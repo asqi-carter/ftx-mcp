@@ -18,6 +18,8 @@ Deploy dialog, in your hands. Everything besides the LLM calls runs locally
 on your machine. No cloud service, no API key; your LLM of choice provides
 the intelligence.
 
+[**Blog Post**](https://asqi.org/resources/ftx-mcp-v1/)
+
 ## Install (10 minutes)
 
 Requirements: Windows 11, FactoryTalk Optix Studio 1.7.x, and an MCP client like Claude Cowork.
