@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.venv-test/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# uv
+uv.lock.bak
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local state (shouldn't be committed)
+*.log
+logs/
+local-state/
+
+# Optix artifacts (deployed outputs, never source)
+*.optix-bundle
+*.optix-deploy
+
+# Scratch / per-session artifacts
+.tmp/
+*-commit-msg.txt
+
+# Claude Code local config (project-scoped, not shared)
+.claude/settings.local.json
+
+# Operational/internal notes - never for public publish
+internal/
+docs/internal/
+
+# packed MCP bundles (build artifacts)
+*.mcpb
+
+# Kept locally, not distributed (dev/aux material lives in the private repo)
+bootstrap/mcpb/
+bootstrap/optional/
+bootstrap/launcher/
+bootstrap/build-exe.ps1
+bootstrap/install.ps1
+tools/
+examples/
+docs/optix-patterns/
+docs/component-gallery.md
+docs/corp-it-install.md
+docs/deploy-verification.md
+docs/dpapi.md
+docs/expression-evaluator-reference.md
+docs/smoke-checklist.md
+docs/studio-open-detection.md
+docs/visual-studio-quick-install.md
+docs/claude-desktop-cowork-setup.md
+bootstrap/launch.ps1
+skills/optix-deploy-safely/
+skills/optix-anchored-edit/

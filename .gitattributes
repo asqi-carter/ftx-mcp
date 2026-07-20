@@ -1,0 +1,20 @@
+# Default to LF in the repo, let git decide working-tree EOL by autocrlf.
+* text=auto eol=lf
+
+# PowerShell scripts MUST be CRLF on Windows working tree to be invokable
+# from the legacy Windows PowerShell ISE / Win32 console host without
+# parser warnings. Native git on Windows handles the LF→CRLF on checkout.
+*.ps1   text eol=crlf
+
+# Shell scripts must stay LF even if checked out on Windows (they run
+# inside WSL or under git-bash; CRLF breaks shebang).
+*.sh    text eol=lf
+
+# Binary files git should not touch.
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.bin   binary

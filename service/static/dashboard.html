@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ftx-mcp · console</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111823; --line:#1e2a3a; --ink:#c7d3e0; --dim:#5f7086;
+    --cyan:#3fe0d0; --green:#57e389; --amber:#f5c451; --red:#f2585b; --violet:#9d7cff;
+    --mono:'SFMono-Regular',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:
+      radial-gradient(1200px 600px at 80% -10%, #12203010, transparent),
+      linear-gradient(#0a0e14,#080b10);
+    color:var(--ink);font:13px/1.5 var(--mono);letter-spacing:.2px;
+    min-height:100vh}
+  .wrap{max-width:1120px;margin:0 auto;padding:22px 20px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+  .logo{font-weight:700;font-size:16px;letter-spacing:1px}
+  .logo b{color:var(--cyan)}
+  .pulse{width:9px;height:9px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 0 #57e38966;animation:p 1.8s infinite}
+  @keyframes p{0%{box-shadow:0 0 0 0 #57e38966}70%{box-shadow:0 0 0 8px #57e38900}100%{box-shadow:0 0 0 0 #57e38900}}
+  .pulse.down{background:var(--red);animation:none}
+  .spacer{flex:1}
+  .clock{color:var(--dim)}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
+  .card{grid-column:span 4;background:linear-gradient(#111823,#0d141d);
+    border:1px solid var(--line);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+  .card.wide{grid-column:span 6}.card.full{grid-column:span 12}
+  .card h2{margin:0 0 10px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);font-weight:600}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed #1a2534}
+  .row:last-child{border-bottom:0}
+  .k{color:var(--dim)} .v{color:var(--ink);text-align:right}
+  .ok{color:var(--green)} .bad{color:var(--red)} .warn{color:var(--amber)} .accent{color:var(--cyan)}
+  .big{font-size:26px;font-weight:700;letter-spacing:.5px;margin:2px 0 0}
+  .sub{color:var(--dim);font-size:11px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .chip{border:1px solid var(--line);border-radius:20px;padding:2px 9px;font-size:11px;color:var(--dim)}
+  .chip.on{color:var(--cyan);border-color:#294}
+.chip.tk-destructive{border-color:#b4544a}
+.chip.tk-write{border-color:#3d6b8f} .chip.on{border-color:#1f5a52;color:var(--cyan)}
+  .bar{height:6px;border-radius:6px;background:#16202c;overflow:hidden;margin-top:6px}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--green))}
+  .feed{max-height:220px;overflow:auto;font-size:12px}
+  .feed div{padding:2px 0;color:var(--dim)} .feed b{color:var(--ink)}
+  .gal{display:flex;flex-wrap:wrap;gap:5px;max-height:120px;overflow:auto}
+  .gal span{border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11px;color:var(--dim)}
+  footer{color:#3a4757;margin-top:18px;font-size:11px}
+  a{color:var(--violet);text-decoration:none}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+  button.act{font:inherit;cursor:pointer;border:1px solid var(--line);background:#0f1a26;color:var(--ink);
+    border-radius:8px;padding:8px 15px;letter-spacing:.5px;transition:border-color .15s,color .15s}
+  button.act:hover:not(:disabled){border-color:var(--cyan);color:var(--cyan)}
+  button.act.primary{border-color:#1f5a52;color:var(--cyan)}
+  button.act.danger:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+  button.act:disabled{opacity:.38;cursor:not-allowed}
+  .result{margin-top:11px;font-size:12px;color:var(--dim);min-height:16px;white-space:pre-wrap;word-break:break-word}
+  .busy{color:var(--amber)} .result .okr{color:var(--green)} .result .badr{color:var(--red)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span id="dot" class="pulse"></span>
+    <span class="logo"><b>ftx</b>-mcp</span>
+    <span class="sub" id="tagline">design-time bridge console</span>
+    <span class="spacer"></span>
+    <span class="clock" id="clock">—</span>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Bridge</h2>
+      <div class="big" id="b_ver">—</div>
+      <div class="sub" id="b_proj">connecting…</div>
+      <div class="row"><span class="k">reachable</span><span class="v" id="b_reach">—</span></div>
+      <div class="row"><span class="k">model loaded</span><span class="v" id="b_model">—</span></div>
+      <div class="row"><span class="k">last saved</span><span class="v" id="b_saved">—</span></div>
+      <div class="row"><span class="k">thread</span><span class="v accent">http-bg (inline)</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Runtime · CDP</h2>
+      <div class="big" id="cdp_state">—</div>
+      <div class="sub" id="cdp_sub">chrome-cdp :9222</div>
+      <div class="row"><span class="k">web engine</span><span class="v" id="rt_web">—</span></div>
+      <div class="row"><span class="k">runtime port</span><span class="v" id="rt_port">—</span></div>
+      <div class="row"><span class="k">emulator</span><span class="v" id="rt_emu">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Service</h2>
+      <div class="big" id="s_ver">—</div>
+      <div class="sub" id="s_sub">coord :8765</div>
+      <div class="row"><span class="k">interactive session</span><span class="v" id="s_int">—</span></div>
+      <div class="row"><span class="k">doctor</span><span class="v" id="s_doc">—</span></div>
+      <div class="bar"><i id="s_bar" style="width:0%"></i></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Controls · <span id="ctl_proj" class="accent">—</span></h2>
+      <div class="btns">
+        <button class="act primary" id="btn_save">Save</button>
+        <button class="act" id="btn_emu">Run emulator</button>
+        <button class="act danger" id="btn_deploy">Deploy · UpdateSvc</button>
+      </div>
+      <div class="result" id="ctl_result">acts on the project the bridge is serving</div>
+    </div>
+
+    <div class="card wide">
+      <h2>Config · flags</h2>
+      <div class="row"><span class="k">bind</span><span class="v" id="f_bind">—</span></div>
+      <div class="row"><span class="k">auth</span><span class="v" id="f_auth">—</span></div>
+      <div class="row"><span class="k">gentle save</span><span class="v" id="f_gentle">—</span></div>
+      <div class="row"><span class="k">cdp autoheal</span><span class="v" id="f_cdp">—</span></div>
+      <div class="row"><span class="k">deploy target</span><span class="v" id="f_deploy">—</span></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Doctor checks</h2>
+      <div id="checks"></div>
+    </div>
+
+    <div class="card wide">
+      <h2>Capabilities</h2>
+      <div class="row"><span class="k">authorable widget types</span><span class="v accent big" id="cap_types" style="font-size:20px">—</span></div>
+      <div class="chips" id="cap_tools"></div>
+      <div class="gal" id="cap_gal" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card full">
+      <h2>Activity</h2>
+      <div class="feed" id="feed"><div>waiting for the bridge to speak…</div></div>
+    </div>
+  </div>
+
+  <footer>ftx-mcp · live console · polling <span id="poll">/ui/stats</span> every 2s ·
+    <a href="/doctor">/doctor</a> · <a href="/health">/health</a></footer>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let lastSeen=null, feed=[];
+function pill(ok){return ok?'<span class="ok">● ok</span>':'<span class="bad">● down</span>';}
+function tick(){ $('clock').textContent=new Date().toLocaleTimeString(); }
+setInterval(tick,1000); tick();
+
+async function poll(){
+  let d=null;
+  try{ const r=await fetch('/ui/stats',{cache:'no-store'}); d=await r.json(); }
+  catch(e){ setDown(); return; }
+  render(d);
+}
+function setDown(){
+  $('dot').classList.add('down'); $('b_reach').innerHTML=pill(false);
+  $('b_proj').textContent='service unreachable';
+}
+function render(d){
+  const b=d.bridge||{}, s=d.service||{}, c=d.cdp||{}, rt=d.runtime||{}, cap=d.capabilities||{};
+  $('dot').classList.toggle('down', !b.reachable);
+  // bridge
+  $('b_ver').textContent=b.version||'offline';
+  $('b_ver').className='big '+(b.reachable?'accent':'bad');
+  $('b_proj').textContent=b.project?('serving '+b.project):'no project';
+  $('b_reach').innerHTML=pill(!!b.reachable);
+  $('b_model').innerHTML=b.model_loaded?'<span class="ok">yes</span>':'<span class="warn">no</span>';
+  // cdp / runtime
+  $('cdp_state').textContent=c.alive?'live':'idle';
+  $('cdp_state').className='big '+(c.alive?'ok':'warn');
+  $('rt_web').innerHTML=rt.web_engine?'<span class="ok">present</span>':'<span class="warn">—</span>';
+  $('rt_port').textContent=rt.port||'—';
+  const es = rt.emulator_state;
+  $('rt_emu').innerHTML =
+    es==='running'  ? `<span class="ok">running · :${rt.port}</span>` :
+    es==='starting' ? `<span class="warn">starting…</span>` :
+    rt.serving      ? `<span class="sub">deployed app on :${rt.port}</span>` :
+                      '<span class="sub">idle</span>';
+  // service
+  $('s_ver').textContent=s.version||'—'; $('s_ver').className='big accent';
+  $('s_int').innerHTML=s.interactive?'<span class="ok">session 1</span>':'<span class="warn">session 0</span>';
+  const dc=d.doctor||[]; const okc=dc.filter(x=>x.ok).length;
+  $('s_doc').textContent=okc+'/'+dc.length+' ok';
+  $('s_bar').style.width=(dc.length? Math.round(100*okc/dc.length):0)+'%';
+  // checks
+  $('checks').innerHTML=dc.map(x=>`<div class="row"><span class="k">${x.name}</span><span class="v ${x.ok?'ok':'bad'}">${x.ok?'ok':'fail'}</span></div>`).join('')||'<div class="sub">no data</div>';
+  // capabilities
+  $('cap_types').textContent=cap.widget_types!=null?cap.widget_types:'—';
+  // dynamic tool chips from the live MCP registry — hover for the summary
+  const esc=x=>String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+  const tools=cap.tools||[];
+  $('cap_tools').innerHTML=tools.map(t=>
+    `<span class="chip on tk-${t.kind}" title="${esc(t.summary)} [${t.kind}]">${esc(t.name.replace(/^optix_/,''))}</span>`).join('')
+    + (tools.length?`<span class="sub" style="margin-left:6px">${tools.length} tools</span>`:'');
+  $('cap_gal').innerHTML=(cap.gallery||[]).map(t=>`<span>${t}</span>`).join('');
+  // config / flags
+  const f=d.flags||{};
+  $('f_bind').innerHTML = f.bind_host ? (f.loopback?`<span class="ok">${f.bind_host} · loopback</span>`:`<span class="warn">${f.bind_host} · LAN</span>`) : '—';
+  $('f_auth').innerHTML = f.auth_required?'<span class="accent">token required</span>':'<span class="sub">off · loopback</span>';
+  $('f_gentle').innerHTML = flagChip(f.gentle_save);
+  $('f_cdp').innerHTML = flagChip(f.cdp_autoheal);
+  // Deploy UI only exists when the deploy integration is wired (it is not in
+  // the public distribution) — hide the button and target row entirely.
+  deployEnabled = !!f.deploy_enabled;
+  $('btn_deploy').style.display = deployEnabled ? '' : 'none';
+  $('f_deploy').parentElement.style.display = deployEnabled ? '' : 'none';
+  $('f_deploy').innerHTML = f.deploy_configured?`<span class="ok">${f.deploy_ip||''} ✓</span>`:'<span class="warn">not configured</span>';
+  // bridge last-saved + control target
+  $('b_saved').textContent = fmtAge(b.last_saved_epoch);
+  curProj = (b.reachable && b.project) ? b.project : null;
+  $('ctl_proj').textContent = curProj || 'no bridge';
+  // adaptive emulator button — F5 toggles, so show Stop only when the
+  // EMULATOR is up (a deployed app on the same port must not flip it)
+  emuRunning = (rt.emulator_state==='running' || rt.emulator_state==='starting');
+  const be=$('btn_emu');
+  be.textContent = emuRunning ? 'Stop emulator' : 'Run emulator';
+  be.classList.toggle('danger', emuRunning);
+  syncButtons();
+  // activity feed — synthesize from state transitions
+  const stamp=new Date().toLocaleTimeString();
+  const sig=JSON.stringify([b.version,b.project,b.reachable,c.alive]);
+  if(sig!==lastSeen){ feed.unshift(`<div><span class="sub">${stamp}</span> <b>${b.version||'offline'}</b> · ${b.project||'—'} · cdp ${c.alive?'live':'idle'}</div>`); lastSeen=sig; feed=feed.slice(0,40); $('feed').innerHTML=feed.join(''); }
+}
+// ---- flags + controls ----
+let busy=false, curProj=null, emuRunning=false, deployEnabled=false;
+function flagChip(on){return on?'<span class="ok">on</span>':'<span class="sub">off</span>';}
+function fmtAge(e){ if(!e) return '—'; const s=Math.max(0,Math.floor(Date.now()/1000-e)); return s<60?s+'s ago':s<3600?Math.floor(s/60)+'m ago':Math.floor(s/3600)+'h ago'; }
+function syncButtons(){
+  // save + deploy need the served project; the emulator button in STOP mode just needs the service
+  $('btn_save').disabled = busy||!curProj;
+  $('btn_deploy').disabled = busy||!curProj||!deployEnabled;
+  $('btn_emu').disabled = busy || (!emuRunning && !curProj);
+}
+function setResult(html){ $('ctl_result').innerHTML=html; }
+function summarize(label,j){
+  if(label==='Save') return j.saved?`<span class="okr">saved ✓</span> (${j.elapsed_seconds??'?'}s)`:`save: ${j.reason||j.hint||'nothing to save'}`;
+  if(label==='Run emulator') return j.launched?(j.serving?`<span class="okr">emulator serving ✓</span> (${j.waited_seconds??'?'}s)`:`launched, not yet serving: ${j.hint||'still building'}`):`emulator: ${j.reason||j.hint||'not launched'}`;
+  if(label==='Stop emulator') return j.stopped?'<span class="okr">emulator stopped ✓</span>':`stop: ${j.reason||'nothing running'}`;
+  if(label==='Deploy') return (j.state==='succeeded'||j.ok===true)?'<span class="okr">deploy ✓</span>':`<span class="badr">deploy: ${j.error||j.reason||JSON.stringify(j).slice(0,120)}</span>`;
+  return JSON.stringify(j).slice(0,160);
+}
+async function doAction(url,label,confirmMsg){
+  const needsProj = url.includes('{p}');
+  if(needsProj && !curProj) return;
+  if(confirmMsg && !confirm(confirmMsg)) return;
+  busy=true; syncButtons(); setResult(`<span class="busy">${label}…</span>`);
+  try{
+    const r=await fetch(needsProj?url.replace('{p}',encodeURIComponent(curProj)):url,{method:'POST'});
+    const j=await r.json();
+    setResult(summarize(label,j));
+  }catch(e){ setResult(`<span class="badr">${label} failed: ${e}</span>`); }
+  busy=false; syncButtons();
+}
+$('btn_save').onclick=()=>doAction('/projects/{p}/save','Save');
+$('btn_emu').onclick=()=> emuRunning
+  ? doAction('/emulator/stop','Stop emulator')
+  : doAction('/projects/{p}/run/emulator','Run emulator');
+$('btn_deploy').onclick=()=>doAction('/projects/{p}/deploy/updatesvc?run_after=true','Deploy',`Deploy "${curProj}" to the runtime via the Update Service? (saves + deploys from disk)`);
+
+poll(); setInterval(poll,2000);
+</script>
+</body>
+</html>

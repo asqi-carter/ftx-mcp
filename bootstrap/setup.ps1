@@ -1,0 +1,414 @@
+<#
+.SYNOPSIS
+    Idempotent installer for ftx-mcp on Windows 11.
+
+.DESCRIPTION
+    Fresh-Windows-box -> working stack. See docs/architecture.md.
+    Run from the repo root or from an extracted release tarball.
+
+    Two deploy paths ship: the UpdateSvc deploy verb (the primary ship
+    step; needs the deploy env configured -- run optix_doctor) and the
+    export-based tree swap (Studio must be closed). Deploy integration is
+    not wired in this distribution.
+
+    Steps:
+      1. Port-conflict detection (8081, 8765, 8766, 9222 + HMI port)
+      2. Verify FT Optix Studio installed
+      3. Verify Chrome installed (skipped if -NoCdp)
+      4. Create state dirs %LOCALAPPDATA%\ftx-mcp\{logs,secrets,export-staging,runtime}
+      5. Install Python 3.12 via winget if missing; create venv; install package
+      6. Bearer-token auth bootstrap (HMI tokens.json.dpapi)
+      7. Register ftx-mcp scheduled task at user logon
+      8. Optionally install the Chrome-CDP verify task (-NoCdp to skip)
+      9. Verify GET /health returns 200; print summary
+
+.PARAMETER NoCdp
+    Skip step 8 entirely. Minimum viable install: ftx-mcp alone.
+
+.PARAMETER NoAuth
+    Loopback-no-auth opt-out. Sets FTX_AUTH_REQUIRED=false at user-env
+    scope and skips Step 6 token issuance entirely. The service banner
+    will read "auth  disabled (loopback only)" on next start, and the
+    LAN-bind refusal matrix will block any non-loopback bind. Use only
+    on single-user dev boxes where bearer-token friction outweighs the
+    threat model. See docs/security.md.
+
+    NOTE: this writes FTX_AUTH_REQUIRED=false at User env scope, so the
+    setting persists across logons and across re-installs. For one-shot
+    install-smoke runs that should not touch persistent auth state, use
+    -NoAuthPrompt instead. To revert -NoAuth later, run:
+      [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED",$null,"User")
+
+.PARAMETER NoAuthPrompt
+    Skip the Step 6 interactive auth-enable prompt. Useful for unattended
+    re-installs and for install-smoke runs that must not mutate persistent
+    auth state. Existing FTX_AUTH_REQUIRED user env var is preserved.
+
+    directly.
+
+.PARAMETER NoServiceRegister
+    Skip Step 7 (scheduled-task register) and Step 10 (/health probe).
+    Useful for install-smoke runs that exercise Steps 0-6 + 8 in a
+    redirected state dir + ports (override via OPTIX_STATE_DIR /
+    OPTIX_HTTP_PORT / OPTIX_MCP_PORT) without touching the prod
+    scheduled task. After install completes the operator (or CI)
+    manually launches the service from the freshly-installed venv to
+    smoke-probe /health.
+
+.PARAMETER RepoRoot
+    Path to the ftx-mcp checkout (default: parent of this script).
+#>
+[CmdletBinding()]
+param(
+    [switch]$NoCdp,
+    [switch]$NoAuth,
+    [switch]$NoAuthPrompt,
+    [switch]$NoServiceRegister,
+    [string]$RepoRoot
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+if (-not $RepoRoot) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+
+# Install-time state dir matches what the service resolves at runtime via
+# core.Config.from_env() - both respect OPTIX_STATE_DIR. Override at
+# install time for install-smoke runs (alongside -NoServiceRegister) or
+# corp-IT boxes that redirect %LOCALAPPDATA%. Default keeps the
+# fresh-Windows-box install at %LOCALAPPDATA%\ftx-mcp\.
+if ($env:OPTIX_STATE_DIR) {
+    $state = $env:OPTIX_STATE_DIR
+} else {
+    $state = Join-Path $env:LOCALAPPDATA "ftx-mcp"
+}
+$secretsDir = Join-Path $state "secrets"
+$logsDir = Join-Path $state "logs"
+$exportStagingDir = Join-Path $state "export-staging"
+$runtimeDir = Join-Path $state "runtime"
+$venvDir = Join-Path $RepoRoot ".venv"
+
+function Section($name) {
+    Write-Host ""
+    Write-Host "=== $name ===" -ForegroundColor Cyan
+}
+
+function Fail($msg) {
+    Write-Host "FAIL: $msg" -ForegroundColor Red
+    exit 1
+}
+
+function Ok($msg) {
+    Write-Host "ok: $msg" -ForegroundColor Green
+}
+
+function Warn($msg) {
+    Write-Host "WARN: $msg" -ForegroundColor Yellow
+}
+
+# Step 0: ExecutionPolicy nudge
+# PowerShell will refuse to dot-source helper scripts (services.ps1,
+# other bootstrap scripts) under Restricted/AllSigned/Undefined.
+# Catch that here with a clear remedy instead of failing opaquely later.
+$execPolicy = Get-ExecutionPolicy -Scope CurrentUser
+if ($execPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
+    Write-Host ""
+    Write-Host "ExecutionPolicy (CurrentUser) is '$execPolicy'." -ForegroundColor Yellow
+    Write-Host "ftx-mcp setup runs .ps1 helpers; this scope will block them." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Run this in the same shell, then re-run setup.ps1:" -ForegroundColor Yellow
+    Write-Host "    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned" -ForegroundColor Cyan
+    Write-Host ""
+    Fail "ExecutionPolicy '$execPolicy' blocks helper scripts. See remedy above."
+}
+Ok "ExecutionPolicy (CurrentUser) = $execPolicy"
+
+# Step 1: port-conflict detection
+Section "1. Port-conflict detection"
+# Resolve port set from env overrides so install-smoke runs (with the
+# service ports redirected) don't false-positive on the prod service
+# holding the default ports. Each port mirrors the service-side
+# resolution in core.Config.from_env() / install-chrome-cdp.ps1.
+$httpPort        = $env:OPTIX_HTTP_PORT;         if (-not $httpPort)        { $httpPort = 8765 }
+$mcpPort         = $env:OPTIX_MCP_PORT;          if (-not $mcpPort)         { $mcpPort = 8766 }
+$runtimeTestPort = $env:OPTIX_RUNTIME_TEST_PORT; if (-not $runtimeTestPort) { $runtimeTestPort = 8081 }
+# 9222 is the Chrome CDP port owned by install-chrome-cdp.ps1; check
+# only when the chrome-cdp task is going to install. -NoCdp skips it.
+$ports = @([int]$runtimeTestPort, [int]$httpPort, [int]$mcpPort)
+if (-not $NoCdp) { $ports += 9222 }
+$conflicts = @()
+foreach ($p in $ports) {
+    $listener = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
+    if ($listener) {
+        $conflicts += [PSCustomObject]@{
+            Port = $p
+            Pid  = ($listener | Select-Object -First 1).OwningProcess
+        }
+    } else {
+        Ok "$p free"
+    }
+}
+if ($conflicts.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Port conflicts detected:" -ForegroundColor Yellow
+    $conflicts | Format-Table -AutoSize | Out-String | Write-Host
+    Write-Host "Override with env vars: OPTIX_HTTP_PORT, OPTIX_MCP_PORT, OPTIX_HMI_PORT (and re-run)." -ForegroundColor Yellow
+    Fail "Resolve port conflicts before continuing."
+}
+
+# Step 2: verify FT Optix Studio
+# Honors a pre-set FTOPTIX_STUDIO_EXE (Process or User scope) before probing
+# the default install root. Corp IT relocations and side-by-side Studio
+# versions need this override; without it the highest-version probe under
+# the default root wins, which is wrong when the operator has explicitly
+# pinned a Studio binary via env.
+Section "2. Verify FT Optix Studio"
+if ($env:FTOPTIX_STUDIO_EXE) {
+    if (-not (Test-Path $env:FTOPTIX_STUDIO_EXE)) {
+        Fail "FTOPTIX_STUDIO_EXE points at $($env:FTOPTIX_STUDIO_EXE) but the file is missing. Unset it or correct the path."
+    }
+    $studioExe = Get-Item $env:FTOPTIX_STUDIO_EXE
+    Ok "Studio $($studioExe.VersionInfo.FileVersion) at $($studioExe.FullName) (from FTOPTIX_STUDIO_EXE)"
+} else {
+    $studioRoot = "C:\Program Files\Rockwell Automation\FactoryTalk Optix"
+    if (-not (Test-Path $studioRoot)) {
+        Fail "FT Optix Studio not found under $studioRoot. Install Studio first, or set FTOPTIX_STUDIO_EXE to its full path."
+    }
+    $studioExe = Get-ChildItem -Path $studioRoot -Recurse -Filter FTOptixStudio.exe -ErrorAction SilentlyContinue |
+        Sort-Object @{Expression = { $_.VersionInfo.FileVersion }; Descending = $true } |
+        Select-Object -First 1
+    if (-not $studioExe) {
+        Fail "FTOptixStudio.exe not found under $studioRoot. Set FTOPTIX_STUDIO_EXE to its full path to override."
+    }
+    Ok "Studio $($studioExe.VersionInfo.FileVersion) at $($studioExe.FullName)"
+    $env:FTOPTIX_STUDIO_EXE = $studioExe.FullName
+}
+
+# Step 3: verify Chrome
+Section "3. Verify Chrome"
+$chromePaths = @(
+    "C:\Program Files\Google\Chrome\Application\chrome.exe",
+    "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+)
+$chrome = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $chrome) {
+    if ($NoCdp) {
+        Write-Host "WARN: Chrome not found, but -NoCdp is set; continuing." -ForegroundColor Yellow
+    } else {
+        Fail "Chrome not found. Install Chrome or re-run with -NoCdp."
+    }
+} else {
+    Ok "Chrome at $chrome"
+}
+
+# Step 4: state dirs
+Section "4. State dirs"
+foreach ($d in @($state, $logsDir, $secretsDir, $exportStagingDir, $runtimeDir)) {
+    if (-not (Test-Path $d)) {
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        Ok "created $d"
+    } else {
+        Ok "$d"
+    }
+}
+
+# Step 5: Python + venv + package install
+Section "5. Python venv"
+# Fresh Win11 ships a Microsoft Store alias stub at ...\WindowsApps\python.exe
+# that opens the Store instead of running Python, so Get-Command alone reports
+# Python "present" on a box that has none. Treat the stub as absent so the
+# winget branch actually fires (the Store alias otherwise shadows real installs).
+function Get-RealPython {
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -notlike "*\WindowsApps\python.exe") { return $cmd }
+    return $null
+}
+$python = Get-RealPython
+if (-not $python) {
+    Write-Host "Python not on PATH (or Store-alias stub only). Installing via winget..." -ForegroundColor Yellow
+    winget install --silent --accept-source-agreements --accept-package-agreements Python.Python.3.12
+    # winget writes the new PATH to the registry; this session's PATH predates
+    # the install. Refresh from registry or the re-check below can't see it.
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                [Environment]::GetEnvironmentVariable("Path", "User")
+    $python = Get-RealPython
+    if (-not $python) { Fail "winget install python failed; install manually." }
+}
+Ok "Python at $($python.Source)"
+
+if (-not (Test-Path $venvDir)) {
+    & $python.Source -m venv $venvDir
+    Ok "venv created at $venvDir"
+} else {
+    Ok "venv exists at $venvDir"
+}
+
+$venvPython = Join-Path $venvDir "Scripts\python.exe"
+& $venvPython -m pip install --quiet --upgrade pip
+& $venvPython -m pip install --quiet -e $RepoRoot
+Ok "ftx-mcp installed into venv"
+
+# Step 6: bearer-token auth bootstrap
+# v1.0 default: auth OFF (loopback-only install; a bearer token adds ~no security
+# on your own box). Opt IN to enable it - required only for a LAN bind, which the
+# service otherwise refuses. -NoAuth forces off without a prompt; -NoAuthPrompt
+# leaves existing config untouched.
+Section "6. Bearer-token auth (default: off, loopback-only)"
+$tokensBlob = Join-Path $secretsDir "tokens.json.dpapi"
+# Pre-clean any stale OPTIX_AUTH_REQUIRED user env var from an old install.
+# The env-var rename made it dead; leaving it set would confuse operators
+# inspecting their env.
+$staleOptixEnv = [Environment]::GetEnvironmentVariable("OPTIX_AUTH_REQUIRED", "User")
+if ($staleOptixEnv) {
+    [Environment]::SetEnvironmentVariable("OPTIX_AUTH_REQUIRED", $null, "User")
+    Write-Host "WARN: cleared stale OPTIX_AUTH_REQUIRED user env (renamed to FTX_AUTH_REQUIRED)." -ForegroundColor Yellow
+}
+$existingAuthEnv = [Environment]::GetEnvironmentVariable("FTX_AUTH_REQUIRED", "User")
+$tokensExist = Test-Path $tokensBlob
+
+if ($NoAuth) {
+    # Explicit force-off (same as the v1.0 default; kept for scripts/back-compat).
+    [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED", "false", "User")
+    $env:FTX_AUTH_REQUIRED = "false"
+    Ok "auth disabled (loopback-only) [-NoAuth]"
+} elseif ($existingAuthEnv -eq "true") {
+    # Operator previously chose auth-on - honour it and ensure a token exists.
+    Ok "FTX_AUTH_REQUIRED=true (auth on, operator-set)"
+    if (-not $tokensExist) {
+        & (Join-Path $PSScriptRoot "issue-token.ps1") -Label "bootstrap" -Scope "deploy" -RepoRoot $RepoRoot
+        if ($LASTEXITCODE -ne 0) { Fail "issue-token.ps1 failed; resolve before continuing." }
+    } else {
+        Ok "tokens.json.dpapi already present at $tokensBlob"
+    }
+} elseif ($NoAuthPrompt) {
+    Ok "auth prompt skipped (-NoAuthPrompt). FTX_AUTH_REQUIRED unchanged (default: off on loopback)."
+} else {
+    Write-Host ""
+    Write-Host "Auth is OFF by default: this is a loopback-only install, where a bearer" -ForegroundColor Yellow
+    Write-Host "token adds ~no security (any local process runs as you). Enable it only if" -ForegroundColor Yellow
+    Write-Host "you will bind to the LAN (OPTIX_BIND_HOST=0.0.0.0) - the service refuses a" -ForegroundColor Yellow
+    Write-Host "LAN bind without auth." -ForegroundColor Yellow
+    Write-Host ""
+    $resp = Read-Host "Enable bearer-token auth now? [y/N]"
+    if ($resp -match '^[yY]') {
+        [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED", "true", "User")
+        $env:FTX_AUTH_REQUIRED = "true"
+        Ok "set user env FTX_AUTH_REQUIRED=true"
+        & (Join-Path $PSScriptRoot "issue-token.ps1") -Label "bootstrap" -Scope "deploy" -RepoRoot $RepoRoot
+        if ($LASTEXITCODE -ne 0) { Fail "issue-token.ps1 failed; resolve before continuing." }
+    } else {
+        # Leave FTX_AUTH_REQUIRED unset - the service default (off) applies; nothing
+        # to persist. Enable later with FTX_AUTH_REQUIRED=true + issue-token.ps1.
+        Ok "auth left off (default). No token needed for loopback use."
+    }
+}
+
+# Step 7: register ftx-mcp scheduled task
+# Skip with -NoServiceRegister for CI / install-smoke runs that exercise
+# steps 0-6 + 8 in a redirected state dir without touching the prod
+# scheduled task. The flag also short-circuits step 10 (the /health
+# probe expects a running service).
+Section "7. Register ftx-mcp scheduled task"
+if ($NoServiceRegister) {
+    Ok "skipped (-NoServiceRegister)"
+    Write-Host "  Service task not registered; no auto-start at logon." -ForegroundColor DarkGray
+    Write-Host "  To launch manually from this checkout:" -ForegroundColor DarkGray
+    Write-Host "    & '$venvPython' -m service" -ForegroundColor DarkGray
+    Write-Host "  (respects OPTIX_STATE_DIR / OPTIX_HTTP_PORT / OPTIX_MCP_PORT env)" -ForegroundColor DarkGray
+} else {
+    $taskName = "ftx-mcp"
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+
+    $action = New-ScheduledTaskAction `
+        -Execute $venvPython `
+        -Argument "-m service" `
+        -WorkingDirectory $RepoRoot
+    # No -Trigger: the task is manual-only by design; start via
+    # bootstrap/services.ps1 start (or Start-ScheduledTask). This keeps a
+    # fresh logon quiet for developers who aren't actively touching Optix.
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Settings $settings `
+        -Principal $principal | Out-Null
+    Ok "scheduled task '$taskName' registered (manual start; use bootstrap\services.ps1)"
+
+    # Optional: kick it off now so the smoke test below can hit /health
+    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+}
+
+# Step 8: Chrome CDP (optional, for canvas verify)
+# The chrome-cdp task lets the service screenshot + click the rendered HMI
+# canvas via CDP. Authoring works without it; skip on locked-down boxes
+# that block Chrome or CDP port 9222.
+Section "8. Chrome CDP (verify)"
+if ($NoCdp) {
+    Ok "skipped (-NoCdp)"
+    Write-Host "  To install the CDP-Chrome verify task later:" -ForegroundColor DarkGray
+    Write-Host "    powershell -File bootstrap\install-chrome-cdp.ps1 -RepoRoot $RepoRoot" -ForegroundColor DarkGray
+    Write-Host "  Canvas verify (optix_cdp_screenshot/click) is disabled until then;" -ForegroundColor DarkGray
+    Write-Host "  deploy / runtime_start still work via HTTP + MCP." -ForegroundColor DarkGray
+} else {
+    & (Join-Path $PSScriptRoot "install-chrome-cdp.ps1") -RepoRoot $RepoRoot
+}
+
+# Step 10: verify /health
+# Probes the loopback HTTP port for a 200 response. Skipped when
+# -NoServiceRegister is set (no service was registered/started; the
+# probe would always time out).
+Section "10. Verify /health"
+if ($NoServiceRegister) {
+    Ok "skipped (-NoServiceRegister; no service was registered to probe)"
+} else {
+    $healthPort = $env:OPTIX_HTTP_PORT
+    if (-not $healthPort) { $healthPort = 8765 }
+    $ok = $false
+    for ($i = 0; $i -lt 10; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$healthPort/health" -TimeoutSec 2 -UseBasicParsing
+            if ($resp.StatusCode -eq 200) { $ok = $true; break }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not $ok) {
+        Write-Host "WARN: /health did not return 200 within 10s. Check the scheduled task logs at $logsDir." -ForegroundColor Yellow
+    } else {
+        Ok "/health returned 200"
+        $resp.Content | ConvertFrom-Json | Format-List | Out-String | Write-Host
+    }
+}
+
+Section "Done"
+Write-Host "ftx-mcp install complete." -ForegroundColor Green
+Write-Host "  HTTP   http://127.0.0.1:$httpPort"
+Write-Host "  MCP    http://127.0.0.1:$mcpPort/mcp"
+Write-Host "  state  $state"
+Write-Host "  repo   $RepoRoot"
+Write-Host ""
+$authOn = ([Environment]::GetEnvironmentVariable("FTX_AUTH_REQUIRED", "User")) -eq "true"
+if ($authOn) {
+    Write-Host "Next: add the MCP server to your client config:" -ForegroundColor Cyan
+    Write-Host "  http://127.0.0.1:$mcpPort/mcp  (auth is enabled; set an Authorization: Bearer <token> header)" -ForegroundColor Cyan
+} else {
+    Write-Host "Next: register with Claude Code (no bearer; loopback-no-auth):" -ForegroundColor Cyan
+    Write-Host "  claude mcp add --transport http ftx-mcp http://127.0.0.1:$mcpPort/mcp" -ForegroundColor Cyan
+}
+Write-Host ""
+Write-Host "Verify your setup: ask your AI assistant to run the 'optix_doctor' tool" -ForegroundColor Cyan
+Write-Host "  (or GET /doctor): it checks every dependency (Studio, projects root," -ForegroundColor Cyan
+Write-Host "  cdp, deploy account/cert, interactive session) and prints a plain-" -ForegroundColor Cyan
+Write-Host "  English fix for anything red. Run it first if a later step doesn't work." -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Lifecycle: .\bootstrap\services.ps1 {start|stop|restart|status}" -ForegroundColor Cyan
