@@ -1,5 +1,7 @@
 # ftx-mcp
 
+<!-- mcp-name: io.github.asqi-carter/ftx-mcp -->
+
 **Talk to your FactoryTalk Optix project.** ftx-mcp connects AI tools
 (Desktop, Cowork, Code — or any MCP client) to FactoryTalk Optix Studio on
 your Windows machine, so you can build and change HMI screens by describing
