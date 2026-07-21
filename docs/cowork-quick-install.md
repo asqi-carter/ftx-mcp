@@ -4,11 +4,20 @@ The fastest path from a fresh Windows box to running `ftx-mcp` tools inside
 Claude Desktop / Cowork. If anything fails along the way,
 [`troubleshooting.md`](troubleshooting.md) is searchable by symptom.
 
-1. **Install the service.**
+1. **Install the service — from a regular PowerShell window** (Win+R →
+   `powershell`), *not* a shell running inside Claude Desktop/Cowork. The
+   Microsoft Store build of Claude Desktop is MSIX-packaged: any shell it
+   hosts gets its `%LOCALAPPDATA%` writes silently redirected into the app's
+   private overlay, invisible to the ftx-mcp scheduled task (state dirs and
+   auth tokens end up "existing" only inside the app). `setup.ps1` detects
+   this and refuses to run.
 
    ```powershell
    .\bootstrap\setup.ps1
    ```
+
+   The Store-build connector path (step 2's default config form) also needs
+   **Node.js** on PATH: `winget install OpenJS.NodeJS.LTS`.
 
 2. **Wire the client config:**
 

@@ -220,3 +220,52 @@ class TestBuildTokenStore:
         store = main.build_token_store(c)
         assert len(store) == 1
         assert store.lookup(secret) is not None
+
+
+# ---- startup state-dir self-creation --------------------------------
+
+class TestEnsureStateDirs:
+    """v1.0.1 (field report finding 1): the service self-creates runtime_dir
+    at startup, exactly as it already did state_dir. An installer run from an
+    MSIX-packaged shell (Store-build Claude Desktop / Cowork quick-install)
+    gets its %LOCALAPPDATA% mkdirs virtualized into the app's package
+    overlay — the scheduled task then launches the service against the real
+    filesystem where the dirs never existed (/health runtime_dir_exists:
+    false while the install shell swears they are present).
+    """
+
+    def test_creates_both_state_and_runtime_dirs(
+        self, cfg: core.Config, tmp_path: Path
+    ) -> None:
+        c = replace(
+            cfg,
+            state_dir=tmp_path / "fresh-state",
+            runtime_dir=tmp_path / "fresh-state" / "runtime",
+        )
+        main._ensure_state_dirs(c)
+        assert c.state_dir.is_dir()
+        assert c.runtime_dir.is_dir()
+
+    def test_runtime_dir_none_is_tolerated(
+        self, cfg: core.Config, tmp_path: Path
+    ) -> None:
+        c = replace(cfg, state_dir=tmp_path / "s", runtime_dir=None)
+        main._ensure_state_dirs(c)
+        assert c.state_dir.is_dir()
+
+    def test_uncreatable_runtime_dir_does_not_crash_startup(
+        self, cfg: core.Config, tmp_path: Path
+    ) -> None:
+        # runtime_dir nested under a FILE -> mkdir raises OSError; startup
+        # must swallow it so the condition surfaces as a red /health flag
+        # (split-volume OPTIX_RUNTIME_DIR on an offline drive), not a crash.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory")
+        c = replace(
+            cfg,
+            state_dir=tmp_path / "s2",
+            runtime_dir=blocker / "runtime",
+        )
+        main._ensure_state_dirs(c)
+        assert c.state_dir.is_dir()
+        assert not c.runtime_dir.exists()

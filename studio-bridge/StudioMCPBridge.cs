@@ -26,7 +26,7 @@ using FTOptix.CoreBase;
 // "MCPBridge" Optix library (component "StudioMCPBridge") for drag-in reuse.
 public class StudioMCPBridge : BaseNetLogic
 {
-    private const string BridgeVersion = "1.0.0";
+    private const string BridgeVersion = "1.0.1";
     // Cross-ALC stop signal: at design time Studio runs each [ExportMethod] in an
     // ISOLATED AssemblyLoadContext, so StartBridge and StopBridge share NO managed
     // state (neither instance NOR static - both were tried and failed).

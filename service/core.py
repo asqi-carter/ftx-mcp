@@ -283,6 +283,39 @@ _DEFAULT_RUNNER = Runner()
 
 # ---- config -----------------------------------------------------------
 
+_STUDIO_INSTALL_ROOT = Path(
+    r"C:\Program Files\Rockwell Automation\FactoryTalk Optix"
+)
+
+
+def _default_studio_exe() -> Path:
+    """Highest-version FTOptixStudio.exe under the default install root.
+
+    Mirrors setup.ps1 step 2's probe so the service default can never go
+    stale across Studio updates: a pinned default (formerly 1.7.1.46)
+    reported studio_exe_exists=false as soon as a newer Studio was the only
+    one installed, because setup.ps1's discovered path only lived in the
+    install shell's process env — the scheduled task never saw it.
+    FTOPTIX_STUDIO_EXE (any scope) still wins; from_env checks it before
+    calling this. Falls back to the historical pinned path when nothing is
+    found so /health has a concrete path to report red.
+    """
+    try:
+        candidates = list(_STUDIO_INSTALL_ROOT.glob("Studio */FTOptixStudio.exe"))
+    except OSError:
+        candidates = []
+
+    def _version_key(exe: Path) -> tuple[int, ...]:
+        try:
+            return tuple(int(part) for part in exe.parent.name.split(" ", 1)[1].split("."))
+        except (IndexError, ValueError):
+            return (0,)
+
+    if candidates:
+        return max(candidates, key=_version_key)
+    return _STUDIO_INSTALL_ROOT / "Studio 1.7.1.46" / "FTOptixStudio.exe"
+
+
 @dataclass(frozen=True)
 class Config:
     projects_root: Path
@@ -369,11 +402,11 @@ class Config:
                 str(Path.home() / "Documents" / "Rockwell Automation"
                     / "FactoryTalk Optix" / "Projects"),
             )),
-            studio_exe=Path(os.environ.get(
-                "FTOPTIX_STUDIO_EXE",
-                r"C:\Program Files\Rockwell Automation\FactoryTalk Optix"
-                r"\Studio 1.7.1.46\FTOptixStudio.exe",
-            )),
+            studio_exe=(
+                Path(os.environ["FTOPTIX_STUDIO_EXE"])
+                if os.environ.get("FTOPTIX_STUDIO_EXE")
+                else _default_studio_exe()
+            ),
             state_dir=state_dir,
             runtime_dir=runtime_dir,
             runtime_launcher=os.environ.get("OPTIX_RUNTIME_LAUNCHER"),

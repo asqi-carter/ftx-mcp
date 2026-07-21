@@ -57,6 +57,27 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Refuse to run inside an MSIX-packaged shell (e.g. the Microsoft Store
+# build of Claude Desktop hosting a Cowork/Claude Code shell). Writes to
+# %LOCALAPPDATA% from a packaged process are virtualized into the app's
+# private LocalCache overlay: the DPAPI token blob would look present from
+# this shell while the real service (scheduled task, outside the package)
+# loads zero tokens and 401s every request. Unlike the state dirs, there is
+# no service-side recovery for a mislocated secrets blob.
+$pkgSig = @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern int GetCurrentPackageFullName(ref uint length, System.Text.StringBuilder fullName);
+'@
+$pkgType = Add-Type -MemberDefinition $pkgSig -Name PkgIdentity -Namespace FtxIssueToken -PassThru
+$pkgLen = [uint32]0
+# 15700 = APPMODEL_ERROR_NO_PACKAGE -> unpackaged process, safe to proceed
+if ($pkgType::GetCurrentPackageFullName([ref]$pkgLen, $null) -ne 15700) {
+    Write-Host ("FAIL: this shell is running inside an MSIX-packaged app; its " +
+        "%LOCALAPPDATA% writes are virtualized and the token blob would be " +
+        "invisible to the ftx-mcp service. Re-run from a regular PowerShell window.") -ForegroundColor Red
+    exit 1
+}
+
 if (-not $RepoRoot) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 }

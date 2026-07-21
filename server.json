@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.asqi-carter/ftx-mcp",
-  "title": "FTX MCP — FactoryTalk Optix MCP Server",
+  "title": "FTX MCP \u2014 FactoryTalk Optix MCP Server",
   "description": "MCP server for FactoryTalk Optix: author, preview, and verify Studio changes via the emulator.",
   "repository": {
     "url": "https://github.com/asqi-carter/ftx-mcp",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "ftx-mcp",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "transport": {
         "type": "stdio"
       }

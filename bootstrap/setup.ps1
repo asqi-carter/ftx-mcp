@@ -112,18 +112,50 @@ function Warn($msg) {
 # PowerShell will refuse to dot-source helper scripts (services.ps1,
 # other bootstrap scripts) under Restricted/AllSigned/Undefined.
 # Catch that here with a clear remedy instead of failing opaquely later.
-$execPolicy = Get-ExecutionPolicy -Scope CurrentUser
+# The check uses the EFFECTIVE policy (not just CurrentUser scope): a box
+# whose policy comes from MachinePolicy/LocalMachine would otherwise pass
+# or fail on the wrong scope's value.
+$execPolicy = Get-ExecutionPolicy
 if ($execPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
     Write-Host ""
-    Write-Host "ExecutionPolicy (CurrentUser) is '$execPolicy'." -ForegroundColor Yellow
-    Write-Host "ftx-mcp setup runs .ps1 helpers; this scope will block them." -ForegroundColor Yellow
+    Write-Host "Effective ExecutionPolicy is '$execPolicy'." -ForegroundColor Yellow
+    Write-Host "ftx-mcp setup runs .ps1 helpers; this policy will block them." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Run this in the same shell, then re-run setup.ps1:" -ForegroundColor Yellow
     Write-Host "    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned" -ForegroundColor Cyan
     Write-Host ""
+    Write-Host "If this repo came from a GitHub ZIP download (not git clone)," -ForegroundColor Yellow
+    Write-Host "also clear the mark-of-the-web or RemoteSigned still blocks it:" -ForegroundColor Yellow
+    Write-Host "    Get-ChildItem -Recurse | Unblock-File" -ForegroundColor Cyan
+    Write-Host ""
     Fail "ExecutionPolicy '$execPolicy' blocks helper scripts. See remedy above."
 }
-Ok "ExecutionPolicy (CurrentUser) = $execPolicy"
+Ok "ExecutionPolicy (effective) = $execPolicy"
+
+# Step 0.5: refuse to run inside an MSIX-packaged shell.
+# A shell hosted by a packaged app (e.g. the Microsoft Store build of
+# Claude Desktop - exactly what docs/cowork-quick-install.md used to
+# produce) runs with filesystem write virtualization: every write this
+# script makes under %LOCALAPPDATA% lands in the app's private
+# LocalCache overlay. In-shell checks see the merged view and pass, but
+# the scheduled tasks registered below run OUTSIDE the package against
+# the real filesystem - where none of those writes exist. The service
+# self-creates its state dirs at startup (service/main.py), but
+# token/secret writes (issue-token.ps1) have no such recovery, so the
+# only safe behavior is to refuse and point at a regular shell.
+$pkgSig = @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+public static extern int GetCurrentPackageFullName(ref uint length, System.Text.StringBuilder fullName);
+'@
+$pkgType = Add-Type -MemberDefinition $pkgSig -Name PkgIdentity -Namespace FtxSetup -PassThru
+$pkgLen = [uint32]0
+# 15700 = APPMODEL_ERROR_NO_PACKAGE -> unpackaged process, safe to proceed
+if ($pkgType::GetCurrentPackageFullName([ref]$pkgLen, $null) -ne 15700) {
+    Fail ("This shell is running inside an MSIX-packaged app (e.g. the Microsoft " +
+          "Store build of Claude Desktop). Its writes to %LOCALAPPDATA% are " +
+          "virtualized into the app's private LocalCache and invisible to the " +
+          "ftx-mcp scheduled tasks. Re-run setup.ps1 from a regular PowerShell window.")
+}
 
 # Step 1: port-conflict detection
 Section "1. Port-conflict detection"
@@ -386,7 +418,29 @@ if ($NoServiceRegister) {
         Write-Host "WARN: /health did not return 200 within 10s. Check the scheduled task logs at $logsDir." -ForegroundColor Yellow
     } else {
         Ok "/health returned 200"
-        $resp.Content | ConvertFrom-Json | Format-List | Out-String | Write-Host
+        $health = $resp.Content | ConvertFrom-Json
+        $health | Format-List | Out-String | Write-Host
+        # HTTP 200 alone is not a healthy install: an MSIX-virtualized setup
+        # shell produced a service that answered 200 while runtime_dir_exists
+        # was false (the dirs existed only in the package overlay). Assert
+        # the *_exists flags so a split-brain install fails HERE, at install
+        # time, with the flag named. projects_root_exists stays a WARN -
+        # Studio only creates that directory the first time a project is
+        # saved, so it is legitimately absent on a fresh box.
+        $badFlags = $health.PSObject.Properties |
+            Where-Object { $_.Name -like '*_exists' -and $_.Value -eq $false } |
+            Select-Object -ExpandProperty Name
+        $fatalFlags = @($badFlags | Where-Object { $_ -ne 'projects_root_exists' })
+        if ($badFlags -contains 'projects_root_exists') {
+            Warn "projects_root does not exist yet (Studio creates it on first project save)."
+        }
+        if ($fatalFlags.Count -gt 0) {
+            Fail ("/health returned 200 but reported: " + ($fatalFlags -join ', ') +
+                  " = false. The service sees a different filesystem state than " +
+                  "this shell - if setup ran inside a packaged app shell, re-run " +
+                  "from a regular PowerShell window.")
+        }
+        Ok "/health *_exists flags verified"
     }
 }
 

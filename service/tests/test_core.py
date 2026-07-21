@@ -341,6 +341,16 @@ class TestConfigFromEnv:
         assert cfg.runtime_dir == cfg.state_dir / "runtime"
         assert cfg.tokens_path == cfg.state_dir / "secrets" / "tokens.json.dpapi"
 
+    def test_studio_exe_env_override_wins_over_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        override = tmp_path / "Custom" / "FTOptixStudio.exe"
+        monkeypatch.setenv("FTOPTIX_STUDIO_EXE", str(override))
+
+        cfg = core.Config.from_env()
+
+        assert cfg.studio_exe == override
+
     def test_deploy_source_transfer_and_cdp_settle_defaults(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -358,4 +368,57 @@ class TestConfigFromEnv:
         cfg = core.Config.from_env()
         assert cfg.deploy_disable_source_transfer is False  # keep source -> don't disable
         assert cfg.cdp_settle_seconds == 0.4
+
+
+class TestDefaultStudioExe:
+    """v1.0.1 (field report finding 2): the studio_exe default is a live
+    highest-version probe, not a pinned path. The pinned 1.7.1.46 default
+    reported studio_exe_exists=false on any box whose only Studio was newer,
+    because setup.ps1's discovered path lived in the install shell's process
+    env — invisible to the scheduled task that launches the service.
+    """
+
+    def _make_install(self, root: Path, version: str) -> Path:
+        exe = root / f"Studio {version}" / "FTOptixStudio.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"")
+        return exe
+
+    def test_picks_highest_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(core, "_STUDIO_INSTALL_ROOT", tmp_path)
+        self._make_install(tmp_path, "1.7.1.46")
+        newest = self._make_install(tmp_path, "1.7.3.39")
+
+        assert core._default_studio_exe() == newest
+
+    def test_version_sort_is_numeric_not_lexicographic(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(core, "_STUDIO_INSTALL_ROOT", tmp_path)
+        self._make_install(tmp_path, "1.7.9.1")
+        newest = self._make_install(tmp_path, "1.7.10.2")
+
+        assert core._default_studio_exe() == newest
+
+    def test_missing_root_falls_back_to_pinned_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(core, "_STUDIO_INSTALL_ROOT", tmp_path / "absent")
+
+        exe = core._default_studio_exe()
+
+        # A concrete (red-in-/health) path, still under the install root.
+        assert exe.name == "FTOptixStudio.exe"
+        assert exe.parent.name == "Studio 1.7.1.46"
+
+    def test_unparseable_version_dirs_do_not_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(core, "_STUDIO_INSTALL_ROOT", tmp_path)
+        self._make_install(tmp_path, "beta")
+        newest = self._make_install(tmp_path, "1.7.3.39")
+
+        assert core._default_studio_exe() == newest
 

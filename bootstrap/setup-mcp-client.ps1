@@ -108,6 +108,14 @@ if ($NativeHttp) {
     }
     if ($Bearer) { $server.headers = [ordered]@{ Authorization = "Bearer $Bearer" } }
 } else {
+    # The cmd/c npx form silently requires Node.js at CONNECT time, not now:
+    # without it the client shows a dead "ftx-mcp" entry with no useful error.
+    # Warn here, where the operator can still fix it before restarting the app.
+    if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+        Write-Host ("WARN: npx (Node.js) not found on PATH. The written config uses " +
+            "'cmd /c npx -y mcp-remote' and will fail to connect until Node.js is " +
+            "installed:  winget install OpenJS.NodeJS.LTS") -ForegroundColor Yellow
+    }
     $mrArgs = @('/c','npx','-y','mcp-remote', $url)
     if ($Bearer) { $mrArgs += @('--header', "Authorization: Bearer $Bearer") }
     $server = [ordered]@{

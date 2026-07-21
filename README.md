@@ -24,7 +24,17 @@ the intelligence.
 
 ## Install (10 minutes)
 
-Requirements: Windows 11, FactoryTalk Optix Studio 1.7.x, and an MCP client like Claude Cowork.
+Requirements: Windows 11, FactoryTalk Optix Studio 1.7.x, and an MCP client
+like Claude Cowork. Also: **Google Chrome** (the CDP verify loop; skip with
+`setup.ps1 -NoCdp`) and — for the Claude Desktop **Microsoft Store build**
+connector path — **Node.js** (`winget install OpenJS.NodeJS.LTS`; the config
+uses `npx mcp-remote`).
+
+Run `setup.ps1` from a **regular PowerShell window** — not a shell hosted
+inside a packaged app like the Store build of Claude Desktop, whose
+`%LOCALAPPDATA%` writes are virtualized (setup now detects this and refuses).
+If you downloaded a ZIP instead of cloning, run
+`Get-ChildItem -Recurse | Unblock-File` first.
 
 ```powershell
 git clone https://github.com/asqi-carter/ftx-mcp.git

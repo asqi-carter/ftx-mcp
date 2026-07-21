@@ -126,9 +126,28 @@ def build_token_store(cfg: core.Config) -> TokenStore:
     return TokenStore(cfg.tokens_path)
 
 
+def _ensure_state_dirs(cfg: core.Config) -> None:
+    """Self-create state_dir AND runtime_dir at startup.
+
+    The service owns creation of its state dirs — the installer cannot be
+    trusted to have made them: setup.ps1 run from an MSIX-packaged shell
+    (Store-build Claude Desktop, i.e. the Cowork quick-install path) gets
+    its %LOCALAPPDATA% writes virtualized into the app's package overlay,
+    which the scheduled task launching this service never sees.
+    """
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.runtime_dir:
+        try:
+            cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # OPTIX_RUNTIME_DIR may point at a volume that is legitimately
+            # offline; that must stay a red /health flag, not a startup crash.
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = core.Config.from_env()
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_state_dirs(cfg)
 
     conflicts = []
     for label, port in (
