@@ -82,3 +82,48 @@ def test_lock_breaks_on_corrupt_state(state_dir: Path) -> None:
         st = lock.read_state()
         assert st is not None
         assert st["caller"] == "newcomer"
+
+
+def test_write_self_is_atomic_exclusive(state_dir: Path) -> None:
+    """_write_self creates the lock exclusively (O_CREAT|O_EXCL): a second
+    writer that saw 'no lock' cannot overwrite the first and proceed. This is
+    the serialization point that prevents two concurrent deploys from both
+    holding the lock."""
+    state_dir.mkdir(exist_ok=True)
+    lock_path = state_dir / "deploy.lock"
+    DeployLock(lock_path, caller="first")._write_self()  # first writer wins
+    with pytest.raises(FileExistsError):
+        DeployLock(lock_path, caller="second")._write_self()
+
+
+def test_acquire_fails_closed_when_live_lock_appears_after_check(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a live lock is created between our staleness check and our exclusive
+    create (the classic TOCTOU), acquisition must fail closed with LockHeld,
+    not clobber the other holder."""
+    state_dir.mkdir(exist_ok=True)
+    lock_path = state_dir / "deploy.lock"
+    lock = DeployLock(lock_path, caller="racer")
+
+    live = {
+        "pid": os.getpid(),  # alive + fresh -> not stale
+        "started_at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+        "caller": "winner",
+    }
+    original_read = lock.read_state
+    calls = {"n": 0}
+
+    def read_state_racing():
+        # First read (staleness check) sees no lock; a concurrent winner then
+        # creates it, so the exclusive create fails and the re-read sees it.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            lock_path.write_text(json.dumps(live), encoding="utf-8")
+            return None
+        return original_read()
+
+    monkeypatch.setattr(lock, "read_state", read_state_racing)
+    with pytest.raises(LockHeld) as excinfo:
+        lock._try_acquire()
+    assert excinfo.value.lock_state["caller"] == "winner"
