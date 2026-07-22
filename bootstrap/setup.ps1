@@ -132,6 +132,17 @@ if ($execPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
 }
 Ok "ExecutionPolicy (effective) = $execPolicy"
 
+# Surface persisted auth state up front. FTX_AUTH_REQUIRED lives at User env
+# scope and survives re-installs BY DESIGN (see Step 6) - which reads as
+# "auth mysteriously on" when a re-install follows an earlier auth-on choice.
+# Field report 2026-07-22: cost a support round-trip. One line here ends that.
+$persistedAuth = [Environment]::GetEnvironmentVariable("FTX_AUTH_REQUIRED", "User")
+if ($persistedAuth -eq "true") {
+    Write-Host "note: FTX_AUTH_REQUIRED=true persisted from a previous install - the UI/API will demand a bearer token. Re-run with -NoAuth to force off (single-user dev box)." -ForegroundColor Yellow
+} elseif ($persistedAuth) {
+    Ok "FTX_AUTH_REQUIRED (User) = $persistedAuth (persisted)"
+}
+
 # Step 0.5: refuse to run inside an MSIX-packaged shell.
 # A shell hosted by a packaged app (e.g. the Microsoft Store build of
 # Claude Desktop - exactly what docs/cowork-quick-install.md used to
@@ -186,7 +197,25 @@ if ($conflicts.Count -gt 0) {
     Write-Host ""
     Write-Host "Port conflicts detected:" -ForegroundColor Yellow
     $conflicts | Format-Table -AutoSize | Out-String | Write-Host
-    Write-Host "Override with env vars: OPTIX_HTTP_PORT, OPTIX_MCP_PORT, OPTIX_HMI_PORT (and re-run)." -ForegroundColor Yellow
+    # Per-conflict guidance. 9222 gets its own remedy: env vars don't move it,
+    # and the most common holder (field report 2026-07-22) is a leftover
+    # ftx-mcp CDP chrome from a previous install - identified by its dedicated
+    # profile dir, in which case services.ps1 stop reaps it.
+    $cdpMarker = Join-Path $env:LOCALAPPDATA "ftx-mcp\chrome-cdp-profile"
+    foreach ($c in $conflicts) {
+        if ($c.Port -eq 9222) {
+            $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($c.Pid)" -ErrorAction SilentlyContinue).CommandLine
+            if ($cmd -and $cmd -like "*$cdpMarker*") {
+                Write-Host "  :9222 is ftx-mcp's own CDP chrome (pid $($c.Pid), likely a previous install)." -ForegroundColor Yellow
+                Write-Host "  Stop it:  .\bootstrap\services.ps1 stop    (then re-run setup)" -ForegroundColor Yellow
+            } else {
+                Write-Host "  :9222 is held by pid $($c.Pid) (not ftx-mcp's CDP chrome)." -ForegroundColor Yellow
+                Write-Host "  Close that app (often a browser started with remote debugging), or re-run with -NoCdp to skip canvas verify." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  :$($c.Port) - override with OPTIX_HTTP_PORT (8765) / OPTIX_MCP_PORT (8766) / OPTIX_RUNTIME_TEST_PORT (8081) and re-run." -ForegroundColor Yellow
+        }
+    }
     Fail "Resolve port conflicts before continuing."
 }
 
