@@ -57,14 +57,58 @@ function Test-Port($port) {
     [bool]$c
 }
 
-function Do-Start($name) {
-    Start-ScheduledTask -TaskName $name
+# The CDP chrome is identified by its dedicated profile dir, NOT just the
+# port: a user's own browser could legitimately hold a debug port, and a
+# reinstall (Unregister + Register in install-chrome-cdp.ps1) ORPHANS any
+# chrome the OLD task spawned - Stop-ScheduledTask on the new task then
+# does nothing while the orphan keeps 9222. Field report 2026-07-22
+# ("cdp has its own mind"). Match on the profile-dir marker so we only
+# ever touch our chrome.
+$cdpProfileMarker = Join-Path $env:LOCALAPPDATA "ftx-mcp\chrome-cdp-profile"
+
+function Get-CdpChromePids($port) {
+    $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+    if (-not $conns) { return @() }
+    $pids = $conns | Select-Object -ExpandProperty OwningProcess -Unique
+    $ours = @()
+    foreach ($procId in $pids) {
+        $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
+        if ($cmd -and $cmd -like "*$cdpProfileMarker*") { $ours += $procId }
+    }
+    return $ours
 }
 
-function Do-Stop($name) {
+function Do-Start($name, $port) {
+    # Returns $true when the task was actually started (caller prints the
+    # start line); $false when it early-returned with its own message.
+    if ($name -eq "ftx-mcp-chrome-cdp") {
+        $ours = Get-CdpChromePids $port
+        if ($ours.Count -gt 0) {
+            Write-Host ("  ok    {0,-28} (cdp chrome already on :{1}, pid {2})" -f $name, $port, ($ours -join ",")) -ForegroundColor Green
+            return $false
+        }
+        $other = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+        if ($other) {
+            $holder = ($other | Select-Object -First 1).OwningProcess
+            Write-Host ("  WARN  {0,-28} :{1} held by pid {2} (NOT the ftx-mcp cdp chrome) - not starting" -f $name, $port, $holder) -ForegroundColor Yellow
+            return $false
+        }
+    }
+    Start-ScheduledTask -TaskName $name
+    return $true
+}
+
+function Do-Stop($name, $port) {
     # Best-effort: a Stop on a task that's already Ready is a no-op error
     # in some PS versions. SilentlyContinue keeps the loop moving.
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if ($name -eq "ftx-mcp-chrome-cdp") {
+        # Reap our chrome even when the task no longer owns it (orphan case).
+        foreach ($procId in (Get-CdpChromePids $port)) {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            Write-Host ("  kill  {0,-28} (orphan cdp chrome pid {1} on :{2})" -f $name, $procId, $port) -ForegroundColor Yellow
+        }
+    }
 }
 
 foreach ($t in $tasks) {
@@ -76,18 +120,20 @@ foreach ($t in $tasks) {
     }
     switch ($Action) {
         "start" {
-            Do-Start $name
-            Write-Host ("  start {0,-28}" -f $name) -ForegroundColor Green
+            if (Do-Start $name $t.Port) {
+                Write-Host ("  start {0,-28}" -f $name) -ForegroundColor Green
+            }
         }
         "stop" {
-            Do-Stop $name
+            Do-Stop $name $t.Port
             Write-Host ("  stop  {0,-28}" -f $name) -ForegroundColor Yellow
         }
         "restart" {
-            Do-Stop $name
+            Do-Stop $name $t.Port
             Start-Sleep -Seconds 1
-            Do-Start $name
-            Write-Host ("  rstrt {0,-28}" -f $name) -ForegroundColor Green
+            if (Do-Start $name $t.Port) {
+                Write-Host ("  rstrt {0,-28}" -f $name) -ForegroundColor Green
+            }
         }
         "enable-autostart" {
             # Opt-in: add an at-logon trigger so the service comes up in the

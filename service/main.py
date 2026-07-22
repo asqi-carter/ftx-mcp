@@ -24,7 +24,7 @@ from typing import Any
 
 import uvicorn
 
-from . import __version__, core
+from . import __version__, _cdp, core
 from .auth import AuthMiddleware, TokenStore
 from .http_app import make_app
 from .mcp_app import make_mcp
@@ -199,11 +199,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"ftx-mcp v{__version__}", flush=True)
     print(f"  HTTP  http://{cfg.bind_host}:{cfg.bind_http_port}", flush=True)
     print(f"  MCP   http://{cfg.bind_host}:{cfg.bind_mcp_port}/mcp", flush=True)
+    print(f"  UI    http://{cfg.bind_host}:{cfg.bind_http_port}/ui", flush=True)
     print(f"  state {cfg.state_dir}", flush=True)
     if cfg.auth_required:
         print(f"  auth  required (tokens loaded: {len(store)})", flush=True)
     else:
         print("  auth  disabled (loopback only)", flush=True)
+    # CDP status at boot: field reports show the chrome-cdp task drifting out
+    # of sync with the service (orphaned chrome after reinstall, task never
+    # started). One probe line here answers "is verify going to work?" without
+    # a support round-trip. probe() never raises; 1s cap keeps boot snappy.
+    _cdp_state = _cdp.probe(cfg.cdp_url, timeout=1.0)
+    if _cdp_state["alive"]:
+        page = "drivable page" if _cdp_state["has_page"] else "no page target"
+        print(f"  cdp   ok ({cfg.cdp_url}, {page})", flush=True)
+    else:
+        print(
+            f"  cdp   not running ({cfg.cdp_url}) - canvas verify unavailable; "
+            "start: bootstrap\\services.ps1 start",
+            flush=True,
+        )
     for line in warns:
         print(f"  {line}", flush=True)
 
