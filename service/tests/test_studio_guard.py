@@ -112,7 +112,9 @@ def test_read_file_ok_when_studio_closed(
 ) -> None:
     p = make_project(projects_root, "Alpha")
     (p / "Nodes").mkdir()
-    (p / "Nodes" / "UI.yaml").write_text("Name: UI\n", encoding="utf-8")
+    # Pin LF on disk: Windows text-mode write translates \n -> \r\n, which
+    # would break the exact-EOL assertion below (read_file preserves EOL).
+    (p / "Nodes" / "UI.yaml").write_text("Name: UI\n", encoding="utf-8", newline="\n")
     set_procs(monkeypatch, [])
     out = core.read_file(cfg, "Alpha", "Nodes/UI.yaml")
     assert out["content"] == "Name: UI\n"
@@ -124,7 +126,8 @@ def test_read_file_proceeds_on_detection_error(
     """An enumeration fault is an infra problem, not evidence of Studio —
     reads proceed (preflight carries the warning)."""
     p = make_project(projects_root, "Alpha")
-    (p / "f.yaml").write_text("x: 1\n", encoding="utf-8")
+    # Pin LF on disk (see note above): keeps the exact-EOL assertion portable.
+    (p / "f.yaml").write_text("x: 1\n", encoding="utf-8", newline="\n")
 
     def boom() -> list[dict]:
         raise OSError("no proc table")
