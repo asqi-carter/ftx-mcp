@@ -132,6 +132,15 @@ if ($execPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
 }
 Ok "ExecutionPolicy (effective) = $execPolicy"
 
+# Elevation check: setup needs NO admin rights, and tasks registered from an
+# elevated shell get Admins-owned descriptors - uninstall/re-register then
+# demands elevation forever after (field report 2026-07-22). Warn, don't block:
+# corp boxes sometimes only hand out elevated shells.
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isElevated) {
+    Write-Host "note: running ELEVATED. Setup does not need admin - scheduled tasks registered from an elevated shell will require an elevated uninstall later. Prefer a regular PowerShell window." -ForegroundColor Yellow
+}
+
 # Surface persisted auth state up front. FTX_AUTH_REQUIRED lives at User env
 # scope and survives re-installs BY DESIGN (see Step 6) - which reads as
 # "auth mysteriously on" when a re-install follows an earlier auth-on choice.
