@@ -1595,7 +1595,14 @@ def _use_bridge_for(cfg: Config, project: str) -> bool:
     try:
         want = resolve_project(cfg, project).name
     except CoreError:
-        return False
+        # Studio can open a project from ANYWHERE (e.g. the Desktop), not only
+        # under projects_root. The bridge serves Project.Current regardless of
+        # on-disk location, so live-model access must not require the project to
+        # resolve under projects_root — fall back to the requested name itself.
+        # Keep the invalid-name guard (no path separators) so junk never matches.
+        if not project or "/" in project or "\\" in project or ".." in project:
+            return False
+        want = project
     return str(st["project"]).strip().lower() == want.strip().lower()
 
 

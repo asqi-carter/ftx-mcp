@@ -39,6 +39,35 @@ _HEALTHY = {"/bridge/health": (200, {"bridge_version": "0.4.0-phase0",
                                      "project": "Alpha", "model_loaded": True})}
 
 
+# ---- _use_bridge_for routing ------------------------------------------
+
+def test_use_bridge_for_project_under_projects_root(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    make_project(projects_root, "Alpha")
+    monkeypatch.setattr(core, "_bridge_http", _bridge(_HEALTHY))  # serves "Alpha"
+    assert core._use_bridge_for(cfg, "Alpha") is True
+
+
+def test_use_bridge_for_project_opened_outside_projects_root(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """Studio can open a project from ANYWHERE (e.g. the Desktop); the bridge
+    serves Project.Current regardless of on-disk location. Route to the bridge
+    by NAME even when the project isn't under projects_root (resolve_project
+    would raise) — otherwise every live-model tool is wrongly refused."""
+    routes = {"/bridge/health": (200, {"bridge_version": "1.0.1",
+                                        "project": "DesktopProj", "model_loaded": True})}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    # Not on disk under projects_root, but the name matches what the bridge serves.
+    assert core._use_bridge_for(cfg, "DesktopProj") is True
+    # A different served project must still be refused.
+    assert core._use_bridge_for(cfg, "OtherProj") is False
+    # Invalid names never match, even via the name fallback.
+    assert core._use_bridge_for(cfg, "a/b") is False
+    assert core._use_bridge_for(cfg, "../x") is False
+
+
 # ---- bridge_state -----------------------------------------------------
 
 def test_bridge_state_available(cfg: core.Config, monkeypatch) -> None:
