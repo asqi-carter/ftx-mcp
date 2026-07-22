@@ -5,7 +5,7 @@ that contributors should know up-front.
 
 ## Repo status
 
-Current release is `v1.0.0`. This project is meant to leverage llms for design edits and testing via a headless browser from the emulator runtime. 
+Current release: see the GitHub Releases page. This project is meant to leverage llms for design edits and testing via a headless browser from the emulator runtime. 
 
 ## What automated checks cover vs. what they can't
 

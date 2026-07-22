@@ -1,6 +1,6 @@
 [project]
 name = "ftx-mcp"
-version = "1.0.1"
+version = "1.0.2"
 description = "MCP server for authoring, previewing, and verifying FactoryTalk Optix Studio changes via the emulator, single Windows box."
 readme = "README.md"
 license = { file = "LICENSE" }
