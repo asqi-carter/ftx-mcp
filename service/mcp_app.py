@@ -6,10 +6,12 @@ MCP client picks the right tool for the right reason.
 """
 from __future__ import annotations
 
+import functools
 import json
 import time
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -2442,6 +2444,36 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                    "optix_add_widget", "optix_add_model_variable",
                    "optix_set_property"):
             mcp._tool_manager._tools.pop(_t, None)
+
+    # Offload the tools that shell out to Studio / PowerShell / Chrome-CDP onto a
+    # worker thread. The official FastMCP runs a sync `def` tool fn DIRECTLY on the
+    # event loop (Tool.run -> FuncMetadata.call_fn_with_arg_validation), so a slow
+    # shell-out (e.g. emulator_status' Get-CimInstance process scan, up to ~15s)
+    # stalls the shared HTTP+MCP loop long enough to drop the MCP streamable-http
+    # transport (the observed 120s optix_emulator_status hang). These are the only
+    # tools with multi-second subprocess/CDP calls; the rest are fast and stay on
+    # the loop. Tool.run reads self.fn/self.is_async at call time, so this takes
+    # effect. (New shell-out tools MUST be added here.)
+    _OFFLOAD_TOOLS = frozenset((
+        "optix_run_emulator", "optix_restart_emulator", "optix_stop_emulator",
+        "optix_emulator_status", "optix_save", "optix_studio_version",
+        "optix_services_status", "optix_doctor",
+        "optix_cdp_screenshot", "optix_cdp_click", "optix_cdp_fill",
+        "optix_cdp_type", "optix_cdp_key", "optix_cdp_ocr", "optix_cdp_restart",
+        "optix_runtime_start", "optix_runtime_stop", "optix_runtime_status",
+    ))
+    for _name, _tool in mcp._tool_manager._tools.items():
+        if _name not in _OFFLOAD_TOOLS or _tool.is_async:
+            continue
+        _sync_fn = _tool.fn
+
+        async def _offloaded(*a, _sync_fn=_sync_fn, **k):
+            return await anyio.to_thread.run_sync(functools.partial(_sync_fn, *a, **k))
+
+        _offloaded.__name__ = getattr(_sync_fn, "__name__", "tool")
+        _offloaded.__doc__ = _sync_fn.__doc__
+        _tool.fn = _offloaded
+        _tool.is_async = True
 
     # Per-call traffic stats (state_dir/logs/traffic.jsonl): wrap the
     # ToolManager dispatch so every MCP tool call records name, request/

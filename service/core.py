@@ -2517,7 +2517,7 @@ def run_emulator(
     project: str,
     save_first: bool = False,
     wait_ready: bool = True,
-    ready_timeout: float = 30.0,
+    ready_timeout: float = 60.0,
     runner: Runner = _DEFAULT_RUNNER,
 ) -> dict:
     """Launch the project in Studio's built-in emulator by sending F5.
@@ -2644,6 +2644,17 @@ def run_emulator(
                     "The emulator process exists but its port isn't serving yet — "
                     "still building/loading. Poll optix_emulator_status until "
                     "`running`; do NOT resend F5 (it TOGGLES and would stop it).")
+            elif st.get("state") == "not_running" and _bare_runtime_running(cfg, runner):
+                # A FTOptixRuntime process DOES exist, but the strict
+                # --application-name=Emulator identity match / CIM timing can't
+                # confirm it yet and the port isn't serving: that's a slow START,
+                # not a failed spawn. Report "starting" instead of crying wolf.
+                result["runtime_identity"] = "starting"
+                result["hint"] = (
+                    f"An FTOptixRuntime process exists but :{port} isn't serving yet "
+                    "and its emulator identity isn't confirmable yet — still starting. "
+                    "Poll optix_emulator_status until `running`; do NOT resend F5 "
+                    "(it TOGGLES and would stop it).")
             elif st.get("state") == "not_running":
                 tgt = studio_active_deployment_target(cfg)
                 file_claims_emu = tgt.get("known") and tgt.get("is_emulator")
@@ -2673,6 +2684,23 @@ def run_emulator(
             "keystroke — run both at the same integrity level."
         )
     return result
+
+
+def _bare_runtime_running(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> bool:
+    """Any FTOptixRuntime.exe process at all — the identity-agnostic fallback for
+    run_emulator's spawn check. The strict --application-name=Emulator match in
+    emulator_status can miss a just-F5'd runtime whose CommandLine isn't in CIM
+    yet, or lag on a busy box; a bare presence check tells 'still starting' apart
+    from 'nothing spawned'. Best-effort; returns False on any error.
+    """
+    ps = ("$p = Get-Process FTOptixRuntime -ErrorAction SilentlyContinue; "
+          "if ($p) { 'RUNTIMES=' + $p.Count } else { 'RUNTIMES=0' }")
+    try:
+        proc = runner.run(["powershell", "-NoProfile", "-Command", ps], timeout=15)
+        m = re.search(r"RUNTIMES=(\d+)", proc.stdout or "")
+        return bool(m) and int(m.group(1)) > 0
+    except Exception:
+        return False
 
 
 def emulator_status(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> dict:
@@ -3453,6 +3481,40 @@ def runtime_stop(
 _CHROME_CDP_TASK = "ftx-mcp-chrome-cdp"
 
 
+def _chrome_cdp_profile_dir() -> Path:
+    """The CDP Chrome's user-data-dir (see bootstrap/install-chrome-cdp.ps1)."""
+    root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(root) / "ftx-mcp" / "chrome-cdp-profile"
+
+
+def _cleanup_stale_cdp_chrome(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> None:
+    """Kill wedged chrome.exe from OUR CDP profile and clear its Singleton locks.
+
+    A crashed/hung CDP Chrome leaves a chrome.exe holding the profile's
+    SingletonLock, so a fresh task-launched Chrome can't bind the debug port.
+    Scoped strictly by --remote-debugging-port + the chrome-cdp-profile
+    user-data-dir on the command line, so a normal user Chrome is untouched.
+    Best-effort — never raises.
+    """
+    from urllib.parse import urlparse
+    port = urlparse(cfg.cdp_url).port or 9222
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" "
+          "-ErrorAction SilentlyContinue | Where-Object { "
+          f"$_.CommandLine -match '--remote-debugging-port={port}' -and "
+          "$_.CommandLine -match 'chrome-cdp-profile' } | ForEach-Object { "
+          "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    try:
+        runner.run(["powershell", "-NoProfile", "-Command", ps], timeout=15)
+    except Exception:
+        pass
+    profile = _chrome_cdp_profile_dir()
+    for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (profile / lock).unlink()
+        except OSError:
+            pass
+
+
 def ensure_chrome_cdp(
     cfg: Config, runner: Runner = _DEFAULT_RUNNER, allow_restart: bool = True,
     wait_seconds: float = 12.0,
@@ -3497,7 +3559,9 @@ def ensure_chrome_cdp(
                 "restarted": False,
                 "detail": f"CDP {cfg.cdp_url} down and restart disabled"}
 
-    # Tier 2 — relaunch the task, then wait for the port.
+    # Tier 2 — clear any wedged CDP Chrome holding the profile SingletonLock,
+    # then relaunch the task and wait for the port.
+    _cleanup_stale_cdp_chrome(cfg, runner)
     try:
         runner.run(["schtasks", "/run", "/tn", _CHROME_CDP_TASK], timeout=15)
     except Exception as e:

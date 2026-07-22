@@ -210,6 +210,24 @@ def test_mcp_deploy_preflight_tool_returns_envelope(
         assert key in out, f"preflight envelope missing {key!r}: {out}"
 
 
+def test_shellout_tools_are_offloaded_async(cfg: core.Config) -> None:
+    """Slow shell-out tools are async-wrapped so their blocking subprocess/CDP
+    calls run OFF the shared event loop. A sync tool fn runs directly on the loop
+    (FastMCP Tool.run), so a multi-second Studio/CDP call would stall the loop and
+    drop the MCP streamable-http transport (the observed 120s emulator_status
+    hang). Fast tools stay sync (so tests can call .fn directly and there's no
+    needless thread hop)."""
+    mcp = make_mcp(cfg)
+    by_name = {t.name: t for t in _list_tools(mcp)}
+    for n in ("optix_emulator_status", "optix_run_emulator", "optix_restart_emulator",
+              "optix_cdp_screenshot", "optix_cdp_click", "optix_studio_version",
+              "optix_doctor", "optix_services_status", "optix_save"):
+        assert by_name[n].is_async is True, f"{n} must be offloaded (async)"
+    for n in ("optix_health", "optix_list_projects", "optix_describe_node",
+              "optix_bridge_set_property", "optix_get_project_map"):
+        assert by_name[n].is_async is False, f"{n} should stay sync"
+
+
 def test_mcp_call_tool_path_invokes_health(cfg: core.Config) -> None:
     """Exercise the FastMCP `call_tool` async path so we know the
     registered tool surface is wired through the manager, not just
