@@ -58,8 +58,16 @@ if ($existing) { Unregister-ScheduledTask -TaskName "ftx-mcp-chrome-cdp" -Confir
 $action = New-ScheduledTaskAction -Execute $chrome -Argument $chromeArgs
 # No -Trigger. Start via bootstrap/services.ps1 start.
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+# Restart-on-failure + unlimited ExecutionTimeLimit: the scheduler's 72h
+# default otherwise kills the headless chrome mid-week, and a crashed
+# chrome silently strands canvas verify (field-validated fix). Restarts
+# only cover mid-session crashes - after logoff, services.ps1 start.
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 Register-ScheduledTask `
     -TaskName "ftx-mcp-chrome-cdp" `
-    -Action $action -Principal $principal | Out-Null
+    -Action $action -Principal $principal -Settings $settings | Out-Null
 $mode = if ($Headed) { "headed" } else { "headless" }
 Ok "Chrome CDP scheduled task registered ($mode; manual start; --remote-debugging-port=9222)"

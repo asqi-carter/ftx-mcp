@@ -3,14 +3,14 @@ name = "ftx-mcp"
 version = "1.0.2"
 description = "MCP server for authoring, previewing, and verifying FactoryTalk Optix Studio changes via the emulator, single Windows box."
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [
     { name = "ASQI" },
 ]
 keywords = ["factorytalk", "optix", "mcp", "rockwell", "ot"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -45,7 +45,7 @@ Issues = "https://github.com/asqi-carter/ftx-mcp/issues"
 Specification = "https://github.com/asqi-carter/ftx-mcp/blob/main/docs/architecture.md"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
