@@ -45,6 +45,11 @@ cd ftx-mcp
 http://127.0.0.1:8765/ui                               # health dashboard
 ```
 
+To remove an install (or reset before a clean reinstall):
+`.\bootstrap\uninstall.ps1` stops and unregisters the scheduled tasks and
+reaps any leftover CDP chrome; add `-All` to also delete state (issued
+tokens, chrome profile, persisted auth choice) and the venv.
+
 ## Start the Studio Bridge (5 minutes)
 
 1. **One-time bridge setup** (per project): in the Studio project tree,

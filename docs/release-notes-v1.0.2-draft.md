@@ -35,6 +35,11 @@ Security and field-report fixes. Thanks to first-time contributor
 
 ## Improvements
 
+- **New `bootstrap/uninstall.ps1`** — the missing mirror of setup: stops and
+  unregisters both scheduled tasks and reaps leftover CDP chrome (orphan-
+  aware); `-PurgeState` / `-PurgeVenv` / `-All` for a true clean slate.
+  Makes reinstall testing a two-command loop.
+
 - **Boot banner now prints the UI dashboard URL and CDP status**, e.g.
   `cdp ok (http://127.0.0.1:9222, drivable page)` or a clear
   "not running — canvas verify unavailable" line with the start command.
