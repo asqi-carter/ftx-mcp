@@ -236,6 +236,24 @@ def test_unknown_edit_shape_refused(cfg: core.Config, projects_root: Path) -> No
         _deploy(cfg, "Alpha", [{"path": "a.yaml", "replace": "x: 2"}])  # no find/content/insert
 
 
+def test_multi_mode_edit_refused_without_touching_file(
+    cfg: core.Config, projects_root: Path
+) -> None:
+    """A stray 'content' alongside find/replace must be rejected, not silently
+    overwrite the whole file via mode precedence."""
+    proj = make_project(projects_root, "Alpha")
+    f = _write(proj, "a.yaml", "MaxConnections: 5\nOtherField: 5\n")
+    before = f.read_bytes()
+    with pytest.raises(core.InvalidEdit):
+        _deploy(cfg, "Alpha", [{
+            "path": "a.yaml",
+            "content": "Name: New\n",            # would clobber the file
+            "find": "MaxConnections: 5",         # caller's actual intent
+            "replace": "MaxConnections: 6",
+        }])
+    assert f.read_bytes() == before  # atomic refusal: file untouched
+
+
 def test_anchored_edit_on_missing_file_refused(cfg: core.Config, projects_root: Path) -> None:
     make_project(projects_root, "Alpha")
     with pytest.raises(core.FileNotFound):

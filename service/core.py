@@ -1871,6 +1871,17 @@ def _resolve_edit_content(target: Path, edit: dict, rel: str) -> tuple[bytes, di
     deploy() resolves the whole batch first and only then writes, so any
     anchor mismatch refuses the batch atomically — zero files touched.
     """
+    # Exactly one authoring mode per edit (InvalidEdit contract). Reject a dict
+    # that declares more than one instead of letting a silent precedence order
+    # pick a winner: a stray "content" alongside find/replace would otherwise
+    # overwrite the whole file while the caller expected a surgical replace.
+    modes = [k for k in ("content", "find", "insert_after_anchor") if k in edit]
+    if len(modes) > 1:
+        raise InvalidEdit(
+            f"edit on {rel} declares multiple modes {modes}; each edit is exactly "
+            "one of: content / find+replace / insert_after_anchor+block"
+        )
+
     if "content" in edit:
         new_text = edit["content"]
         new_bytes = new_text.encode("utf-8")
@@ -4340,9 +4351,18 @@ class RuntimeController:
         # references the runtime project dir, then kill them. WMI's
         # CommandLine match is the safest way to scope to *this* project's
         # runtime instance without touching others.
+        #
+        # Match the dir WITH a trailing separator so a sibling project whose
+        # name shares a prefix ('Proj' vs 'Proj2') is not also killed — a bare
+        # substring match on the dir would catch 'Proj2'. The runtime exe lives
+        # at <dir>\FTOptixApplication\FTOptixRuntime.exe, so the trailing
+        # separator is always present in a genuinely matching command line.
+        # Double any single quote so a dir name containing ' can't break out of
+        # the PowerShell single-quoted literal.
+        match_literal = (str(runtime_project_dir) + os.sep).replace("'", "''")
         ps = (
             "Get-CimInstance Win32_Process -Filter \"Name='FTOptixRuntime.exe'\" | "
-            f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{runtime_project_dir}') }} | "
+            f"Where-Object {{ $_.CommandLine -match [regex]::Escape('{match_literal}') }} | "
             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
         )
         self.runner.run(["powershell", "-NoProfile", "-Command", ps], timeout=30)
