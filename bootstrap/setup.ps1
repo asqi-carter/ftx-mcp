@@ -437,7 +437,7 @@ if ($NoCdp) {
 # Probes the loopback HTTP port for a 200 response. Skipped when
 # -NoServiceRegister is set (no service was registered/started; the
 # probe would always time out).
-Section "10. Verify /health"
+Section "9. Verify /health"
 if ($NoServiceRegister) {
     Ok "skipped (-NoServiceRegister; no service was registered to probe)"
 } else {
