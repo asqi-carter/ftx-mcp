@@ -82,7 +82,7 @@ function Do-Start($name, $port) {
     # Returns $true when the task was actually started (caller prints the
     # start line); $false when it early-returned with its own message.
     if ($name -eq "ftx-mcp-chrome-cdp") {
-        $ours = Get-CdpChromePids $port
+        $ours = @(Get-CdpChromePids $port)
         if ($ours.Count -gt 0) {
             Write-Host ("  ok    {0,-28} (cdp chrome already on :{1}, pid {2})" -f $name, $port, ($ours -join ",")) -ForegroundColor Green
             return $false
@@ -104,7 +104,7 @@ function Do-Stop($name, $port) {
     Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if ($name -eq "ftx-mcp-chrome-cdp") {
         # Reap our chrome even when the task no longer owns it (orphan case).
-        foreach ($procId in (Get-CdpChromePids $port)) {
+        foreach ($procId in @(Get-CdpChromePids $port)) {
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
             Write-Host ("  kill  {0,-28} (orphan cdp chrome pid {1} on :{2})" -f $name, $procId, $port) -ForegroundColor Yellow
         }
