@@ -65,6 +65,7 @@ ignore = [
 "service/tests/*" = ["S101"]  # asserts in tests are fine
 "service/core.py" = ["N818", "N806"]  # domain exception names + Win32 constant naming
 "service/deploy_lock.py" = ["N818", "N806"]  # LockHeld + Win32 constant naming
+"service/mcp_app.py" = ["N818", "N806"]  # ScopeInsufficient exception + dispatch constant
 
 [tool.mypy]
 python_version = "3.11"
