@@ -1928,8 +1928,8 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     def optix_cdp_screenshot(
         save_path: str | None = None, quality: int = 65,
         navigate_url: str | None = None, settle_seconds: float | None = None,
-        fresh: bool = False,
-    ) -> dict:
+        fresh: bool = False, return_image: bool = False,
+    ):
         """Screenshot the running Optix HMI (emulator or deployed runtime) via
         CDP — THE way to visually verify a change.
 
@@ -1953,14 +1953,20 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         screenshot the current tab as-is.
 
         CDP Page.captureScreenshot — no tab plumbing. This tool ALWAYS writes the JPEG
-        to a file and returns its `path`; **read the file back with your file tool.**
-        It does NOT return inline base64: a large b64 makes some hosts try to *render*
-        it inline (Cowork's "visualize"), which can hang for a long time on a sandboxed
-        or headless host. A file path avoids that entirely (verified: file-path runs are
-        fast, b64 runs stall on "visualize…"). **Prefer passing your own `save_path`**
-        in your session/output directory so your file tool can definitely read it;
-        omit it and the tool picks a temp path. Returns {state, path, size_bytes,
-        navigated, captured_at}. The coordinate system matches optix_cdp_click.
+        to a file and returns its `path`; by default **read the file back with your
+        file tool.** It does NOT put base64 in the JSON: a large b64 string makes some
+        hosts try to *render* it inline (Cowork's "visualize"), which can hang for a
+        long time on a sandboxed or headless host (verified: file-path runs are fast,
+        b64-in-JSON runs stall). **Prefer passing your own `save_path`** in your
+        session/output directory so your file tool can definitely read it; omit it and
+        the tool picks a temp path.
+
+        `return_image=true` additionally returns the capture as TYPED MCP image
+        content (not b64-in-JSON) so the model sees it in the same turn with no file
+        round-trip — use when your host's file tool cannot reach the service's
+        filesystem. If your host stalls rendering it, go back to the file-path flow.
+        Returns {state, path, size_bytes, navigated, captured_at, hint}. The
+        coordinate system matches optix_cdp_click.
 
         Use this when:
           - VALIDATING a deploy: capture the runtime HMI to confirm the change is live
@@ -1977,10 +1983,23 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             d = os.path.join(tempfile.gettempdir(), "ftx-cdp-screenshots")
             os.makedirs(d, exist_ok=True)
             save_path = os.path.join(d, f"runtime-{int(time.time() * 1000)}.jpg")
-        return core.cdp_screenshot_runtime(
+        result = core.cdp_screenshot_runtime(
             cfg, save_path=save_path, quality=quality,
             navigate_url=navigate_url, settle_seconds=settle_seconds,
             fresh=fresh)
+        if result.get("state") == "succeeded":
+            result["hint"] = (
+                "JPEG written to `path` - read it with your file tool. If your "
+                "file tool cannot reach that path, re-call with save_path inside "
+                "your workspace, or return_image=true to receive the image inline."
+            )
+        if return_image and result.get("state") == "succeeded" and result.get("path"):
+            # Typed MCP image content (ImageContent block), NOT b64 stuffed in the
+            # JSON text - the b64-in-JSON shape is what stalled Cowork's visualize
+            # (see docstring). Metadata rides along as a JSON text block.
+            from mcp.server.fastmcp import Image as _McpImage
+            return [json.dumps(result), _McpImage(path=result["path"])]
+        return result
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def optix_cdp_ocr(

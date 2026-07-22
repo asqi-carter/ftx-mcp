@@ -311,3 +311,70 @@ def test_server_ships_instructions(cfg: core.Config) -> None:
     ins = mcp._mcp_server.instructions or ""
     assert "optix_list_skills" in ins and "optix_restart_emulator" in ins
     assert len(ins) < 1200, "instructions must stay lean — they cost every session"
+
+
+def test_cdp_screenshot_default_returns_dict_with_hint(
+    cfg: core.Config, monkeypatch, tmp_path
+) -> None:
+    """Default (return_image=False) keeps the verified-safe path-only shape,
+    now with a hint field telling the model what to do with the path."""
+    shot = tmp_path / "shot.jpg"
+    shot.write_bytes(b"\xff\xd8\xff\xdbfakejpeg")
+
+    def fake_capture(cfg_, save_path=None, **kw):
+        return {"state": "succeeded", "path": str(shot), "b64": None,
+                "size_bytes": 8, "navigated": False, "captured_at": "t"}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(save_path=str(shot))
+    assert isinstance(out, dict)
+    assert out["state"] == "succeeded"
+    assert "hint" in out and "file tool" in out["hint"]
+
+
+def test_cdp_screenshot_return_image_yields_typed_image_content(
+    cfg: core.Config, monkeypatch, tmp_path
+) -> None:
+    """return_image=true returns [json-metadata, Image] — TYPED MCP image
+    content, never b64 stuffed into the JSON text (the shape that stalled
+    Cowork's visualize; see tool docstring)."""
+    import json as _json
+
+    from mcp.server.fastmcp import Image as McpImage
+
+    shot = tmp_path / "shot.jpg"
+    shot.write_bytes(b"\xff\xd8\xff\xdbfakejpeg")
+
+    def fake_capture(cfg_, save_path=None, **kw):
+        return {"state": "succeeded", "path": str(shot), "b64": None,
+                "size_bytes": 8, "navigated": False, "captured_at": "t"}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(save_path=str(shot), return_image=True)
+    assert isinstance(out, list) and len(out) == 2
+    meta = _json.loads(out[0])
+    assert meta["state"] == "succeeded" and meta["path"] == str(shot)
+    assert isinstance(out[1], McpImage)
+    # b64 must not ride in the JSON text block
+    assert "b64" not in out[0] or _json.loads(out[0]).get("b64") in (None,)
+
+
+def test_cdp_screenshot_return_image_failure_stays_dict(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """A failed capture with return_image=true returns the plain error dict —
+    no image block, no crash on a missing file."""
+    def fake_capture(cfg_, save_path=None, **kw):
+        return {"state": "failed", "path": None, "b64": None, "size_bytes": 0,
+                "navigated": False, "captured_at": "t", "error": "boom"}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(return_image=True)
+    assert isinstance(out, dict)
+    assert out["state"] == "failed"
