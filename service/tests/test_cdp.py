@@ -614,3 +614,179 @@ def test_find_text_reports_tesseract_nonzero(cfg, fake_cdp, monkeypatch):
     out = core.cdp_find_text_runtime(cfg, "Start", runner=runner)
     assert out["state"] == "failed" and "leptonica" in out["error"]
     assert out["found"] is False and out["matches"] == []
+
+
+# ---- cdp_navigate (S5): blind navigation via banked routes files --------
+
+def _write_routes(tmp_path: Path, routes: dict) -> Path:
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps({"version": 1, "routes": routes}))
+    return p
+
+
+def test_navigate_happy_path_resolves_coords_and_honors_settle_and_expect(
+    cfg, fake_cdp, tmp_path: Path, monkeypatch,
+):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "setup-values": {"steps": [
+            {"click": [0.5, 0.5], "settle_seconds": 0.25, "expect_text": "Setup Values"},
+            {"click": [100, 50]},  # pixel-coord step (both > 1)
+        ]}
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    recorded_sleep: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: recorded_sleep.append(s))
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "Setup Values panel loaded"))
+
+    out = core.cdp_navigate_runtime(
+        cfg, route="setup-values", routes_path=str(routes_file),
+        navigate_url="", runner=runner)
+
+    assert out["state"] == "succeeded"
+    assert out["route"] == "setup-values"
+    assert out["steps_run"] == 2
+    assert out["verified_steps"] == 1
+    assert "ocr_unavailable" not in out
+    assert out["navigated"] is False
+
+    # step 1 normalized against the fake 1000x800 viewport; step 2 pixel passthrough
+    presses = [(p["x"], p["y"]) for (m, p, _) in ws.sent
+               if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+    assert presses == [(500.0, 400.0), (100.0, 50.0)]
+
+    # step 1's explicit settle_seconds honored; step 2 falls back to cfg default
+    assert recorded_sleep == [0.25, cfg.cdp_settle_seconds]
+
+    # tesseract ran exactly once (only step 1 carries expect_text)
+    assert len(runner.calls) == 1
+
+
+def test_navigate_expectation_failure_stops_route_and_reports_readback(
+    cfg, fake_cdp, tmp_path: Path, monkeypatch,
+):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "r1": {"steps": [
+            {"click": [0.1, 0.1], "expect_text": "Never Shown"},
+            {"click": [0.9, 0.9]},
+        ]}
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "Something else entirely"))
+
+    out = core.cdp_navigate_runtime(
+        cfg, route="r1", routes_path=str(routes_file), navigate_url="", runner=runner)
+
+    assert out["state"] == "failed"
+    assert out["error"] == "expectation_failed"
+    assert out["step"] == 0
+    assert out["expected"] == "Never Shown"
+    assert "Something else entirely" in out["read_back"]
+
+    # only step 0's click happened; step 1 never ran
+    presses = [p for (m, p, _) in ws.sent
+               if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+    assert len(presses) == 1
+
+
+def test_navigate_tesseract_absent_skips_checks_but_runs_all_clicks(
+    cfg, fake_cdp, tmp_path: Path, monkeypatch,
+):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "r1": {"steps": [
+            {"click": [0.1, 0.1], "expect_text": "Anything"},
+            {"click": [0.2, 0.2]},
+        ]}
+    })
+    ws = fake_cdp(results={"Page.getLayoutMetrics": _layout_metrics(1000, 800)})
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    out = core.cdp_navigate_runtime(
+        cfg, route="r1", routes_path=str(routes_file), navigate_url="")
+
+    assert out["state"] == "succeeded"
+    assert out["ocr_unavailable"] is True
+    assert out["steps_run"] == 2
+    assert out["verified_steps"] == 0
+    presses = [p for (m, p, _) in ws.sent
+               if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+    assert len(presses) == 2
+    # never even captured a screenshot for OCR since tesseract is absent
+    assert not [m for (m, _, _) in ws.sent if m == "Page.captureScreenshot"]
+
+
+def test_navigate_missing_routes_file(cfg, fake_cdp, tmp_path: Path):
+    ws = fake_cdp()
+    out = core.cdp_navigate_runtime(
+        cfg, route="r1", routes_path=str(tmp_path / "missing.json"))
+    assert out["state"] == "failed" and out["error"] == "routes_file_not_found"
+    assert not ws.sent  # never opened a CDP session for a file error
+
+
+def test_navigate_invalid_json(cfg, fake_cdp, tmp_path: Path):
+    routes_file = tmp_path / "routes.json"
+    routes_file.write_text("{not valid json")
+    ws = fake_cdp()
+    out = core.cdp_navigate_runtime(cfg, route="r1", routes_path=str(routes_file))
+    assert out["state"] == "failed" and out["error"] == "routes_file_invalid"
+    assert not ws.sent
+
+
+def test_navigate_unknown_route_lists_available(cfg, fake_cdp, tmp_path: Path):
+    routes_file = _write_routes(tmp_path, {
+        "alpha": {"steps": [{"click": [0, 0]}]},
+        "beta": {"steps": [{"click": [0, 0]}]},
+    })
+    ws = fake_cdp()
+    out = core.cdp_navigate_runtime(
+        cfg, route="missing-route", routes_path=str(routes_file))
+    assert out["state"] == "failed" and out["error"] == "route_not_found"
+    assert out["available"] == ["alpha", "beta"]
+    assert not ws.sent
+
+
+def test_navigate_malformed_step_missing_click(cfg, fake_cdp, tmp_path: Path):
+    routes_file = _write_routes(tmp_path, {
+        "r1": {"steps": [{"settle_seconds": 0.1}]}
+    })
+    ws = fake_cdp()
+    out = core.cdp_navigate_runtime(cfg, route="r1", routes_path=str(routes_file))
+    assert out["state"] == "failed" and out["error"] == "route_invalid"
+    assert out["step"] == 0
+    assert not ws.sent
+
+
+def test_navigate_malformed_step_wrong_shape_click(cfg, fake_cdp, tmp_path: Path):
+    routes_file = _write_routes(tmp_path, {
+        "r1": {"steps": [{"click": [0.1, 0.2, 0.3]}]}
+    })
+    ws = fake_cdp()
+    out = core.cdp_navigate_runtime(cfg, route="r1", routes_path=str(routes_file))
+    assert out["state"] == "failed" and out["error"] == "route_invalid"
+    assert out["step"] == 0
+    assert not ws.sent
+
+
+def test_navigate_malformed_step_reported_at_correct_index(cfg, fake_cdp, tmp_path: Path):
+    routes_file = _write_routes(tmp_path, {
+        "r1": {"steps": [
+            {"click": [0.1, 0.1]},
+            {"click": "not-a-list"},
+        ]}
+    })
+    fake_cdp()
+    out = core.cdp_navigate_runtime(cfg, route="r1", routes_path=str(routes_file))
+    assert out["state"] == "failed" and out["error"] == "route_invalid"
+    assert out["step"] == 1

@@ -4163,6 +4163,213 @@ def cdp_find_text_runtime(
     }
 
 
+# ---- cdp_navigate: blind navigation to a banked route (S5) ------------
+
+def _load_routes_file(routes_path: str) -> tuple[dict | None, dict | None]:
+    """Load + parse a navigation routes JSON file (see optix_cdp_navigate /
+    the optix-blind-authoring skill for the format). Returns (data, None) on
+    success, or (None, error_response) with the standard failed-envelope on
+    a missing/unparseable/malformed file. Never raises."""
+    path = Path(routes_path)
+    if not path.is_file():
+        return None, {"state": "failed", "error": "routes_file_not_found",
+                       "routes_path": str(path)}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        return None, {"state": "failed", "error": "routes_file_invalid",
+                       "routes_path": str(path), "detail": str(e)}
+    if not isinstance(data, dict) or not isinstance(data.get("routes"), dict):
+        return None, {"state": "failed", "error": "routes_file_invalid",
+                       "routes_path": str(path),
+                       "detail": "routes file must be a JSON object with a 'routes' map"}
+    return data, None
+
+
+def _validate_route_steps(steps: Any) -> tuple[list, str | None, int | None]:
+    """Shape-validate a route's `steps` list before any CDP work starts.
+
+    Checks structure only (click present, [x, y] shape, numeric values,
+    optional settle_seconds/expect_text types) — NOT viewport bounds, which
+    can only be resolved once a CDP session is open (see _resolve_point).
+    Returns (steps, None, None) on success, or (steps, detail_str, bad_index)
+    naming the first offending step. Never raises."""
+    if not isinstance(steps, list) or not steps:
+        return steps, "route has no steps", 0
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return steps, f"step {i} is not an object", i
+        click = step.get("click")
+        if not isinstance(click, (list, tuple)) or len(click) != 2:
+            return steps, f"step {i} missing/invalid 'click' [x, y]", i
+        try:
+            float(click[0]), float(click[1])
+        except (TypeError, ValueError):
+            return steps, f"step {i} 'click' values must be numeric", i
+        settle = step.get("settle_seconds")
+        if settle is not None:
+            try:
+                float(settle)
+            except (TypeError, ValueError):
+                return steps, f"step {i} 'settle_seconds' must be numeric", i
+        expect_text = step.get("expect_text")
+        if expect_text is not None and not isinstance(expect_text, str):
+            return steps, f"step {i} 'expect_text' must be a string", i
+    return steps, None, None
+
+
+def _resolve_point(sess: Any, point: Any) -> tuple[list[float] | None, str | None]:
+    """Resolve a route step's `click` [x, y] to absolute CSS pixels.
+
+    Same convention as _resolve_region: if BOTH values are <= 1.0 the point
+    is normalized viewport fractions (resolved via sess.viewport_size()); if
+    either value is > 1 the point is already absolute pixels. Returns
+    (pixel_point, None) on success, or (None, detail_str) for malformed/
+    out-of-frame input — never raises for bad input (only a genuine CDP
+    transport error propagates, via sess.viewport_size())."""
+    if not isinstance(point, (list, tuple)) or len(point) != 2:
+        return None, "click must be [x, y]"
+    try:
+        x, y = (float(v) for v in point)
+    except (TypeError, ValueError):
+        return None, "click values must be numeric"
+    if x < 0 or y < 0:
+        return None, "click x/y must be >= 0"
+    vp_w, vp_h = sess.viewport_size()
+    if vp_w <= 0 or vp_h <= 0:
+        return None, "could not resolve viewport size"
+    if x <= 1.0 and y <= 1.0:
+        px = [x * vp_w, y * vp_h]
+    else:
+        px = [x, y]
+    if px[0] >= vp_w or px[1] >= vp_h:
+        return None, f"click {px} outside viewport {vp_w:g}x{vp_h:g}"
+    return px, None
+
+
+def cdp_navigate_runtime(
+    cfg: Config, route: str, routes_path: str, expect: bool = True,
+    navigate_url: str | None = None, runner: Runner = _DEFAULT_RUNNER,
+) -> dict:
+    """Blind-navigate the runtime canvas through a banked sequence of clicks
+    from a routes JSON file — zero screenshots to get to a known screen.
+
+    Routes file format (version 1): `{"version": 1, "routes": {"<name>":
+    {"steps": [{"click": [x, y], "settle_seconds": 0.5, "expect_text":
+    "..."}]}}}`. `click` uses the SAME coordinate convention as
+    optix_cdp_screenshot's `region`: both values <= 1.0 are normalized
+    viewport fractions, any value > 1 is absolute pixels. `settle_seconds`
+    per step defaults to cfg.cdp_settle_seconds. `expect_text` is optional
+    per-step OCR verification (see below). Convention: bank routes at
+    `dev/ftx_ui_map.json` in the project workspace (the optix-blind-authoring
+    skill's cache format).
+
+    ONE CDP session drives the whole route (mirrors optix_cdp_click's
+    lifecycle). When navigate_url is omitted, auto-targets the local runtime
+    first exactly like optix_cdp_screenshot (skipping the reload if the tab
+    is already there, preserving prior state); pass navigate_url="" to act
+    on the current tab as-is.
+
+    Per step: resolve `click` to pixels, dispatch a trusted CDP click (same
+    as optix_cdp_click), wait settle_seconds, then — if expect=True and the
+    step has expect_text — OCR the frame (tesseract) and check expect_text
+    is a case-insensitive substring of the recognized text. On the FIRST
+    expectation failure, navigation STOPS immediately: state='failed',
+    error='expectation_failed', step=<index>, expected=<text>,
+    read_back=<first ~200 chars of OCR text> — later steps do not run. Fail
+    loud, never drift blind past a screen that didn't load as expected.
+
+    If tesseract is not installed and any step in the route carries
+    expect_text (with expect=True), the navigation is NOT failed — expect_text
+    checks are skipped for the whole run and the response carries
+    ocr_unavailable=true (the clicks themselves are still valuable even
+    without text verification).
+
+    File/route problems never raise: missing routes_path -> state='failed',
+    error='routes_file_not_found'; unparseable JSON -> 'routes_file_invalid';
+    unknown route name -> 'route_not_found' with `available` listing the
+    known route names; a malformed step (no `click`, wrong shape/types) ->
+    'route_invalid' naming the offending `step` index.
+
+    Returns on success: {state: 'succeeded', route, steps_run, verified_steps,
+    ocr_unavailable?, navigated, finished_at}.
+    """
+    from . import _cdp
+    audit(cfg, "cdp_navigate", route=route, routes_path=str(routes_path))
+
+    data, err = _load_routes_file(routes_path)
+    if err is not None:
+        return err
+    routes = data["routes"]
+    if route not in routes:
+        return {"state": "failed", "error": "route_not_found", "route": route,
+                "available": sorted(routes.keys())}
+    route_def = routes[route]
+    raw_steps = route_def.get("steps") if isinstance(route_def, dict) else None
+    steps, verr, bad_idx = _validate_route_steps(raw_steps)
+    if verr is not None:
+        return {"state": "failed", "error": "route_invalid", "route": route,
+                "step": bad_idx, "detail": verr}
+
+    settle_default = cfg.cdp_settle_seconds
+    ocr_unavailable = False
+    tesseract: str | None = None
+    if expect and any(s.get("expect_text") for s in steps):
+        tesseract = _find_tesseract()
+        if tesseract is None:
+            ocr_unavailable = True
+
+    sess = _cdp_session(cfg)
+    steps_run = 0
+    verified_steps = 0
+    try:
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default)
+        for i, step in enumerate(steps):
+            px_point, perr = _resolve_point(sess, step["click"])
+            if perr is not None:
+                return {"state": "failed", "error": "route_invalid", "route": route,
+                        "step": i, "detail": perr, "steps_run": steps_run}
+            sess.click(px_point[0], px_point[1])
+            steps_run += 1
+            step_settle = step.get("settle_seconds")
+            step_settle = settle_default if step_settle is None else float(step_settle)
+            time.sleep(max(0.0, step_settle))
+
+            expect_text = step.get("expect_text")
+            if expect and expect_text and not ocr_unavailable:
+                import tempfile
+                jpeg = sess.screenshot_jpeg()
+                with tempfile.TemporaryDirectory() as td:
+                    img = Path(td) / "nav.jpg"
+                    img.write_bytes(jpeg)
+                    proc = runner.run(
+                        [tesseract, str(img), "stdout", "--psm", "6"], timeout=30)
+                    read_back = (proc.stdout or "") if proc.returncode == 0 else ""
+                if expect_text.lower() not in read_back.lower():
+                    return {
+                        "state": "failed", "error": "expectation_failed",
+                        "route": route, "step": i, "expected": expect_text,
+                        "read_back": read_back.strip()[:200],
+                        "steps_run": steps_run,
+                    }
+                verified_steps += 1
+
+        result: dict[str, Any] = {
+            "state": "succeeded", "route": route, "steps_run": steps_run,
+            "verified_steps": verified_steps, "navigated": navigated,
+            "finished_at": _now_iso(),
+        }
+        if ocr_unavailable:
+            result["ocr_unavailable"] = True
+            result["hint"] = _tesseract_missing_hint()
+        return result
+    except _cdp.CDPError as e:
+        return {"state": "failed", "error": str(e), "route": route,
+                "steps_run": steps_run}
+    finally:
+        sess.close()
+
+
 # ---- deploy + verify --------------------------------------------------
 
 def _git(runner: Runner, project_dir: Path, *args: str) -> subprocess.CompletedProcess:

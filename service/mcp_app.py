@@ -2108,6 +2108,59 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         return core.cdp_find_text_runtime(
             cfg, text, navigate_url=navigate_url, settle_seconds=settle_seconds)
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+    def optix_cdp_navigate(
+        route: str, routes_path: str, expect: bool = True,
+        navigate_url: str | None = None,
+    ) -> dict:
+        """Zero-screenshot navigation to a banked screen: replays a sequence of
+        clicks from a routes JSON file instead of screenshot -> locate ->
+        click, click again.
+
+        Routes file format (version 1): `{"version": 1, "routes": {"<name>":
+        {"steps": [{"click": [x, y], "settle_seconds": 0.5, "expect_text":
+        "Setup Values"}]}}}`. `click` uses the SAME coordinate convention as
+        optix_cdp_screenshot's `region`: both values <= 1.0 are normalized
+        viewport fractions, any value > 1 is absolute pixels — portable
+        across window sizes. Convention: bank routes at `dev/ftx_ui_map.json`
+        in the project workspace — see the optix-blind-authoring skill for
+        the cache workflow (discover once with optix_cdp_find_text, bank the
+        route, navigate blind from then on).
+
+        expect_text verification needs tesseract: with expect=true (the
+        default) and a step carrying expect_text, this OCRs the frame after
+        the click and checks expect_text is a case-insensitive substring of
+        the recognized text. The FIRST failed expectation stops the route
+        immediately — later steps do not run — and returns
+        error='expectation_failed' with the step index and a read_back
+        excerpt: fail loud rather than drift onto the wrong screen. If
+        tesseract isn't installed, the checks are skipped (not a failure) and
+        the response carries ocr_unavailable=true — the clicks still ran.
+
+        Returns {state, route, steps_run, verified_steps, ocr_unavailable?,
+        navigated, finished_at}. Never raises for a bad routes file: missing
+        path -> error='routes_file_not_found'; bad JSON ->
+        'routes_file_invalid'; unknown route -> 'route_not_found' (with
+        `available` listing known routes); a malformed step -> 'route_invalid'
+        naming the `step` index.
+
+        Use this when:
+          - jumping straight to a screen you've already banked a route for,
+            without spending a screenshot to find your way there
+          - a multi-step navigation (menu -> submenu -> tab) you'll repeat
+            often — record it once, replay it cheaply from then on
+
+        Do NOT use this when:
+          - the route isn't banked yet (use optix_cdp_find_text /
+            optix_cdp_screenshot to discover it first, then save the route)
+          - you only need one click (use optix_cdp_click directly)
+          - you need to verify color/layout, not just text (pair with an
+            optix_cdp_screenshot after navigating)
+        """
+        return core.cdp_navigate_runtime(
+            cfg, route=route, routes_path=routes_path, expect=expect,
+            navigate_url=navigate_url)
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
     def optix_cdp_restart(allow_restart: bool = True) -> dict:
         """Recover the chrome-cdp instance that screenshot/click drive.

@@ -80,6 +80,7 @@ EXPECTED_TOOLS = {
     "optix_cdp_ocr",
     "optix_cdp_read_text",
     "optix_cdp_find_text",
+    "optix_cdp_navigate",
     "optix_cdp_restart",
 }
 
@@ -127,7 +128,7 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             "optix_get_project_map", "optix_list_skills", "optix_get_skill"}
     DESTRUCTIVE = {"optix_deploy","optix_deploy_updatesvc","optix_bridge_delete_node",
                    "optix_runtime_stop","optix_cdp_click","optix_cdp_type",
-                   "optix_cdp_key","optix_cdp_fill",
+                   "optix_cdp_key","optix_cdp_fill","optix_cdp_navigate",
                    # replace=true deletes the original instance after the move
                    "optix_bridge_convert_to_type",
                    # re-author move deletes the original after the copy
