@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from service import core, _cdp
-from service.tests.conftest import make_fake_runner
+from service.tests.conftest import FakeProc, make_fake_runner
 
 
 class FakeWS:
@@ -471,3 +471,146 @@ def test_cdp_fill_invalid_submit_key(cfg, fake_cdp):
     from service import core as core_mod
     out = core_mod.cdp_fill_runtime(cfg, x=1, y=2, text="x", submit="F13")
     assert out["state"] == "failed" and out["error"] == "invalid_key"
+
+
+# ---- screenshot region clipping (S4 feature 1: optix_cdp_screenshot region) --
+
+def _layout_metrics(vp_w: float, vp_h: float) -> dict:
+    return {"cssVisualViewport": {"clientWidth": vp_w, "clientHeight": vp_h}}
+
+
+def test_screenshot_region_normalized_resolves_against_viewport(cfg, fake_cdp):
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+    })
+    out = core.cdp_screenshot_runtime(cfg, navigate_url="", region=[0.1, 0.2, 0.5, 0.5])
+    assert out["state"] == "succeeded"
+    assert out["region"] == [100.0, 160.0, 500.0, 400.0]
+    clip = next(p for (m, p, _) in ws.sent if m == "Page.captureScreenshot")["clip"]
+    assert clip == {"x": 100.0, "y": 160.0, "width": 500.0, "height": 400.0, "scale": 1}
+
+
+def test_screenshot_region_pixel_passthrough(cfg, fake_cdp):
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+    })
+    out = core.cdp_screenshot_runtime(cfg, navigate_url="", region=[100, 50, 200, 150])
+    assert out["state"] == "succeeded"
+    assert out["region"] == [100.0, 50.0, 200.0, 150.0]
+    clip = next(p for (m, p, _) in ws.sent if m == "Page.captureScreenshot")["clip"]
+    assert clip == {"x": 100.0, "y": 50.0, "width": 200.0, "height": 150.0, "scale": 1}
+
+
+def test_screenshot_region_none_skips_clip(cfg, fake_cdp):
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={"Page.captureScreenshot":
+                           {"data": base64.b64encode(jpeg).decode()}})
+    out = core.cdp_screenshot_runtime(cfg, navigate_url="")
+    assert out["region"] is None
+    call = next(p for (m, p, _) in ws.sent if m == "Page.captureScreenshot")
+    assert "clip" not in call
+
+
+@pytest.mark.parametrize("bad_region", [
+    [1, 2, 3],           # wrong length
+    [-1, 0, 10, 10],      # negative x
+    [0, 0, 0, 10],        # zero width
+    [0, 0, 10, -5],       # negative height
+    ["a", 0, 10, 10],     # non-numeric
+])
+def test_screenshot_region_malformed_never_touches_viewport(cfg, fake_cdp, bad_region):
+    # shape/value errors are rejected before any CDP round trip - no
+    # Page.getLayoutMetrics result is even stubbed here.
+    ws = fake_cdp()
+    out = core.cdp_screenshot_runtime(cfg, navigate_url="", region=bad_region)
+    assert out["state"] == "failed" and out["error"] == "bad_region"
+    assert out["region"] == bad_region
+    assert [m for (m, _, _) in ws.sent if m == "Page.getLayoutMetrics"] == []
+
+
+def test_screenshot_region_outside_frame_is_bad_region(cfg, fake_cdp):
+    fake_cdp(results={"Page.getLayoutMetrics": _layout_metrics(1000, 800)})
+    out = core.cdp_screenshot_runtime(cfg, navigate_url="", region=[2000, 0, 10, 10])
+    assert out["state"] == "failed" and out["error"] == "bad_region"
+    assert "outside viewport" in out["detail"]
+
+
+def test_screenshot_region_composes_with_save_path(cfg, fake_cdp, tmp_path: Path):
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(400, 300),
+    })
+    out_file = tmp_path / "clip.jpg"
+    out = core.cdp_screenshot_runtime(
+        cfg, navigate_url="", save_path=str(out_file), region=[0.0, 0.0, 1.0, 1.0])
+    assert out["state"] == "succeeded"
+    assert out["region"] == [0.0, 0.0, 400.0, 300.0]
+    assert out_file.read_bytes() == jpeg
+
+
+# ---- find_text (S4 feature 3): CDP session assembly ---------------------
+
+_FIND_TSV = (
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+    "5\t1\t1\t1\t1\t1\t10\t10\t80\t30\t95.5\tStart\n"
+    "5\t1\t1\t1\t1\t2\t95\t10\t100\t30\t92.0\tButton\n"
+)
+
+
+def test_find_text_captures_full_frame_and_runs_tesseract_tsv(cfg, fake_cdp, monkeypatch):
+    import shutil
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, _FIND_TSV))
+    out = core.cdp_find_text_runtime(cfg, "Start Button", runner=runner)
+    assert out["state"] == "succeeded" and out["found"] is True
+    assert len(out["matches"]) == 1
+    match = out["matches"][0]
+    assert match["text"] == "Start Button"
+    assert match["bbox_px"] == [10.0, 10.0, 185.0, 30.0]
+    assert match["bbox_norm"] == [0.01, 0.0125, 0.185, 0.0375]
+    assert match["center_px"] == [102.5, 25.0]
+    assert out["viewport"] == {"w": 1000.0, "h": 800.0}
+    # no `clip` on the capture — find_text is always full-frame
+    shot_call = next(p for (m, p, _) in ws.sent if m == "Page.captureScreenshot")
+    assert "clip" not in shot_call
+    # tesseract invoked with tsv output, not --psm/stdout text mode
+    cmd = runner.calls[0][0]
+    assert cmd[0] == "/usr/bin/tesseract" and cmd[-1] == "tsv"
+
+
+def test_find_text_no_match_is_not_an_error(cfg, fake_cdp, monkeypatch):
+    import shutil
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, _FIND_TSV))
+    out = core.cdp_find_text_runtime(cfg, "Nonexistent Label", runner=runner)
+    assert out["state"] == "succeeded"
+    assert out["found"] is False and out["matches"] == []
+
+
+def test_find_text_reports_tesseract_nonzero(cfg, fake_cdp, monkeypatch):
+    import shutil
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(1, "", "leptonica error"))
+    out = core.cdp_find_text_runtime(cfg, "Start", runner=runner)
+    assert out["state"] == "failed" and "leptonica" in out["error"]
+    assert out["found"] is False and out["matches"] == []

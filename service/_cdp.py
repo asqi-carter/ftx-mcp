@@ -148,10 +148,29 @@ class CDPClient:
             return entries[idx].get("url", "") or ""
         return ""
 
-    def screenshot_jpeg(self, quality: int = 65) -> bytes:
+    def screenshot_jpeg(self, quality: int = 65, clip: dict | None = None) -> bytes:
+        """Capture the page as JPEG. `clip` (CDP's native {x, y, width,
+        height, scale}) restricts the capture to a sub-rectangle in CSS
+        pixels — the caller resolves a `region` request to this shape via
+        viewport_size() before calling."""
         import base64
-        r = self.cmd("Page.captureScreenshot", format="jpeg", quality=int(quality))
+        kwargs: dict[str, Any] = {"format": "jpeg", "quality": int(quality)}
+        if clip is not None:
+            kwargs["clip"] = clip
+        r = self.cmd("Page.captureScreenshot", **kwargs)
         return base64.b64decode(r["data"])
+
+    def viewport_size(self) -> tuple[float, float]:
+        """CSS-pixel viewport size via Page.getLayoutMetrics, used to resolve
+        a normalized (<=1.0 fraction) `region` to absolute pixels ahead of a
+        clipped screenshot. Prefers cssVisualViewport (the coordinate space
+        Page.captureScreenshot's `clip` and Input.dispatchMouseEvent both use);
+        falls back to layoutViewport for older Chrome/CDP response shapes."""
+        r = self.cmd("Page.getLayoutMetrics")
+        vp = r.get("cssVisualViewport") or r.get("visualViewport") or r.get("layoutViewport") or {}
+        w = vp.get("clientWidth", vp.get("width", 0))
+        h = vp.get("clientHeight", vp.get("height", 0))
+        return float(w), float(h)
 
     def insert_text(self, text: str) -> None:
         """Insert a string at the current caret/selection (Input.insertText).

@@ -78,6 +78,8 @@ EXPECTED_TOOLS = {
     "optix_cdp_key",
     "optix_cdp_screenshot",
     "optix_cdp_ocr",
+    "optix_cdp_read_text",
+    "optix_cdp_find_text",
     "optix_cdp_restart",
 }
 
@@ -119,6 +121,7 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             "optix_describe_type","optix_list_ui_types","optix_bridge_status",
             "optix_studio_version","optix_runtime_status","optix_services_status",
             "optix_deploy_preflight","optix_cdp_screenshot","optix_cdp_ocr",
+            "optix_cdp_read_text","optix_cdp_find_text",
             "optix_bridge_validate_expression",
             "optix_emulator_status", "optix_runtime_log_tail",
             "optix_get_project_map", "optix_list_skills", "optix_get_skill"}
@@ -378,3 +381,132 @@ def test_cdp_screenshot_return_image_failure_stays_dict(
     out = tool.fn(return_image=True)
     assert isinstance(out, dict)
     assert out["state"] == "failed"
+
+
+# ---- region param (S4 feature 1) + read_text / find_text tools (S4 2, 3) ----
+
+def test_cdp_screenshot_region_forwarded_to_core(
+    cfg: core.Config, monkeypatch, tmp_path
+) -> None:
+    shot = tmp_path / "shot.jpg"
+    shot.write_bytes(b"\xff\xd8\xff\xdbfakejpeg")
+    seen = {}
+
+    def fake_capture(cfg_, save_path=None, region=None, **kw):
+        seen["region"] = region
+        return {"state": "succeeded", "path": str(shot), "b64": None,
+                "size_bytes": 8, "navigated": False, "captured_at": "t",
+                "region": [10.0, 10.0, 20.0, 20.0]}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(save_path=str(shot), region=[0.1, 0.1, 0.2, 0.2])
+    assert seen["region"] == [0.1, 0.1, 0.2, 0.2]
+    assert out["region"] == [10.0, 10.0, 20.0, 20.0]
+
+
+def test_cdp_screenshot_region_composes_with_return_image(
+    cfg: core.Config, monkeypatch, tmp_path
+) -> None:
+    """region and return_image are independent params — the typed-image
+    response still carries the resolved `region` in its JSON metadata block."""
+    import json as _json
+
+    from mcp.server.fastmcp import Image as McpImage
+
+    shot = tmp_path / "shot.jpg"
+    shot.write_bytes(b"\xff\xd8\xff\xdbfakejpeg")
+
+    def fake_capture(cfg_, save_path=None, region=None, **kw):
+        return {"state": "succeeded", "path": str(shot), "b64": None,
+                "size_bytes": 8, "navigated": False, "captured_at": "t",
+                "region": [5.0, 5.0, 15.0, 15.0]}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(save_path=str(shot), region=[0.0, 0.0, 0.1, 0.1], return_image=True)
+    assert isinstance(out, list) and len(out) == 2
+    meta = _json.loads(out[0])
+    assert meta["state"] == "succeeded" and meta["region"] == [5.0, 5.0, 15.0, 15.0]
+    assert isinstance(out[1], McpImage)
+
+
+def test_cdp_screenshot_bad_region_returns_dict_not_raise(
+    cfg: core.Config, monkeypatch
+) -> None:
+    def fake_capture(cfg_, save_path=None, region=None, **kw):
+        return {"state": "failed", "path": None, "b64": None, "size_bytes": 0,
+                "navigated": False, "captured_at": "t", "error": "bad_region",
+                "detail": "region must be [x, y, w, h]", "region": region}
+
+    monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
+    out = tool.fn(region=[1, 2, 3])
+    assert isinstance(out, dict)
+    assert out["state"] == "failed" and out["error"] == "bad_region"
+
+
+def test_cdp_read_text_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_read_text(cfg_, region=None, navigate_url=None, settle_seconds=None,
+                       psm=6):
+        seen.update(region=region, psm=psm)
+        return {"state": "succeeded", "text": "SP-101", "region": region,
+                "size_bytes": 10, "navigated": False, "captured_at": "t"}
+
+    monkeypatch.setattr(core, "cdp_read_text_runtime", fake_read_text)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_read_text")
+    out = tool.fn(region=[0.0, 0.0, 0.5, 0.5], psm=7)
+    assert out["text"] == "SP-101"
+    assert seen == {"region": [0.0, 0.0, 0.5, 0.5], "psm": 7}
+
+
+def test_cdp_read_text_tool_degrades_on_missing_tesseract(
+    cfg: core.Config, monkeypatch
+) -> None:
+    monkeypatch.setattr(core, "cdp_read_text_runtime", lambda *a, **k: {
+        "state": "failed", "text": None, "error": "tesseract_not_installed",
+        "hint": "install tesseract"})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_read_text")
+    out = tool.fn()
+    assert out["state"] == "failed" and out["error"] == "tesseract_not_installed"
+
+
+def test_cdp_find_text_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_find_text(cfg_, text, navigate_url=None, settle_seconds=None):
+        seen["text"] = text
+        return {"state": "succeeded", "found": True, "matches": [
+            {"text": "Start", "confidence": 95.0, "bbox_px": [1, 2, 3, 4],
+             "bbox_norm": [0.1, 0.2, 0.3, 0.4], "center_px": [2.5, 4.0]}],
+            "viewport": {"w": 1000, "h": 800}}
+
+    monkeypatch.setattr(core, "cdp_find_text_runtime", fake_find_text)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
+    out = tool.fn(text="Start")
+    assert out["found"] is True and seen["text"] == "Start"
+    assert out["matches"][0]["center_px"] == [2.5, 4.0]
+
+
+def test_cdp_find_text_tool_no_match_is_not_an_error(
+    cfg: core.Config, monkeypatch
+) -> None:
+    monkeypatch.setattr(core, "cdp_find_text_runtime", lambda cfg_, text, **k: {
+        "state": "succeeded", "found": False, "matches": [],
+        "viewport": {"w": 1000, "h": 800}})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
+    out = tool.fn(text="Nonexistent")
+    assert out["state"] == "succeeded" and out["found"] is False

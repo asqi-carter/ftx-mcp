@@ -3759,10 +3759,46 @@ def cdp_key_runtime(
         sess.close()
 
 
+def _resolve_region(sess: Any, region: list[float] | None) -> tuple[list[float] | None, str | None]:
+    """Resolve a screenshot `region` [x, y, w, h] to absolute CSS pixels.
+
+    Convention: if EVERY value is <= 1.0 the whole list is normalized
+    fractions of the viewport (resolved via sess.viewport_size() /
+    Page.getLayoutMetrics); if any value is > 1 the list is already absolute
+    pixels and is passed through as-is.
+
+    Returns (pixel_region, None) on success, or (None, detail_str) for a
+    malformed region. Callers turn detail_str into the standard
+    {"state": "failed", "error": "bad_region", ...} shape — this helper never
+    raises for bad input (only a genuine CDP transport error propagates, via
+    sess.viewport_size()).
+    """
+    if region is None:
+        return None, None
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        return None, "region must be [x, y, w, h]"
+    try:
+        x, y, w, h = (float(v) for v in region)
+    except (TypeError, ValueError):
+        return None, "region values must be numeric"
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return None, "x/y must be >= 0 and w/h must be > 0"
+    vp_w, vp_h = sess.viewport_size()
+    if vp_w <= 0 or vp_h <= 0:
+        return None, "could not resolve viewport size"
+    if all(v <= 1.0 for v in (x, y, w, h)):
+        px = [x * vp_w, y * vp_h, w * vp_w, h * vp_h]
+    else:
+        px = [x, y, w, h]
+    if px[0] >= vp_w or px[1] >= vp_h:
+        return None, f"region {px} outside viewport {vp_w:g}x{vp_h:g}"
+    return px, None
+
+
 def cdp_screenshot_runtime(
     cfg: Config, save_path: str | None = None, quality: int = 65,
     navigate_url: str | None = None, settle_seconds: float | None = None,
-    fresh: bool = False,
+    fresh: bool = False, region: list[float] | None = None,
 ) -> dict:
     """Capture the runtime canvas via CDP Page.captureScreenshot (JPEG).
 
@@ -3775,8 +3811,19 @@ def cdp_screenshot_runtime(
       - navigate_url given: point the page there first.
       - navigate_url == "": screenshot whatever the tab currently shows.
     After a navigation it waits settle_seconds for the Optix canvas to render
-    (capturing mid-navigation fails). Returns {state, path|b64, size_bytes,
-    navigated, captured_at}.
+    (capturing mid-navigation fails).
+
+    region: optional [x, y, w, h] clip, resolved via CDP
+    Page.captureScreenshot's native `clip`. Coordinate convention: if ALL
+    four values are <= 1.0 they are normalized fractions of the viewport
+    (resolved against Page.getLayoutMetrics); if any value is > 1 the whole
+    list is absolute pixels. A malformed region (wrong length, negative,
+    zero w/h, x/y outside the frame) returns state='failed',
+    error='bad_region' — never raises.
+
+    Returns {state, path|b64, size_bytes, navigated, captured_at, region}.
+    `region` in the result is the resolved absolute-pixel [x, y, w, h] (or
+    None when no region was requested).
     """
     import base64
     from . import _cdp
@@ -3790,11 +3837,22 @@ def cdp_screenshot_runtime(
             sess.reload()
             time.sleep(max(0.0, settle))
             navigated = True
-        jpeg = sess.screenshot_jpeg(quality=quality)
+        px_region, err = _resolve_region(sess, region)
+        if err is not None:
+            return {
+                "state": "failed", "path": None, "b64": None, "size_bytes": 0,
+                "navigated": navigated, "captured_at": _now_iso(),
+                "error": "bad_region", "detail": err, "region": region,
+            }
+        clip = None
+        if px_region is not None:
+            clip = {"x": px_region[0], "y": px_region[1],
+                    "width": px_region[2], "height": px_region[3], "scale": 1}
+        jpeg = sess.screenshot_jpeg(quality=quality, clip=clip)
         result: dict[str, Any] = {
             "state": "succeeded", "path": None, "b64": None,
             "size_bytes": len(jpeg), "navigated": navigated,
-            "captured_at": _now_iso(),
+            "captured_at": _now_iso(), "region": px_region,
         }
         if save_path:
             out = Path(save_path)
@@ -3811,6 +3869,38 @@ def cdp_screenshot_runtime(
         }
     finally:
         sess.close()
+
+
+def _find_tesseract() -> str | None:
+    """Resolve the tesseract binary: PATH first, then the standard Windows
+    install dirs (winget/UB-Mannheim installs don't touch PATH — found live
+    2026-07-17). Module-level (not nested in cdp_ocr_runtime) so
+    cdp_read_text_runtime and cdp_find_text_runtime share the same
+    resolution logic instead of duplicating it."""
+    import shutil
+    hit = shutil.which("tesseract")
+    if hit:
+        return hit
+    for cand in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    ):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _tesseract_missing_hint() -> str:
+    """Shared install hint for the tesseract_not_installed degradation
+    contract (cdp_ocr_runtime, cdp_read_text_runtime, cdp_find_text_runtime)."""
+    return (
+        "Install Tesseract-OCR (Windows: `winget install "
+        "UB-Mannheim.TesseractOCR`) — PATH is optional; the service also "
+        "probes the standard install dirs. This is an OPT-IN fallback — "
+        "the default verify path is a vision model on "
+        "optix_cdp_screenshot, which needs no OCR."
+    )
 
 
 def cdp_ocr_runtime(
@@ -3834,32 +3924,12 @@ def cdp_ocr_runtime(
     hint rather than raising — it is optional infrastructure. Text-only: NOT a
     substitute for vision on color/layout checks.
     """
-    import shutil
     import tempfile
-    def _find_tesseract() -> str | None:
-        hit = shutil.which("tesseract")
-        if hit:
-            return hit
-        for cand in (
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
-        ):
-            if os.path.isfile(cand):
-                return cand
-        return None
-
     tesseract = _find_tesseract()
     if tesseract is None:
         return {
             "state": "failed", "text": None, "error": "tesseract_not_installed",
-            "hint": (
-                "Install Tesseract-OCR (Windows: `winget install "
-                "UB-Mannheim.TesseractOCR`) — PATH is optional; the service also "
-                "probes the standard install dirs. This is an OPT-IN fallback — "
-                "the default verify path is a vision model on "
-                "optix_cdp_screenshot, which needs no OCR."
-            ),
+            "hint": _tesseract_missing_hint(),
         }
     with tempfile.TemporaryDirectory() as td:
         img = Path(td) / "runtime.jpg"
@@ -3886,6 +3956,211 @@ def cdp_ocr_runtime(
             "size_bytes": shot.get("size_bytes", 0),
             "navigated": shot.get("navigated", False), "captured_at": _now_iso(),
         }
+
+
+def cdp_read_text_runtime(
+    cfg: Config, region: list[float] | None = None,
+    navigate_url: str | None = None, settle_seconds: float | None = None,
+    *, psm: int = 6, runner: Runner = _DEFAULT_RUNNER,
+) -> dict:
+    """OCR a region (or the full frame) of the runtime canvas via tesseract —
+    THE cheap check for "does the screen/widget say X", zero vision tokens.
+
+    Captures through the same region-clip path as cdp_screenshot_runtime (see
+    its docstring for the region coordinate convention: values all <= 1.0 are
+    normalized viewport fractions, any value > 1 means absolute pixels), then
+    runs tesseract on the JPEG exactly like cdp_ocr_runtime. NOT a substitute
+    for vision on color/layout checks — use cdp_screenshot_runtime for those.
+
+    Returns {state, text, region, size_bytes, navigated, captured_at}. If
+    tesseract is not installed, returns state='failed',
+    error='tesseract_not_installed' with an install hint — same degradation
+    contract as cdp_ocr_runtime, never raises. A malformed region degrades the
+    same way (state='failed', error='bad_region') via cdp_screenshot_runtime.
+    """
+    import tempfile
+    tesseract = _find_tesseract()
+    if tesseract is None:
+        return {
+            "state": "failed", "text": None, "error": "tesseract_not_installed",
+            "hint": _tesseract_missing_hint(),
+        }
+    with tempfile.TemporaryDirectory() as td:
+        img = Path(td) / "runtime.jpg"
+        shot = cdp_screenshot_runtime(
+            cfg, save_path=str(img), navigate_url=navigate_url,
+            settle_seconds=settle_seconds, region=region,
+        )
+        if shot.get("state") != "succeeded":
+            return {
+                "state": "failed", "text": None,
+                "error": shot.get("error", "screenshot_failed"),
+                "region": shot.get("region"),
+                "navigated": shot.get("navigated", False),
+            }
+        proc = runner.run(
+            [tesseract, str(img), "stdout", "--psm", str(int(psm))], timeout=30)
+        if proc.returncode != 0:
+            return {
+                "state": "failed", "text": None,
+                "error": (proc.stderr or "tesseract failed").strip()[:400],
+                "region": shot.get("region"),
+                "navigated": shot.get("navigated", False),
+            }
+        return {
+            "state": "succeeded", "text": (proc.stdout or "").strip(),
+            "region": shot.get("region"), "size_bytes": shot.get("size_bytes", 0),
+            "navigated": shot.get("navigated", False), "captured_at": _now_iso(),
+        }
+
+
+def _parse_tesseract_tsv(tsv: str) -> list[dict]:
+    """Parse `tesseract <img> stdout tsv` output into word-level rows.
+
+    Columns per tesseract's TSV contract: level page_num block_num par_num
+    line_num word_num left top width height conf text. Only level==5 (word)
+    rows with non-empty text are kept — levels 1-4 are page/block/par/line
+    aggregate pseudo-rows with no text of their own."""
+    lines = tsv.strip("\n").split("\n")
+    if not lines or not lines[0].strip():
+        return []
+    header = lines[0].split("\t")
+    words: list[dict] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        cols = line.split("\t")
+        if len(cols) < len(header):
+            continue
+        row = dict(zip(header, cols))
+        if row.get("level") != "5":
+            continue
+        text = row.get("text", "")
+        if not text.strip():
+            continue
+        try:
+            words.append({
+                "block_num": int(row["block_num"]), "par_num": int(row["par_num"]),
+                "line_num": int(row["line_num"]), "word_num": int(row["word_num"]),
+                "left": float(row["left"]), "top": float(row["top"]),
+                "width": float(row["width"]), "height": float(row["height"]),
+                "conf": float(row["conf"]), "text": text,
+            })
+        except (KeyError, ValueError):
+            continue
+    return words
+
+
+def _match_tsv_words(words: list[dict], query: str) -> list[dict]:
+    """Find `query` in tesseract word boxes: case-insensitive; a multi-word
+    query is matched only against ADJACENT words (same block/par/line,
+    consecutive word_num) joined with a single space. Words with conf < 40
+    are dropped BEFORE matching — a filtered-out word breaks adjacency for
+    its neighbors, so a low-confidence word inside a multi-word query
+    prevents that query from matching at all (fail-loud over guessing)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    n = len(q.split())
+    filtered = [w for w in words if w["conf"] >= 40]
+    matches: list[dict] = []
+    for i in range(len(filtered) - n + 1):
+        window = filtered[i:i + n]
+        if n > 1:
+            adjacent = all(
+                (a["block_num"], a["par_num"], a["line_num"]) ==
+                (b["block_num"], b["par_num"], b["line_num"])
+                and b["word_num"] == a["word_num"] + 1
+                for a, b in zip(window, window[1:])
+            )
+            if not adjacent:
+                continue
+        joined = " ".join(w["text"] for w in window)
+        if joined.lower() != q.lower():
+            continue
+        left = min(w["left"] for w in window)
+        top = min(w["top"] for w in window)
+        right = max(w["left"] + w["width"] for w in window)
+        bottom = max(w["top"] + w["height"] for w in window)
+        matches.append({
+            "text": joined, "confidence": min(w["conf"] for w in window),
+            "bbox_px": [left, top, right - left, bottom - top],
+        })
+    return matches
+
+
+def cdp_find_text_runtime(
+    cfg: Config, text: str, navigate_url: str | None = None,
+    settle_seconds: float | None = None, runner: Runner = _DEFAULT_RUNNER,
+) -> dict:
+    """Locate `text` on the runtime canvas via tesseract TSV word boxes — to
+    click a labeled control (center_px feeds cdp_click_runtime directly) or
+    to build a navigation route. Requires tesseract (same degradation
+    contract as cdp_read_text_runtime / cdp_ocr_runtime).
+
+    Always a full-frame capture (no region — the point is to find where
+    something is, before you know its coordinates). Matching is
+    case-insensitive; a multi-word `text` is matched only against ADJACENT
+    words on the same tesseract line (see _match_tsv_words). Words with
+    confidence < 40 are dropped before matching.
+
+    Returns {state, found, matches: [{text, confidence, bbox_px: [x,y,w,h],
+    bbox_norm: [x,y,w,h], center_px: [x,y]}], viewport: {w, h}, navigated,
+    captured_at}. No match is NOT an error: found=false, matches=[]. Tesseract
+    missing => state='failed', error='tesseract_not_installed' (standard
+    degradation contract, never raises).
+    """
+    from . import _cdp
+    tesseract = _find_tesseract()
+    if tesseract is None:
+        return {
+            "state": "failed", "found": False, "matches": [],
+            "error": "tesseract_not_installed", "hint": _tesseract_missing_hint(),
+        }
+    audit(cfg, "cdp_find_text", text=text)
+    settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
+    sess = _cdp_session(cfg)
+    try:
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle)
+        vp_w, vp_h = sess.viewport_size()
+        jpeg = sess.screenshot_jpeg()
+    except _cdp.CDPError as e:
+        return {"state": "failed", "found": False, "matches": [],
+                "error": str(e), "navigated": False}
+    finally:
+        sess.close()
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        img = Path(td) / "runtime.jpg"
+        img.write_bytes(jpeg)
+        proc = runner.run([tesseract, str(img), "stdout", "tsv"], timeout=30)
+        if proc.returncode != 0:
+            return {
+                "state": "failed", "found": False, "matches": [],
+                "error": (proc.stderr or "tesseract failed").strip()[:400],
+                "navigated": navigated,
+            }
+        words = _parse_tesseract_tsv(proc.stdout or "")
+
+    raw_matches = _match_tsv_words(words, text)
+    result_matches = []
+    for m in raw_matches:
+        x, y, w, h = m["bbox_px"]
+        if vp_w > 0 and vp_h > 0:
+            bbox_norm = [x / vp_w, y / vp_h, w / vp_w, h / vp_h]
+        else:
+            bbox_norm = [0.0, 0.0, 0.0, 0.0]
+        result_matches.append({
+            "text": m["text"], "confidence": m["confidence"],
+            "bbox_px": [x, y, w, h], "bbox_norm": bbox_norm,
+            "center_px": [x + w / 2, y + h / 2],
+        })
+    return {
+        "state": "succeeded", "found": bool(result_matches),
+        "matches": result_matches, "viewport": {"w": vp_w, "h": vp_h},
+        "navigated": navigated, "captured_at": _now_iso(),
+    }
 
 
 # ---- deploy + verify --------------------------------------------------

@@ -1929,6 +1929,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         save_path: str | None = None, quality: int = 65,
         navigate_url: str | None = None, settle_seconds: float | None = None,
         fresh: bool = False, return_image: bool = False,
+        region: list[float] | None = None,
     ):
         """Screenshot the running Optix HMI (emulator or deployed runtime) via
         CDP — THE way to visually verify a change.
@@ -1965,12 +1966,24 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         content (not b64-in-JSON) so the model sees it in the same turn with no file
         round-trip — use when your host's file tool cannot reach the service's
         filesystem. If your host stalls rendering it, go back to the file-path flow.
-        Returns {state, path, size_bytes, navigated, captured_at, hint}. The
+        Returns {state, path, size_bytes, navigated, captured_at, hint, region}. The
         coordinate system matches optix_cdp_click.
+
+        region: optional [x, y, w, h] to capture just a sub-rectangle instead of the
+        full frame (e.g. zooming a vision model in on one widget, or shrinking the
+        image before OCR). Coordinate convention: if ALL FOUR values are <= 1.0 they
+        are normalized fractions of the viewport (0.5 = mid-screen); if ANY value is
+        > 1 the whole list is absolute pixels. A malformed region (wrong length,
+        negative, zero width/height, or x/y outside the frame) returns
+        state='failed', error='bad_region' rather than raising. The result's
+        `region` field echoes back the resolved absolute-pixel [x, y, w, h] (or null
+        when region wasn't passed) — use it to sanity-check what actually got
+        captured.
 
         Use this when:
           - VALIDATING a deploy: capture the runtime HMI to confirm the change is live
           - capturing the HMI to locate a widget before optix_cdp_click
+          - zooming into one widget/region instead of the whole canvas (region)
 
         Do NOT use this when:
           - the chrome-cdp task isn't running (returns cdp_unavailable; run
@@ -1986,7 +1999,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         result = core.cdp_screenshot_runtime(
             cfg, save_path=save_path, quality=quality,
             navigate_url=navigate_url, settle_seconds=settle_seconds,
-            fresh=fresh)
+            fresh=fresh, region=region)
         if result.get("state") == "succeeded":
             result["hint"] = (
                 "JPEG written to `path` - read it with your file tool. If your "
@@ -2027,6 +2040,73 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         """
         return core.cdp_ocr_runtime(
             cfg, navigate_url=navigate_url, settle_seconds=settle_seconds, psm=psm)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def optix_cdp_read_text(
+        region: list[float] | None = None, navigate_url: str | None = None,
+        settle_seconds: float | None = None, psm: int = 6,
+    ) -> dict:
+        """OCR a region of the runtime canvas via tesseract — THE cheap check for
+        "does the screen/widget say X" — zero vision tokens.
+
+        Captures through the same region-clip path as optix_cdp_screenshot (see its
+        docstring for the region coordinate convention: values all <= 1.0 are
+        normalized viewport fractions, any value > 1 means absolute pixels), then
+        runs tesseract on the JPEG. Omit `region` to OCR the full frame. Returns
+        {state, text, region, size_bytes, navigated, captured_at}. If tesseract
+        isn't installed, returns state='failed', error='tesseract_not_installed'
+        with an install hint rather than raising — optional infrastructure, same
+        contract as optix_cdp_ocr. A malformed region degrades the same way
+        (error='bad_region').
+
+        Use this when:
+          - checking that a specific label/widget shows expected text, cheaply
+            (no vision model call) — e.g. confirming a SpinBox value after a fill
+          - a headless/cron caller has no vision model but needs a targeted text read
+
+        Do NOT use this when:
+          - you need color/layout verification (use optix_cdp_screenshot + vision)
+          - you don't know where the text is yet (use optix_cdp_find_text to locate
+            it first, or omit region to read the whole frame)
+        """
+        return core.cdp_read_text_runtime(
+            cfg, region=region, navigate_url=navigate_url,
+            settle_seconds=settle_seconds, psm=psm)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def optix_cdp_find_text(
+        text: str, navigate_url: str | None = None,
+        settle_seconds: float | None = None,
+    ) -> dict:
+        """Locate `text` on the runtime canvas via tesseract word boxes — to find
+        a labeled control to click, or to build a navigation route.
+
+        Full-frame capture (no region — you're locating something, so you don't
+        know its coordinates yet). Matching is case-insensitive; a multi-word
+        `text` query only matches ADJACENT words on the same tesseract line (words
+        on different lines never join). Words with OCR confidence < 40 are dropped
+        before matching. Returns {state, found, matches: [{text, confidence,
+        bbox_px: [x,y,w,h], bbox_norm: [x,y,w,h], center_px: [x,y]}], viewport: {w,
+        h}}. No match is NOT an error — found=false, matches=[]. Requires
+        tesseract: missing binary returns state='failed',
+        error='tesseract_not_installed' (same degradation contract as
+        optix_cdp_ocr / optix_cdp_read_text), never raises.
+
+        `matches[].center_px` feeds optix_cdp_click directly — e.g. find "Start",
+        then click at its center_px — without eyeballing coordinates from a
+        screenshot.
+
+        Use this when:
+          - you need to click a labeled control but don't know its coordinates
+          - building a navigation route by locating menu/button labels in sequence
+
+        Do NOT use this when:
+          - you already know the target coordinates (use optix_cdp_click directly)
+          - you need to read a specific known region's text (use
+            optix_cdp_read_text with a region — cheaper, no full-frame OCR)
+        """
+        return core.cdp_find_text_runtime(
+            cfg, text, navigate_url=navigate_url, settle_seconds=settle_seconds)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
     def optix_cdp_restart(allow_restart: bool = True) -> dict:
