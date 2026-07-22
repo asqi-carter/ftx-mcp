@@ -44,10 +44,8 @@
     re-installs and for install-smoke runs that must not mutate persistent
     auth state. Existing FTX_AUTH_REQUIRED user env var is preserved.
 
-    directly.
-
 .PARAMETER NoServiceRegister
-    Skip Step 7 (scheduled-task register) and Step 10 (/health probe).
+    Skip Step 7 (scheduled-task register) and Step 9 (/health probe).
     Useful for install-smoke runs that exercise Steps 0-6 + 8 in a
     redirected state dir + ports (override via OPTIX_STATE_DIR /
     OPTIX_HTTP_PORT / OPTIX_MCP_PORT) without touching the prod
