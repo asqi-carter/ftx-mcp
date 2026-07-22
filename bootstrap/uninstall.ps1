@@ -59,15 +59,32 @@ $venvDir = Join-Path $RepoRoot ".venv"
 $cdpMarker = Join-Path $env:LOCALAPPDATA "ftx-mcp\chrome-cdp-profile"
 
 Section "1. Scheduled tasks"
+# Tasks registered from an elevated context carry Admins-owned security
+# descriptors (field report 2026-07-22: 0x80070005 from a normal shell,
+# and the CIM error does NOT reliably throw - so verify removal, never
+# assume it). Removal is re-runnable; state/venv purges below still run.
+$taskFailures = 0
 foreach ($name in @("ftx-mcp", "ftx-mcp-chrome-cdp")) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    if ($task) {
-        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $name -Confirm:$false
-        Ok "removed task $name"
-    } else {
+    if (-not $task) {
         Ok "task $name not present"
+        continue
     }
+    Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    try {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+    } catch { }
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+        Warn "could NOT remove task $name (access denied - it was registered elevated)"
+        $taskFailures++
+    } else {
+        Ok "removed task $name"
+    }
+}
+if ($taskFailures -gt 0) {
+    Warn "$taskFailures task(s) still registered. Re-run this script from an ELEVATED PowerShell"
+    Warn "(right-click PowerShell -> Run as administrator) to remove them; everything below"
+    Warn "still runs now, so an elevated re-run only needs the default (no -All) mode."
 }
 
 Section "2. CDP chrome reap"
@@ -121,4 +138,8 @@ if ($PurgeVenv) {
 }
 
 Section "Done"
+if ($taskFailures -gt 0) {
+    Warn "uninstall INCOMPLETE: $taskFailures scheduled task(s) remain (see above). Exit 1."
+    exit 1
+}
 Ok "uninstall complete - re-run bootstrap\setup.ps1 to reinstall"
