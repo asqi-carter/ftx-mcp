@@ -34,15 +34,21 @@
     threat model. See docs/security.md.
 
     NOTE: this writes FTX_AUTH_REQUIRED=false at User env scope, so the
-    setting persists across logons and across re-installs. For one-shot
-    install-smoke runs that should not touch persistent auth state, use
-    -NoAuthPrompt instead. To revert -NoAuth later, run:
+    setting persists across logons and across re-installs. To revert
+    -NoAuth later, run:
       [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED",$null,"User")
 
+.PARAMETER EnableAuth
+    Opt in to bearer-token auth (the LAN posture): persists
+    FTX_AUTH_REQUIRED=true at User scope and issues a bootstrap token.
+    Required before OPTIX_BIND_HOST=0.0.0.0 - the service refuses a LAN
+    bind without auth. Without this switch, setup leaves auth OFF
+    (loopback-only default) and never prompts.
+
 .PARAMETER NoAuthPrompt
-    Skip the Step 6 interactive auth-enable prompt. Useful for unattended
-    re-installs and for install-smoke runs that must not mutate persistent
-    auth state. Existing FTX_AUTH_REQUIRED user env var is preserved.
+    DEPRECATED no-op (accepted for script back-compat). The interactive
+    auth prompt was removed in v1.0.3; the default is auth-off and
+    enabling is explicit via -EnableAuth.
 
 .PARAMETER NoServiceRegister
     Skip Step 7 (scheduled-task register) and Step 9 (/health probe).
@@ -60,6 +66,7 @@
 param(
     [switch]$NoCdp,
     [switch]$NoAuth,
+    [switch]$EnableAuth,
     [switch]$NoAuthPrompt,
     [switch]$NoServiceRegister,
     [string]$RepoRoot
@@ -319,10 +326,11 @@ $venvPython = Join-Path $venvDir "Scripts\python.exe"
 Ok "ftx-mcp installed into venv"
 
 # Step 6: bearer-token auth bootstrap
-# v1.0 default: auth OFF (loopback-only install; a bearer token adds ~no security
-# on your own box). Opt IN to enable it - required only for a LAN bind, which the
-# service otherwise refuses. -NoAuth forces off without a prompt; -NoAuthPrompt
-# leaves existing config untouched.
+# Default: auth OFF (loopback-only install; a bearer token adds ~no security
+# on your own box). Opt IN via -EnableAuth - required only for a LAN bind,
+# which the service otherwise refuses. -NoAuth forces off + persists the
+# choice. No interactive prompt (removed v1.0.3 - it scared fresh installers
+# into enabling auth by accident).
 Section "6. Bearer-token auth (default: off, loopback-only)"
 $tokensBlob = Join-Path $secretsDir "tokens.json.dpapi"
 # Pre-clean any stale OPTIX_AUTH_REQUIRED user env var from an old install.
@@ -350,27 +358,22 @@ if ($NoAuth) {
     } else {
         Ok "tokens.json.dpapi already present at $tokensBlob"
     }
-} elseif ($NoAuthPrompt) {
-    Ok "auth prompt skipped (-NoAuthPrompt). FTX_AUTH_REQUIRED unchanged (default: off on loopback)."
+} elseif ($EnableAuth) {
+    # Explicit LAN-posture opt-in (replaces the removed interactive prompt).
+    [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED", "true", "User")
+    $env:FTX_AUTH_REQUIRED = "true"
+    Ok "set user env FTX_AUTH_REQUIRED=true [-EnableAuth]"
+    & (Join-Path $PSScriptRoot "issue-token.ps1") -Label "bootstrap" -Scope "deploy" -RepoRoot $RepoRoot
+    if ($LASTEXITCODE -ne 0) { Fail "issue-token.ps1 failed; resolve before continuing." }
 } else {
-    Write-Host ""
-    Write-Host "Auth is OFF by default: this is a loopback-only install, where a bearer" -ForegroundColor Yellow
-    Write-Host "token adds ~no security (any local process runs as you). Enable it only if" -ForegroundColor Yellow
-    Write-Host "you will bind to the LAN (OPTIX_BIND_HOST=0.0.0.0) - the service refuses a" -ForegroundColor Yellow
-    Write-Host "LAN bind without auth." -ForegroundColor Yellow
-    Write-Host ""
-    $resp = Read-Host "Enable bearer-token auth now? [y/N]"
-    if ($resp -match '^[yY]') {
-        [Environment]::SetEnvironmentVariable("FTX_AUTH_REQUIRED", "true", "User")
-        $env:FTX_AUTH_REQUIRED = "true"
-        Ok "set user env FTX_AUTH_REQUIRED=true"
-        & (Join-Path $PSScriptRoot "issue-token.ps1") -Label "bootstrap" -Scope "deploy" -RepoRoot $RepoRoot
-        if ($LASTEXITCODE -ne 0) { Fail "issue-token.ps1 failed; resolve before continuing." }
-    } else {
-        # Leave FTX_AUTH_REQUIRED unset - the service default (off) applies; nothing
-        # to persist. Enable later with FTX_AUTH_REQUIRED=true + issue-token.ps1.
-        Ok "auth left off (default). No token needed for loopback use."
+    # No interactive prompt: field-observed that a y/N here scares fresh
+    # installers into answering y, then locking themselves out of the UI.
+    # Default is off (loopback-only; a bearer token adds ~no security when
+    # every local process already runs as you). LAN users opt in explicitly.
+    if ($NoAuthPrompt) {
+        Write-Host "note: -NoAuthPrompt is deprecated (the prompt no longer exists); default applies." -ForegroundColor DarkGray
     }
+    Ok "auth off (loopback-only default). LAN bind needs auth: re-run with -EnableAuth (see docs/security.md)."
 }
 
 # Step 7: register ftx-mcp scheduled task

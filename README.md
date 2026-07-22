@@ -45,6 +45,13 @@ cd ftx-mcp
 http://127.0.0.1:8765/ui                               # health dashboard
 ```
 
+**Auth:** the default install is loopback-only with auth OFF — setup never
+prompts, and no token is needed on your own box. Binding to the LAN is the
+one case that requires auth: install with `.\bootstrap\setup.ps1 -EnableAuth`
+(see [`docs/security.md`](docs/security.md)). If a UI/API unexpectedly asks
+for a bearer token, a previous install enabled auth — re-run setup with
+`-NoAuth` to clear it.
+
 To remove an install (or reset before a clean reinstall):
 `.\bootstrap\uninstall.ps1` stops and unregisters the scheduled tasks and
 reaps any leftover CDP chrome; add `-All` to also delete state (issued

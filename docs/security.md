@@ -53,7 +53,7 @@ setx FTX_AUTH_REQUIRED true
 .\bootstrap\services.ps1 restart                      # re-reads the env
 ```
 
-Token SHA-256 hash is stored DPAPI-encrypted under `%LOCALAPPDATA%\ftx-mcp\secrets\tokens.json.dpapi`. With auth on, every endpoint requires `Authorization: Bearer <token>`; banner reads `auth required`. You can also enable this during `setup.ps1` (answer **y** at the auth prompt). To revert: `setx FTX_AUTH_REQUIRED false` (or `setup.ps1 -NoAuth`) + restart.
+Token SHA-256 hash is stored DPAPI-encrypted under `%LOCALAPPDATA%\ftx-mcp\secrets\tokens.json.dpapi`. With auth on, every endpoint requires `Authorization: Bearer <token>`; banner reads `auth required`. Enable it at install time with `setup.ps1 -EnableAuth` (setup never prompts; the loopback default is auth off). To revert: `setx FTX_AUTH_REQUIRED false` (or `setup.ps1 -NoAuth`) + restart.
 
 ## LAN-bind opt-in
 
