@@ -1,6 +1,6 @@
 # Tool reference
 
-48 tools, grouped by where they sit in the loop. Every tool's docstring
+62 tools, grouped by where they sit in the loop. Every tool's docstring
 carries "Use when / Do NOT use when" guidance for the model, and MCP
 annotations (`readOnlyHint`/`destructiveHint`) so hosts can auto-run reads
 and gate writes. `project` is optional everywhere — it defaults to the
@@ -58,11 +58,16 @@ with the valid-property list rather than crashing Studio.
 
 | Tool | What it does |
 |---|---|
-| `optix_cdp_screenshot` | Screenshot the running HMI (auto-targets it); `fresh=true` forces a reload when a stale frame is suspected |
+| `optix_cdp_screenshot` | Screenshot the running HMI (auto-targets it); `fresh=true` forces a reload when a stale frame is suspected; `region=[x,y,w,h]` crops (<=1.0 = viewport fractions, >1 = pixels); `return_image=true` returns typed MCP image content inline |
 | `optix_cdp_click` | Click at coordinates — reaches the Optix canvas where synthetic clicks don't |
 | `optix_cdp_fill` | Set a field in one call: click + select-all + type + Enter |
 | `optix_cdp_type` / `optix_cdp_key` | Keyboard primitives (mid-entry screenshots, arrow-stepping, Escape) |
 | `optix_cdp_ocr` | Text read-back fallback when the client has no vision |
+| `optix_cdp_read_text` | OCR a region (or the full frame) — the zero-vision-token "does it say X" check (needs tesseract) |
+| `optix_cdp_find_text` | Locate rendered text: word boxes + clickable centers, feeds `optix_cdp_click` and route building (needs tesseract) |
+| `optix_cdp_navigate` | Replay a banked route from a routes file — zero-screenshot navigation; `expect_text` steps OCR-verify arrival |
+| `optix_cdp_sweep` | Walk a route map in one session, capture per screen + OCR text manifest — baseline builder |
+| `optix_cdp_diff` | Compare two sweep dirs: pixel gate + text-level delta per screen, pure text output |
 | `optix_cdp_restart` | Recover the verify browser |
 
 ## HTTP API

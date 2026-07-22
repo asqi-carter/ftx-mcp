@@ -81,6 +81,8 @@ EXPECTED_TOOLS = {
     "optix_cdp_read_text",
     "optix_cdp_find_text",
     "optix_cdp_navigate",
+    "optix_cdp_sweep",
+    "optix_cdp_diff",
     "optix_cdp_restart",
 }
 
@@ -122,13 +124,14 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             "optix_describe_type","optix_list_ui_types","optix_bridge_status",
             "optix_studio_version","optix_runtime_status","optix_services_status",
             "optix_deploy_preflight","optix_cdp_screenshot","optix_cdp_ocr",
-            "optix_cdp_read_text","optix_cdp_find_text",
+            "optix_cdp_read_text","optix_cdp_find_text","optix_cdp_diff",
             "optix_bridge_validate_expression",
             "optix_emulator_status", "optix_runtime_log_tail",
             "optix_get_project_map", "optix_list_skills", "optix_get_skill"}
     DESTRUCTIVE = {"optix_deploy","optix_deploy_updatesvc","optix_bridge_delete_node",
                    "optix_runtime_stop","optix_cdp_click","optix_cdp_type",
                    "optix_cdp_key","optix_cdp_fill","optix_cdp_navigate",
+                   "optix_cdp_sweep",
                    # replace=true deletes the original instance after the move
                    "optix_bridge_convert_to_type",
                    # re-author move deletes the original after the copy
@@ -511,3 +514,66 @@ def test_cdp_find_text_tool_no_match_is_not_an_error(
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
     out = tool.fn(text="Nonexistent")
     assert out["state"] == "succeeded" and out["found"] is False
+
+
+# ---- optix_cdp_sweep / optix_cdp_diff (S6) -------------------------------
+
+def test_cdp_sweep_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_sweep(cfg_, routes_path=None, out_dir=None, routes=None, warmup=True, **k):
+        seen.update(routes_path=routes_path, out_dir=out_dir, routes=routes, warmup=warmup)
+        return {"state": "succeeded", "version": 1, "created_at": "t",
+                "viewport": {"w": 100, "h": 100}, "ocr": False, "screens": {}}
+
+    monkeypatch.setattr(core, "cdp_sweep_runtime", fake_sweep)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_sweep")
+    out = tool.fn(routes_path="dev/routes.json", out_dir="dev/shots",
+                  routes=["home"], warmup=False)
+    assert out["state"] == "succeeded"
+    assert seen == {"routes_path": "dev/routes.json", "out_dir": "dev/shots",
+                    "routes": ["home"], "warmup": False}
+
+
+def test_cdp_sweep_tool_reports_partial_errors(cfg: core.Config, monkeypatch) -> None:
+    monkeypatch.setattr(core, "cdp_sweep_runtime", lambda cfg_, **k: {
+        "state": "succeeded", "version": 1, "created_at": "t",
+        "viewport": {"w": 100, "h": 100}, "ocr": False,
+        "screens": {"a": {"error": "boom"}}, "errors": 1})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_sweep")
+    out = tool.fn(routes_path="r.json", out_dir="out")
+    assert out["state"] == "succeeded" and out["errors"] == 1
+
+
+def test_cdp_diff_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_diff(dir_a, dir_b, threshold=2.0):
+        seen.update(dir_a=dir_a, dir_b=dir_b, threshold=threshold)
+        return {"state": "succeeded", "threshold": threshold, "screens": {},
+                "added": [], "removed": [],
+                "summary": {"same": 0, "changed": 0, "size_mismatch": 0, "errors": 0}}
+
+    monkeypatch.setattr(core, "cdp_diff_runtime", fake_diff)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_diff")
+    out = tool.fn(dir_a="dev/before", dir_b="dev/after", threshold=5.0)
+    assert out["state"] == "succeeded"
+    assert seen == {"dir_a": "dev/before", "dir_b": "dev/after", "threshold": 5.0}
+
+
+def test_cdp_diff_tool_manifest_not_found_surfaces_as_dict(
+    cfg: core.Config, monkeypatch
+) -> None:
+    monkeypatch.setattr(core, "cdp_diff_runtime", lambda dir_a, dir_b, threshold=2.0: {
+        "state": "failed", "error": "manifest_not_found", "dir": dir_a})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_diff")
+    out = tool.fn(dir_a="missing", dir_b="also_missing")
+    assert out["state"] == "failed" and out["error"] == "manifest_not_found"

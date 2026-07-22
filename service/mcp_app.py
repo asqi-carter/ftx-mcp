@@ -2161,6 +2161,95 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             cfg, route=route, routes_path=routes_path, expect=expect,
             navigate_url=navigate_url)
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+    def optix_cdp_sweep(
+        routes_path: str, out_dir: str, routes: list[str] | None = None,
+        warmup: bool = True,
+    ) -> dict:
+        """Capture a full-frame screenshot (+ OCR text, if tesseract is
+        installed) of every route in a banked routes file, in ONE CDP
+        session — builds the visual baseline optix_cdp_diff compares
+        against.
+
+        Loads routes_path exactly like optix_cdp_navigate (same routes
+        file format and error contract). Sweeps all routes in file order,
+        or just the names in `routes` (in the order given) — an unknown
+        name in `routes` fails the whole call with error='route_not_found',
+        same as optix_cdp_navigate. Each route's steps replay exactly like
+        optix_cdp_navigate's clicks/settle_seconds, but expect_text checks
+        are ALWAYS off (this is a capture pass, not a verification pass).
+        Between routes the tab is re-navigated back to the runtime's home
+        screen — routes are assumed to start there, the same assumption
+        banking them for optix_cdp_navigate makes.
+
+        warmup=True (default) takes and discards one full-frame capture
+        before the real one, giving the canvas one settle period to finish
+        animating/rendering. Writes <out_dir>/<route>.jpg (route names
+        sanitized to [a-zA-Z0-9._-]) and <out_dir>/manifest.json:
+        {version, created_at, viewport, ocr, screens: {route: {file,
+        size_bytes, text?}}}. A capture failure on one route (bad banked
+        coordinates, a CDP transport error) does not abort the sweep —
+        that route is recorded as {"error": ...} and the sweep continues;
+        the response then carries "errors": N.
+
+        Returns the manifest dict inline plus state='succeeded'.
+
+        Use this when:
+          - building or refreshing a visual baseline of the whole HMI for
+            optix_cdp_diff, after routes are banked with
+            optix_cdp_navigate / the optix-blind-authoring skill
+          - capturing every known screen in one pass instead of a manual
+            screenshot per screen
+
+        Do NOT use this when:
+          - you only need one screen right now (optix_cdp_screenshot is
+            cheaper and doesn't need banked routes)
+          - the routes aren't banked yet (discover them with
+            optix_cdp_find_text first, then bank a routes file)
+        """
+        return core.cdp_sweep_runtime(
+            cfg, routes_path=routes_path, out_dir=out_dir, routes=routes,
+            warmup=warmup)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def optix_cdp_diff(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
+        """Compare two optix_cdp_sweep capture directories screen-by-screen
+        — a visual regression check, no CDP session needed (pure file
+        comparison).
+
+        Matches screens by route key from each dir's manifest.json. A
+        screen present in only one dir is reported under `added`/`removed`
+        (not an error). For each common screen: if Pillow is installed
+        (`pip install ftx-mcp[visual]`), grayscale mean-pixel-difference vs
+        `threshold` (percent, default 2.0) decides changed/same, with a
+        size mismatch short-circuiting to status='size_mismatch'. Without
+        Pillow, this degrades to a text-only compare using each manifest's
+        OCR text (both sweeps must have run with tesseract installed) —
+        pixel_pct is null and the response carries degraded='no_pillow';
+        with neither Pillow nor OCR text this fails outright
+        (error='no_pillow_no_ocr'). Every 'changed' screen gets a
+        text_added/text_removed explainer diffing the two sweeps' OCR text
+        (capped at 40 lines each).
+
+        Returns {state, threshold, degraded?, screens: {route: {status,
+        pixel_pct, text_added?, text_removed?}}, added, removed, summary:
+        {same, changed, size_mismatch, errors}}. A missing manifest.json in
+        either dir returns state='failed', error='manifest_not_found'.
+
+        Use this when:
+          - checking whether a deploy/edit changed the rendered HMI,
+            screen by screen, against a prior optix_cdp_sweep baseline
+          - you want a cheap pass/fail signal before spending a vision
+            model on a screenshot-by-screenshot comparison
+
+        Do NOT use this when:
+          - you haven't run optix_cdp_sweep on both sides yet (there's no
+            manifest.json to compare)
+          - you need a live look at the CURRENT canvas (use
+            optix_cdp_screenshot — this tool never touches CDP)
+        """
+        return core.cdp_diff_runtime(dir_a, dir_b, threshold=threshold)
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
     def optix_cdp_restart(allow_restart: bool = True) -> dict:
         """Recover the chrome-cdp instance that screenshot/click drive.

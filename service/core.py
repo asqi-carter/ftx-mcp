@@ -3049,6 +3049,16 @@ def doctor(cfg: Config) -> dict:
         "task (services.ps1 start), or call optix_cdp_restart, so Chrome exposes "
         "the CDP debug port with a page target.")
 
+    _tess = _find_tesseract()
+    add("tesseract", bool(_tess), _tess or "(not found)",
+        "For the zero-vision-token text tools (read_text/find_text, navigate "
+        "expect_text, sweep OCR manifests): install Tesseract OCR (winget "
+        "install UB-Mannheim.TesseractOCR). Everything else works without it.")
+    add("pillow", _load_pil() is not None,
+        "installed" if _load_pil() is not None else "(not installed)",
+        "For pixel diff in optix_cdp_diff: pip install ftx-mcp[visual]. "
+        "Without it, diff degrades to text-only mode (needs OCR manifests).")
+
     # Deploy prerequisite checks only exist when the deploy integration is
     # wired (it is not in the public distribution) — a red deploy row on a
     # server that cannot deploy is pure confusion.
@@ -4247,6 +4257,67 @@ def _resolve_point(sess: Any, point: Any) -> tuple[list[float] | None, str | Non
     return px, None
 
 
+def _run_route_steps(
+    sess: Any, steps: list, *, expect: bool, settle_default: float,
+    tesseract: str | None, ocr_unavailable: bool, runner: Runner,
+    progress: dict[str, int] | None = None,
+) -> tuple[int, int, dict | None]:
+    """Replay a route's steps on an already-open CDP session: resolve each
+    step's `click` to pixels, dispatch a trusted click, wait its
+    settle_seconds, then — if `expect` and the step carries `expect_text`
+    and OCR is available — OCR the frame and check expect_text is a
+    case-insensitive substring of the recognized text.
+
+    Shared by cdp_navigate_runtime (expect follows the caller's `expect`
+    flag; the FIRST failure stops the whole route) and cdp_sweep_runtime
+    (expect=False always — sweep is a capture pass, not a verification
+    pass, so expect_text steps replay their click but never OCR-check).
+
+    `progress`, if given, is mutated in place with the running
+    steps_run/verified_steps counts as the loop proceeds — so a caller
+    whose surrounding try/except catches a _cdp.CDPError raised mid-loop
+    (a genuine transport failure, not returned here) can still read how far
+    the route got. Returns (steps_run, verified_steps, error) on normal
+    completion, where `error` is None on full completion or a dict
+    {"error": "route_invalid"|"expectation_failed", "step": i, ...} at the
+    first step-level failure — the caller adds its own state/route/
+    steps_run framing (cdp_navigate_runtime) or records it per-screen and
+    continues (cdp_sweep_runtime). Never raises for bad step data; a
+    genuine CDP transport error still propagates as _cdp.CDPError."""
+    p = progress if progress is not None else {}
+    p["steps_run"] = p.get("steps_run", 0)
+    p["verified_steps"] = p.get("verified_steps", 0)
+    for i, step in enumerate(steps):
+        px_point, perr = _resolve_point(sess, step["click"])
+        if perr is not None:
+            return p["steps_run"], p["verified_steps"], {
+                "error": "route_invalid", "step": i, "detail": perr,
+            }
+        sess.click(px_point[0], px_point[1])
+        p["steps_run"] += 1
+        step_settle = step.get("settle_seconds")
+        step_settle = settle_default if step_settle is None else float(step_settle)
+        time.sleep(max(0.0, step_settle))
+
+        expect_text = step.get("expect_text")
+        if expect and expect_text and not ocr_unavailable:
+            import tempfile
+            jpeg = sess.screenshot_jpeg()
+            with tempfile.TemporaryDirectory() as td:
+                img = Path(td) / "nav.jpg"
+                img.write_bytes(jpeg)
+                proc = runner.run(
+                    [tesseract, str(img), "stdout", "--psm", "6"], timeout=30)
+                read_back = (proc.stdout or "") if proc.returncode == 0 else ""
+            if expect_text.lower() not in read_back.lower():
+                return p["steps_run"], p["verified_steps"], {
+                    "error": "expectation_failed", "step": i,
+                    "expected": expect_text, "read_back": read_back.strip()[:200],
+                }
+            p["verified_steps"] += 1
+    return p["steps_run"], p["verified_steps"], None
+
+
 def cdp_navigate_runtime(
     cfg: Config, route: str, routes_path: str, expect: bool = True,
     navigate_url: str | None = None, runner: Runner = _DEFAULT_RUNNER,
@@ -4320,39 +4391,16 @@ def cdp_navigate_runtime(
             ocr_unavailable = True
 
     sess = _cdp_session(cfg)
-    steps_run = 0
-    verified_steps = 0
+    progress = {"steps_run": 0, "verified_steps": 0}
     try:
         navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default)
-        for i, step in enumerate(steps):
-            px_point, perr = _resolve_point(sess, step["click"])
-            if perr is not None:
-                return {"state": "failed", "error": "route_invalid", "route": route,
-                        "step": i, "detail": perr, "steps_run": steps_run}
-            sess.click(px_point[0], px_point[1])
-            steps_run += 1
-            step_settle = step.get("settle_seconds")
-            step_settle = settle_default if step_settle is None else float(step_settle)
-            time.sleep(max(0.0, step_settle))
-
-            expect_text = step.get("expect_text")
-            if expect and expect_text and not ocr_unavailable:
-                import tempfile
-                jpeg = sess.screenshot_jpeg()
-                with tempfile.TemporaryDirectory() as td:
-                    img = Path(td) / "nav.jpg"
-                    img.write_bytes(jpeg)
-                    proc = runner.run(
-                        [tesseract, str(img), "stdout", "--psm", "6"], timeout=30)
-                    read_back = (proc.stdout or "") if proc.returncode == 0 else ""
-                if expect_text.lower() not in read_back.lower():
-                    return {
-                        "state": "failed", "error": "expectation_failed",
-                        "route": route, "step": i, "expected": expect_text,
-                        "read_back": read_back.strip()[:200],
-                        "steps_run": steps_run,
-                    }
-                verified_steps += 1
+        steps_run, verified_steps, run_err = _run_route_steps(
+            sess, steps, expect=expect, settle_default=settle_default,
+            tesseract=tesseract, ocr_unavailable=ocr_unavailable, runner=runner,
+            progress=progress)
+        if run_err is not None:
+            return {"state": "failed", "route": route, "steps_run": steps_run,
+                    **run_err}
 
         result: dict[str, Any] = {
             "state": "succeeded", "route": route, "steps_run": steps_run,
@@ -4365,9 +4413,326 @@ def cdp_navigate_runtime(
         return result
     except _cdp.CDPError as e:
         return {"state": "failed", "error": str(e), "route": route,
-                "steps_run": steps_run}
+                "steps_run": progress["steps_run"]}
     finally:
         sess.close()
+
+
+# ---- cdp_sweep + cdp_diff: visual baseline capture & compare (S6) -----
+
+_ROUTE_FILENAME_SAFE = re.compile(r"[^a-zA-Z0-9._-]")
+
+
+def _sanitize_route_filename(route: str) -> str:
+    """Route name -> safe filename stem for cdp_sweep_runtime's per-route
+    JPEG: keep [a-zA-Z0-9._-], replace everything else (spaces, slashes,
+    unicode) with '-'."""
+    return _ROUTE_FILENAME_SAFE.sub("-", route)
+
+
+def cdp_sweep_runtime(
+    cfg: Config, routes_path: str, out_dir: str, routes: list[str] | None = None,
+    warmup: bool = True, navigate_url: str | None = None,
+    runner: Runner = _DEFAULT_RUNNER,
+) -> dict:
+    """Capture a full-frame screenshot (+ OCR text, if tesseract is
+    installed) of every route in a banked routes file, in ONE CDP session —
+    the visual baseline cdp_diff_runtime later compares against.
+
+    Loads routes_path exactly like cdp_navigate_runtime (same routes file
+    format and error contract: missing file -> 'routes_file_not_found',
+    bad JSON -> 'routes_file_invalid'). Sweeps every route in the file, in
+    file order, unless `routes` names a subset — then that subset, in the
+    given order; a name in `routes` not present in the file fails the whole
+    call with error='route_not_found' (with `available` listing known
+    routes), same contract as cdp_navigate_runtime.
+
+    Each route's steps replay through the SAME step-execution as
+    cdp_navigate_runtime (_run_route_steps: click -> settle_seconds), but
+    expect_text checks are ALWAYS disabled here (expect=False) — sweep is a
+    capture pass, not a verification pass. ASSUMPTION: routes start from
+    the runtime's initial/home screen (the same assumption banking them for
+    cdp_navigate_runtime makes). Between routes the tab is re-navigated
+    back to the runtime URL (the same auto-target navigate/screenshot use)
+    so each route starts clean; the first route relies on the same
+    auto-target the other CDP tools use (skips the navigate if already
+    there).
+
+    warmup=True (default): before the real capture, takes and discards one
+    full-frame screenshot and waits one settle period — lets
+    animations/renders finish so the saved frame isn't a mid-transition
+    capture. Saves the full-frame JPEG to <out_dir>/<route>.jpg (route
+    names sanitized via _sanitize_route_filename). If tesseract is
+    available, OCRs the saved JPEG (stdout, psm 6) and stores its non-empty
+    stripped lines as `text`.
+
+    A capture failure on one route — a malformed banked step (an
+    out-of-viewport coordinate), or a genuine CDP transport error mid-route
+    — does NOT abort the sweep: that route is recorded as {"error": ...} in
+    `screens` and the sweep continues (a partial sweep beats none). The
+    response then carries "errors": N.
+
+    Writes <out_dir>/manifest.json: {"version": 1, "created_at": ...,
+    "viewport": {"w", "h"}, "ocr": <bool>, "screens": {route: {"file",
+    "size_bytes", "text"?}}}. Returns that same manifest dict inline plus
+    state='succeeded' (and "errors": N when any route failed).
+    """
+    from . import _cdp
+    audit(cfg, "cdp_sweep", routes_path=str(routes_path), out_dir=str(out_dir))
+
+    data, err = _load_routes_file(routes_path)
+    if err is not None:
+        return err
+    all_routes = data["routes"]
+    if routes is None:
+        selected = list(all_routes.keys())
+    else:
+        unknown = [r for r in routes if r not in all_routes]
+        if unknown:
+            return {"state": "failed", "error": "route_not_found",
+                    "route": unknown[0], "available": sorted(all_routes.keys())}
+        selected = list(routes)
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    settle_default = cfg.cdp_settle_seconds
+    target = navigate_url if navigate_url else _runtime_verify_url(cfg)
+    reload_between = navigate_url != ""
+    tesseract = _find_tesseract()
+
+    screens: dict[str, dict] = {}
+    errors = 0
+    vp_w = vp_h = 0.0
+
+    sess = _cdp_session(cfg)
+    try:
+        _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default)
+        vp_w, vp_h = sess.viewport_size()
+        for idx, route in enumerate(selected):
+            route_def = all_routes[route]
+            raw_steps = route_def.get("steps") if isinstance(route_def, dict) else None
+            steps, verr, bad_idx = _validate_route_steps(raw_steps)
+            if verr is not None:
+                screens[route] = {"error": f"route_invalid: step {bad_idx}: {verr}"}
+                errors += 1
+                continue
+            try:
+                if idx > 0 and reload_between:
+                    sess.navigate(target)
+                    time.sleep(max(0.0, settle_default))
+                _, _, run_err = _run_route_steps(
+                    sess, steps, expect=False, settle_default=settle_default,
+                    tesseract=None, ocr_unavailable=True, runner=runner)
+                if run_err is not None:
+                    screens[route] = {
+                        "error": run_err.get("detail") or run_err.get("error")}
+                    errors += 1
+                    continue
+                if warmup:
+                    sess.screenshot_jpeg()  # discard: let the frame settle
+                    time.sleep(max(0.0, settle_default))
+                jpeg = sess.screenshot_jpeg()
+            except _cdp.CDPError as e:
+                screens[route] = {"error": str(e)}
+                errors += 1
+                continue
+
+            fname = _sanitize_route_filename(route)
+            out_file = out_path / f"{fname}.jpg"
+            out_file.write_bytes(jpeg)
+            entry: dict[str, Any] = {"file": out_file.name, "size_bytes": len(jpeg)}
+            if tesseract is not None:
+                proc = runner.run(
+                    [tesseract, str(out_file), "stdout", "--psm", "6"], timeout=30)
+                text = (proc.stdout or "") if proc.returncode == 0 else ""
+                entry["text"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            screens[route] = entry
+    except _cdp.CDPError as e:
+        return {"state": "failed", "error": str(e)}
+    finally:
+        sess.close()
+
+    manifest = {
+        "version": 1, "created_at": _now_iso(),
+        "viewport": {"w": vp_w, "h": vp_h}, "ocr": tesseract is not None,
+        "screens": screens,
+    }
+    (out_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    result: dict[str, Any] = {"state": "succeeded", **manifest}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _load_pil():
+    """Lazy import of Pillow, isolated to one seam (this function) so tests
+    can cleanly force the no-Pillow degraded path by monkeypatching
+    service.core._load_pil instead of touching sys.modules globally.
+    Returns a small namespace with Image/ImageChops/ImageStat, or None if
+    Pillow (the `visual` optional dependency group) is not installed."""
+    try:
+        from PIL import Image, ImageChops, ImageStat
+    except ImportError:
+        return None
+    from types import SimpleNamespace
+    return SimpleNamespace(Image=Image, ImageChops=ImageChops, ImageStat=ImageStat)
+
+
+def _cap_lines(lines: list[str], limit: int = 40) -> list[str]:
+    """Cap a text-diff line list at `limit` entries, appending a '+N more'
+    sentinel string so a badly-drifted screen can't blow up the response."""
+    if len(lines) <= limit:
+        return lines
+    return lines[:limit] + [f"+{len(lines) - limit} more"]
+
+
+def _text_line_diff(text_a: list[str], text_b: list[str]) -> tuple[list[str], list[str]]:
+    """Line-level explainer for cdp_diff_runtime's 'changed' screens: lines
+    in B not in A ("added"), lines in A not in B ("removed"). A simple
+    order-preserving set difference (not a positional/sequence diff — OCR
+    line order isn't stable enough to make that meaningful), each side
+    capped via _cap_lines."""
+    set_a = set(text_a)
+    set_b = set(text_b)
+    added = [ln for ln in text_b if ln not in set_a]
+    removed = [ln for ln in text_a if ln not in set_b]
+    return _cap_lines(added), _cap_lines(removed)
+
+
+def _add_text_diff(entry: dict, text_a: list[str], text_b: list[str]) -> None:
+    added, removed = _text_line_diff(text_a, text_b)
+    entry["text_added"] = added
+    entry["text_removed"] = removed
+
+
+def cdp_diff_runtime(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
+    """Compare two cdp_sweep_runtime capture directories screen-by-screen —
+    a visual regression check, pure file comparison (no CDP session).
+
+    Reads <dir_a>/manifest.json and <dir_b>/manifest.json and matches
+    screens by route key. A missing manifest in either dir fails outright:
+    state='failed', error='manifest_not_found', naming the offending `dir`.
+    Screens present in only one manifest are reported under `added`
+    (only in B) / `removed` (only in A) — not treated as errors. A screen
+    whose sweep entry in either manifest carries its own {"error": ...}
+    (a route that failed to capture) degrades to {"status": "error",
+    "detail": ...} and counts toward summary.errors, rather than crashing
+    the whole diff.
+
+    Pixel gate (Pillow present — the `visual` optional dependency group,
+    lazy-imported via _load_pil so it stays fully optional): opens both
+    JPEGs; a size mismatch short-circuits to {"status": "size_mismatch"}
+    (no pixel compare, no text explainer); otherwise both are converted to
+    grayscale and compared via mean absolute pixel difference scaled to a
+    0-100 percentage (`pixel_pct` = mean_abs_diff * 100 / 255); `changed`
+    when pixel_pct > threshold (default 2.0), else `same`. An unreadable/
+    missing JPEG for a common screen degrades that ONE screen to
+    {"status": "error", ...} rather than failing the whole diff.
+
+    Pillow ABSENT: DEGRADED text-only mode. Requires BOTH manifests to
+    carry OCR text (their top-level `ocr` flag true, written by
+    cdp_sweep_runtime when tesseract ran) — if neither/either does, this
+    fails outright: error='no_pillow_no_ocr', with an install hint (Pillow
+    for pixels, tesseract for text). Otherwise each common screen's status
+    comes from exact equality of the two manifests' OCR `text` lists,
+    `pixel_pct` is null, and the top-level response carries
+    degraded='no_pillow'.
+
+    Every 'changed' screen additionally gets a text explainer —
+    `text_added` / `text_removed` — diffing the two manifests' `text`
+    lists (empty list if a manifest wasn't OCR'd), via _text_line_diff
+    (order-preserving, capped at 40 lines each with a '+N more' sentinel).
+
+    Returns {state, threshold, degraded?, screens: {route: {status,
+    pixel_pct, text_added?, text_removed?}}, added: [...], removed: [...],
+    summary: {"same": N, "changed": N, "size_mismatch": N, "errors": N}}.
+    """
+    path_a = Path(dir_a)
+    path_b = Path(dir_b)
+    manifest_a = path_a / "manifest.json"
+    manifest_b = path_b / "manifest.json"
+    if not manifest_a.is_file():
+        return {"state": "failed", "error": "manifest_not_found", "dir": str(path_a)}
+    if not manifest_b.is_file():
+        return {"state": "failed", "error": "manifest_not_found", "dir": str(path_b)}
+    try:
+        data_a = json.loads(manifest_a.read_text())
+        data_b = json.loads(manifest_b.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        return {"state": "failed", "error": "manifest_invalid", "detail": str(e)}
+
+    screens_a = data_a.get("screens") or {}
+    screens_b = data_b.get("screens") or {}
+    common = sorted(set(screens_a) & set(screens_b))
+    added_routes = sorted(set(screens_b) - set(screens_a))
+    removed_routes = sorted(set(screens_a) - set(screens_b))
+
+    pil = _load_pil()
+    degraded: str | None = None
+    if pil is None:
+        both_ocr = bool(data_a.get("ocr")) and bool(data_b.get("ocr"))
+        if not both_ocr:
+            return {
+                "state": "failed", "error": "no_pillow_no_ocr",
+                "hint": ("pip install ftx-mcp[visual] for pixel diffing, or "
+                         "install tesseract (see optix_cdp_ocr) so both "
+                         "sweeps capture OCR text for a degraded text-only "
+                         "diff"),
+            }
+        degraded = "no_pillow"
+
+    screens: dict[str, dict] = {}
+    summary = {"same": 0, "changed": 0, "size_mismatch": 0, "errors": 0}
+    for route in common:
+        entry_a = screens_a.get(route) or {}
+        entry_b = screens_b.get(route) or {}
+        if entry_a.get("error") or entry_b.get("error"):
+            screens[route] = {"status": "error",
+                               "detail": entry_a.get("error") or entry_b.get("error")}
+            summary["errors"] += 1
+            continue
+        if pil is not None:
+            file_a = path_a / entry_a.get("file", f"{route}.jpg")
+            file_b = path_b / entry_b.get("file", f"{route}.jpg")
+            try:
+                with pil.Image.open(file_a) as img_a, pil.Image.open(file_b) as img_b:
+                    if img_a.size != img_b.size:
+                        screens[route] = {"status": "size_mismatch"}
+                        summary["size_mismatch"] += 1
+                        continue
+                    gray_a = img_a.convert("L")
+                    gray_b = img_b.convert("L")
+                    diff = pil.ImageChops.difference(gray_a, gray_b)
+                    pct = pil.ImageStat.Stat(diff).mean[0] * 100 / 255
+            except OSError as e:
+                screens[route] = {"status": "error", "detail": str(e)}
+                summary["errors"] += 1
+                continue
+            status = "changed" if pct > threshold else "same"
+            screen_entry: dict[str, Any] = {"status": status, "pixel_pct": round(pct, 2)}
+            if status == "changed":
+                _add_text_diff(screen_entry, entry_a.get("text") or [],
+                               entry_b.get("text") or [])
+            screens[route] = screen_entry
+            summary[status] += 1
+        else:
+            text_a = entry_a.get("text") or []
+            text_b = entry_b.get("text") or []
+            status = "same" if text_a == text_b else "changed"
+            screen_entry = {"status": status, "pixel_pct": None}
+            if status == "changed":
+                _add_text_diff(screen_entry, text_a, text_b)
+            screens[route] = screen_entry
+            summary[status] += 1
+
+    result: dict[str, Any] = {
+        "state": "succeeded", "threshold": threshold, "screens": screens,
+        "added": added_routes, "removed": removed_routes, "summary": summary,
+    }
+    if degraded:
+        result["degraded"] = degraded
+    return result
 
 
 # ---- deploy + verify --------------------------------------------------

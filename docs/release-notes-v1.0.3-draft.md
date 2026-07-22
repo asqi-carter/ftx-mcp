@@ -1,4 +1,4 @@
-# ftx-mcp v1.0.3 — draft release notes (in progress)
+# ftx-mcp v1.0.3 — draft release notes
 
 Theme: token economy + install UX. The efficiency tools implement a
 field-validated workflow (thanks to Isaac's field reports from production
@@ -16,15 +16,28 @@ use); the install fixes close out the 2026-07-22 field session.
   and the CDP chrome no longer die quietly mid-week.
 - README: new Auth and Uninstall notes in the install section.
 
-## Token-economy tools (in progress)
+## Token-economy tools
 
 - `optix_cdp_screenshot`: `return_image=true` returns the capture as typed
   MCP image content (model sees it same-turn, no file round-trip) — opt-in;
   the default file-path flow is unchanged. Responses now include a `hint`
   telling the model exactly how to access the file.
-- (planned this release) `region` cropping, `optix_cdp_read_text`,
-  `optix_cdp_find_text`, `optix_cdp_navigate` + routes files,
-  `optix_cdp_sweep` / `optix_cdp_diff` visual-regression loop.
+- `region=[x,y,w,h]` cropping on `optix_cdp_screenshot` (CDP-native clip;
+  values <=1.0 are viewport fractions, >1 are pixels).
+- `optix_cdp_read_text(region?)` — OCR a widget or the frame: the
+  zero-vision-token "does it say X" check.
+- `optix_cdp_find_text(text)` — word boxes + clickable centers; feeds
+  `optix_cdp_click` and route building.
+- `optix_cdp_navigate(route, routes_path)` — replay banked routes (JSON,
+  normalized coords) with optional OCR `expect_text` verification that
+  fails loud instead of drifting blind.
+- `optix_cdp_sweep` / `optix_cdp_diff` — walk a route map in one session
+  into per-screen captures + OCR text manifests, then diff two sweeps:
+  pixel gate (Pillow, `pip install ftx-mcp[visual]`) + text-level deltas;
+  degrades to text-only without Pillow.
+- `optix_doctor` now reports tesseract and Pillow with install hints.
+- New skill `optix-visual-regression` documents the bank -> baseline ->
+  compare -> text-first-diff loop.
 
 ## Skills
 

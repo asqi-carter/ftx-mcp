@@ -126,8 +126,14 @@ Create or open `.vscode/mcp.json` and add:
 - **Hand back to you to ship** when the preview looks right, you deploy
   from Studio as usual. This distribution only runs the emulator.
 
-The full tool list (48 tools, plus the same surface over plain HTTP for
+The full tool list (62 tools, plus the same surface over plain HTTP for
 scripts and CI) is in [docs/tool-reference.md](docs/tool-reference.md).
+**Token economy:** screenshots cost ~1-2k vision tokens each; the OCR tool
+family (`optix_cdp_read_text`, `find_text`, `navigate`, `sweep`/`diff`) turns
+most checks into free text reads — see the `optix-blind-authoring` and
+`optix-visual-regression` playbooks for the workflow (tesseract optional but
+recommended: `winget install UB-Mannheim.TesseractOCR`).
+
 Bundled **authoring playbooks** (navigation, bound controls, styles,
 expressions) ship with the server itself — Claude discovers them via
 `optix_list_skills` / `optix_get_skill`, so every connected client gets

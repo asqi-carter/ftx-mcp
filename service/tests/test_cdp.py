@@ -790,3 +790,241 @@ def test_navigate_malformed_step_reported_at_correct_index(cfg, fake_cdp, tmp_pa
     out = core.cdp_navigate_runtime(cfg, route="r1", routes_path=str(routes_file))
     assert out["state"] == "failed" and out["error"] == "route_invalid"
     assert out["step"] == 1
+
+
+# ---- cdp_sweep (S6): visual baseline capture over banked routes ---------
+
+def test_sanitize_route_filename_replaces_unsafe_chars():
+    assert core._sanitize_route_filename("Setup Values") == "Setup-Values"
+    assert core._sanitize_route_filename("a/b\\c") == "a-b-c"
+    assert core._sanitize_route_filename("valid_Name-1.2") == "valid_Name-1.2"
+    assert core._sanitize_route_filename("Setup / Values #1") == "Setup---Values--1"
+
+
+def test_sweep_happy_path_writes_files_and_manifest(
+    cfg, fake_cdp, tmp_path: Path, monkeypatch,
+):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "home": {"steps": [{"click": [0.5, 0.5]}]},
+        "setup": {"steps": [{"click": [0.2, 0.2]}, {"click": [0.8, 0.8]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: None)  # no tesseract here
+    out_dir = tmp_path / "out"
+
+    out = core.cdp_sweep_runtime(cfg, routes_path=str(routes_file), out_dir=str(out_dir))
+
+    assert out["state"] == "succeeded"
+    assert "errors" not in out
+    assert out["version"] == 1
+    assert out["ocr"] is False
+    assert out["viewport"] == {"w": 1000.0, "h": 800.0}
+    assert set(out["screens"].keys()) == {"home", "setup"}
+    for route in ("home", "setup"):
+        entry = out["screens"][route]
+        assert entry["file"] == f"{route}.jpg"
+        assert entry["size_bytes"] == len(jpeg)
+        assert "text" not in entry
+        assert (out_dir / f"{route}.jpg").read_bytes() == jpeg
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["screens"]["home"]["file"] == "home.jpg"
+    assert manifest["ocr"] is False
+
+    # initial auto-target navigate + one reload between "home" and "setup"
+    navs = [p["url"] for (m, p, _) in ws.sent if m == "Page.navigate"]
+    assert len(navs) == 2
+
+
+def test_sweep_route_subset_in_given_order(cfg, fake_cdp, tmp_path: Path, monkeypatch):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "a": {"steps": [{"click": [0.1, 0.1]}]},
+        "b": {"steps": [{"click": [0.2, 0.2]}]},
+        "c": {"steps": [{"click": [0.3, 0.3]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    out_dir = tmp_path / "out"
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(out_dir), routes=["c", "a"])
+    assert out["state"] == "succeeded"
+    assert list(out["screens"].keys()) == ["c", "a"]
+    assert (out_dir / "c.jpg").exists()
+    assert (out_dir / "a.jpg").exists()
+    assert not (out_dir / "b.jpg").exists()
+
+
+def test_sweep_unknown_subset_route(cfg, fake_cdp, tmp_path: Path):
+    routes_file = _write_routes(tmp_path, {
+        "a": {"steps": [{"click": [0.1, 0.1]}]},
+    })
+    ws = fake_cdp()
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(tmp_path / "out"),
+        routes=["missing"])
+    assert out["state"] == "failed" and out["error"] == "route_not_found"
+    assert out["available"] == ["a"]
+    assert not ws.sent  # never opened a CDP session for a route-name error
+
+
+def test_sweep_missing_routes_file(cfg, fake_cdp, tmp_path: Path):
+    ws = fake_cdp()
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(tmp_path / "missing.json"), out_dir=str(tmp_path / "out"))
+    assert out["state"] == "failed" and out["error"] == "routes_file_not_found"
+    assert not ws.sent
+
+
+def test_sweep_invalid_routes_json(cfg, fake_cdp, tmp_path: Path):
+    routes_file = tmp_path / "routes.json"
+    routes_file.write_text("{not valid json")
+    ws = fake_cdp()
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(tmp_path / "out"))
+    assert out["state"] == "failed" and out["error"] == "routes_file_invalid"
+    assert not ws.sent
+
+
+def test_sweep_warmup_discards_extra_capture(cfg, fake_cdp, tmp_path: Path, monkeypatch):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "home": {"steps": [{"click": [0.5, 0.5]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(tmp_path / "out_warm"),
+        warmup=True)
+    assert out["state"] == "succeeded"
+    caps = [m for (m, _, _) in ws.sent if m == "Page.captureScreenshot"]
+    assert len(caps) == 2  # 1 discard + 1 saved
+
+
+def test_sweep_no_warmup_single_capture(cfg, fake_cdp, tmp_path: Path, monkeypatch):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "home": {"steps": [{"click": [0.5, 0.5]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(tmp_path / "out_nowarm"),
+        warmup=False)
+    assert out["state"] == "succeeded"
+    caps = [m for (m, _, _) in ws.sent if m == "Page.captureScreenshot"]
+    assert len(caps) == 1
+
+
+def test_sweep_ocr_when_tesseract_available(cfg, fake_cdp, tmp_path: Path, monkeypatch):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "home": {"steps": [{"click": [0.5, 0.5]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tesseract")
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "Line One\n\nLine Two  \n"))
+    out_dir = tmp_path / "out_ocr"
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(out_dir), runner=runner)
+    assert out["ocr"] is True
+    assert out["screens"]["home"]["text"] == ["Line One", "Line Two"]
+    cmd = runner.calls[0][0]
+    assert cmd[0] == "/usr/bin/tesseract"
+    assert cmd[1] == str(out_dir / "home.jpg")
+    assert cmd[2:] == ["stdout", "--psm", "6"]
+
+
+def test_sweep_per_route_capture_error_continues(cfg, fake_cdp, tmp_path: Path, monkeypatch):
+    import shutil
+    routes_file = _write_routes(tmp_path, {
+        "good": {"steps": [{"click": [0.1, 0.1]}]},
+        "bad": {"steps": [{"click": [-1, 0.1]}]},  # invalid: negative coord
+        "good2": {"steps": [{"click": [0.2, 0.2]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+        "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+    })
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    out_dir = tmp_path / "out_err"
+    out = core.cdp_sweep_runtime(cfg, routes_path=str(routes_file), out_dir=str(out_dir))
+    assert out["state"] == "succeeded"
+    assert out["errors"] == 1
+    assert "error" in out["screens"]["bad"]
+    assert out["screens"]["good"]["file"] == "good.jpg"
+    assert out["screens"]["good2"]["file"] == "good2.jpg"
+    assert (out_dir / "good.jpg").exists()
+    assert (out_dir / "good2.jpg").exists()
+    assert not (out_dir / "bad.jpg").exists()
+
+
+def test_sweep_cdp_transport_error_mid_sweep_continues(cfg, tmp_path: Path, monkeypatch):
+    """A genuine CDP transport error (not a step-validation error) on one
+    route's capture is caught and recorded, and the sweep continues."""
+    import shutil
+    from service import _cdp as _cdp_mod
+
+    routes_file = _write_routes(tmp_path, {
+        "a": {"steps": [{"click": [0.1, 0.1]}]},
+        "b": {"steps": [{"click": [0.2, 0.2]}]},
+        "c": {"steps": [{"click": [0.3, 0.3]}]},
+    })
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+
+    class FlakyWS(FakeWS):
+        def __init__(self):
+            super().__init__(results={
+                "Page.getLayoutMetrics": _layout_metrics(1000, 800),
+                "Page.captureScreenshot": {"data": base64.b64encode(jpeg).decode()},
+            })
+            self._shot_calls = 0
+
+        def send(self, text):
+            msg = json.loads(text)
+            if msg["method"] == "Page.captureScreenshot":
+                self._shot_calls += 1
+                if self._shot_calls == 3:  # route "b"'s warmup-discard capture
+                    self.sent.append((msg["method"], msg.get("params", {}), msg["id"]))
+                    self._outbox.append(json.dumps(
+                        {"id": msg["id"], "error": {"message": "transport boom"}}))
+                    return
+            super().send(text)
+
+    ws = FlakyWS()
+    monkeypatch.setattr(_cdp_mod, "_discover_page_ws",
+                        lambda url, timeout=5.0: "ws://x/devtools/page/1")
+    monkeypatch.setattr(_cdp_mod, "_connect_ws", lambda url, timeout=30.0: ws)
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    out = core.cdp_sweep_runtime(
+        cfg, routes_path=str(routes_file), out_dir=str(tmp_path / "out_flaky"))
+
+    assert out["state"] == "succeeded"
+    assert out["errors"] == 1
+    assert "transport boom" in out["screens"]["b"]["error"]
+    assert out["screens"]["a"]["file"] == "a.jpg"
+    assert out["screens"]["c"]["file"] == "c.jpg"
