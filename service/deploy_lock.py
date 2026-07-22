@@ -97,20 +97,53 @@ class DeployLock:
         return False
 
     def _try_acquire(self) -> None:
-        existing = self.read_state()
-        if existing and not self.is_stale(existing):
-            raise LockHeld(existing)
-        self._write_self()
+        # Try to win an exclusive create; if a lock file already exists, break
+        # it only when it is NOT live (stale/dead/corrupt) and retry once. This
+        # never unlinks a live lock (so a concurrent acquirer's valid lock is
+        # safe) and never lets two acquirers both pass — the O_CREAT|O_EXCL in
+        # _write_self is the single serialization point.
+        for _ in range(2):
+            existing = self.read_state()
+            if existing and not self.is_stale(existing):
+                raise LockHeld(existing)
+            try:
+                self._write_self()
+                return
+            except FileExistsError:
+                current = self.read_state()
+                if current and not self.is_stale(current):
+                    raise LockHeld(current) from None
+                # Not live (stale/dead/corrupt/unparseable): break it, then the
+                # loop retries the exclusive create.
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        # Both create attempts lost to a live concurrent acquirer. Fail closed.
+        current = self.read_state()
+        raise LockHeld(
+            current or {"pid": None, "note": "held by concurrent acquirer"}
+        ) from None
 
     def _write_self(self) -> None:
+        """Atomically create the lock file, failing if it already exists.
+
+        O_CREAT|O_EXCL makes the create the single serialization point: exactly
+        one concurrent acquirer can create the file, the losers get
+        FileExistsError. This replaces a check-then-os.replace(tmp, path) that
+        unconditionally overwrote, letting two acquirers that both saw "no lock"
+        each write and both proceed.
+        """
         state = {
             "pid": os.getpid(),
             "started_at": _now_iso(),
             "caller": self.caller,
         }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        os.replace(tmp, self.path)
+        fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, json.dumps(state).encode("utf-8"))
+        finally:
+            os.close(fd)
 
     def _release(self) -> None:
         try:

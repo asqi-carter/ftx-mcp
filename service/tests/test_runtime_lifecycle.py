@@ -14,6 +14,7 @@ and a fake socket probe (so no real port binding is required). They cover:
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,10 @@ def test_runtime_stop_invokes_controller(
     cmd = runner.calls[0][0]
     assert cmd[0] == "powershell"
     assert any("FTOptixRuntime" in arg for arg in cmd)
+    # The CommandLine match must be boundary-anchored (dir + separator) so a
+    # sibling project 'Proj2' can't be caught by a bare 'Proj' substring match.
+    ps = next(arg for arg in cmd if "CommandLine" in arg)
+    assert (str(project_dir.resolve()) + os.sep) in ps
 
 
 def test_runtime_stop_non_windows_no_op(cfg: core.Config, runtime_dir: Path) -> None:

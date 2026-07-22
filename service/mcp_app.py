@@ -8,11 +8,62 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from . import __version__, core
+from . import __version__, auth, core
+
+# The low-level server sets this contextvar for the duration of each request;
+# for the streamable-HTTP transport its `.request` is the Starlette Request
+# whose `.scope` is the ASGI scope that AuthMiddleware augments with
+# `ftxm.token_scope`. Typed Any so the None fallback is a valid assignment.
+_mcp_request_ctx: Any
+try:
+    from mcp.server.lowlevel.server import request_ctx as _mcp_request_ctx
+except Exception:  # pragma: no cover - SDK shape guard
+    _mcp_request_ctx = None
+
+
+class ScopeInsufficient(Exception):
+    """A token-authenticated MCP call lacked the scope its tool requires."""
+
+
+def _authenticated_token_scope() -> str | None:
+    """Scope of the bearer token that authenticated the current MCP request,
+    or None when the request was not token-authenticated (the auth-off loopback
+    default, or a non-HTTP transport) or the scope cannot be resolved.
+
+    AuthMiddleware forwards `ftxm.token_scope` on the ASGI scope after a
+    successful auth (service/auth.py). Fully guarded: a shape change in the SDK
+    must never crash tool dispatch — it degrades to "no enforcement", i.e. the
+    pre-existing behavior, never to a crash.
+    """
+    if _mcp_request_ctx is None:
+        return None
+    try:
+        rc = _mcp_request_ctx.get()
+    except LookupError:
+        return None
+    req = getattr(rc, "request", None)
+    scope = getattr(req, "scope", None)
+    if not isinstance(scope, dict):
+        return None
+    val = scope.get("ftxm.token_scope")
+    return val if isinstance(val, str) else None
+
+
+def _required_tool_scope(mcp: FastMCP, name: str) -> str:
+    """Minimum token scope to invoke tool `name`: read-only tools need `read`,
+    anything that mutates (write / destructive) needs `deploy`. This mirrors the
+    HTTP route scopes (auth.DEFAULT_SCOPE_RULES) so the two surfaces cannot
+    diverge — the very gap this closes. An unknown/annotation-less tool fails
+    closed to `deploy` (most restrictive), matching resolve_required_scope."""
+    tool = mcp._tool_manager._tools.get(name)
+    ann = getattr(tool, "annotations", None)
+    read_only = bool(getattr(ann, "readOnlyHint", False)) if ann is not None else False
+    return "read" if read_only else "deploy"
 
 
 def make_mcp(cfg: core.Config) -> FastMCP:
@@ -2027,6 +2078,24 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         except Exception:
             chars_in = 0
         try:
+            # Per-tool scope refinement (the check auth.DEFAULT_SCOPE_RULES
+            # defers here): the /mcp transport only requires `read`, so without
+            # this a `read` token could drive every write/destructive tool. Only
+            # engages when the request was token-authenticated; the auth-off
+            # loopback default carries no token scope and is unaffected.
+            token_scope = _authenticated_token_scope()
+            if token_scope is not None:
+                required = _required_tool_scope(mcp, name)
+                try:
+                    allowed = auth.scope_satisfies(token_scope, required)
+                except ValueError:
+                    allowed = False
+                if not allowed:
+                    raise ScopeInsufficient(
+                        f"token scope {token_scope!r} cannot call {name!r} "
+                        f"(requires {required!r}); re-issue with a higher scope "
+                        "(deploy superset of read superset of health)"
+                    )
             result = await _dispatch(name, arguments, *args, **kwargs)
         except Exception:
             core.traffic(cfg, tool=name, chars_in=chars_in, chars_out=0,
