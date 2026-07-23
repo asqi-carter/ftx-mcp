@@ -28,7 +28,9 @@ Requirements: Windows 11, FactoryTalk Optix Studio 1.7.x, and an MCP client
 like Claude Cowork. Also: **Google Chrome** (the CDP verify loop; skip with
 `setup.ps1 -NoCdp`) and — for the Claude Desktop **Microsoft Store build**
 connector path — **Node.js** (`winget install OpenJS.NodeJS.LTS`; the config
-uses `npx mcp-remote`).
+uses `npx mcp-remote`). Setup auto-installs **Tesseract OCR** via winget for
+the zero-vision-token text tools (skip with `-NoOcr`; everything else works
+without it) and **Pillow** into the venv for pixel diffing.
 
 Run `setup.ps1` from a **regular PowerShell window** — not a shell hosted
 inside a packaged app like the Store build of Claude Desktop, whose
@@ -131,8 +133,8 @@ scripts and CI) is in [docs/tool-reference.md](docs/tool-reference.md).
 **Token economy:** screenshots cost ~1-2k vision tokens each; the OCR tool
 family (`optix_cdp_read_text`, `find_text`, `navigate`, `sweep`/`diff`) turns
 most checks into free text reads — see the `optix-blind-authoring` and
-`optix-visual-regression` playbooks for the workflow (tesseract optional but
-recommended: `winget install UB-Mannheim.TesseractOCR`).
+`optix-visual-regression` playbooks for the workflow (setup installs
+tesseract automatically; `-NoOcr` opts out).
 
 Bundled **authoring playbooks** (navigation, bound controls, styles,
 expressions) ship with the server itself — Claude discovers them via

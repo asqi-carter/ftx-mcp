@@ -15,6 +15,7 @@
       1. Port-conflict detection (8081, 8765, 8766, 9222 + HMI port)
       2. Verify FT Optix Studio installed
       3. Verify Chrome installed (skipped if -NoCdp)
+      3.5 Install Tesseract OCR via winget if missing (-NoOcr skips)
       4. Create state dirs %LOCALAPPDATA%\ftx-mcp\{logs,secrets,export-staging,runtime}
       5. Install Python 3.12 via winget if missing; create venv; install package
       6. Bearer-token auth bootstrap (HMI tokens.json.dpapi)
@@ -24,6 +25,11 @@
 
 .PARAMETER NoCdp
     Skip step 8 entirely. Minimum viable install: ftx-mcp alone.
+
+.PARAMETER NoOcr
+    Skip the step 3.5 Tesseract install. The OCR-backed text tools
+    (read_text, find_text, navigate expect_text, sweep manifests) then
+    report tesseract_not_installed; everything else is unaffected.
 
 .PARAMETER NoAuth
     Loopback-no-auth opt-out. Sets FTX_AUTH_REQUIRED=false at user-env
@@ -66,6 +72,7 @@
 param(
     [switch]$NoCdp,
     [switch]$NoAuth,
+    [switch]$NoOcr,
     [switch]$EnableAuth,
     [switch]$NoAuthPrompt,
     [switch]$NoServiceRegister,
@@ -278,6 +285,34 @@ if (-not $chrome) {
     Ok "Chrome at $chrome"
 }
 
+# Step 3.5: Tesseract OCR (the zero-vision-token text tools: read_text,
+# find_text, navigate expect_text, sweep manifests). Optional - everything
+# else works without it - so install failures WARN and continue. The
+# UB-Mannheim/winget installer does not touch PATH; the service resolves the
+# standard install dirs itself, so no PATH edit is needed here either.
+Section "3.5 Tesseract OCR (text tools; -NoOcr skips)"
+$tessPaths = @(
+    "C:\Program Files\Tesseract-OCR\tesseract.exe",
+    "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    (Join-Path $env:LOCALAPPDATA "Programs\Tesseract-OCR\tesseract.exe")
+)
+$tess = Get-Command tesseract -ErrorAction SilentlyContinue
+if ($tess) { $tess = $tess.Source } else { $tess = $tessPaths | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+if ($tess) {
+    Ok "Tesseract at $tess"
+} elseif ($NoOcr) {
+    Ok "Tesseract not found; -NoOcr set - text tools will report tesseract_not_installed"
+} else {
+    Write-Host "Tesseract not found - installing via winget..." -ForegroundColor Yellow
+    winget install --id UB-Mannheim.TesseractOCR --silent --accept-source-agreements --accept-package-agreements
+    $tess = $tessPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($tess) {
+        Ok "Tesseract installed at $tess"
+    } else {
+        Warn "Tesseract install did not complete (winget missing or blocked). Text tools degrade gracefully; install later with: winget install UB-Mannheim.TesseractOCR"
+    }
+}
+
 # Step 4: state dirs
 Section "4. State dirs"
 foreach ($d in @($state, $logsDir, $secretsDir, $exportStagingDir, $runtimeDir)) {
@@ -322,7 +357,10 @@ if (-not (Test-Path $venvDir)) {
 
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 & $venvPython -m pip install --quiet --upgrade pip
-& $venvPython -m pip install --quiet -e $RepoRoot
+# [visual] extra = Pillow, the pixel gate for optix_cdp_diff. Cheap pure
+# wheel; installed by default in the full local setup (the lean base matters
+# for pip consumers of the package, not for this repo install).
+& $venvPython -m pip install --quiet -e "$RepoRoot[visual]"
 Ok "ftx-mcp installed into venv"
 
 # Step 6: bearer-token auth bootstrap

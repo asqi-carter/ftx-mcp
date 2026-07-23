@@ -15,6 +15,9 @@ use); the install fixes close out the 2026-07-22 field session.
   the Task Scheduler's silent 72-hour execution limit removed — the service
   and the CDP chrome no longer die quietly mid-week.
 - README: new Auth and Uninstall notes in the install section.
+- **Setup installs the OCR/visual deps**: Tesseract via winget (step 3.5,
+  `-NoOcr` to skip, warn-and-continue if winget can't) and Pillow via the
+  venv `[visual]` extra - `optix_doctor` still reports both.
 
 ## Token-economy tools
 
