@@ -22,7 +22,8 @@ ftx-mcp: http://127.0.0.1:8766/mcp (HTTP) - ✓ Connected
 
 ### Steps
 
-1. **Set PowerShell execution policy** for the current user (default `Restricted` blocks all bootstrap scripts):
+1. **Execution policy** — usually nothing to do: `setup.ps1` detects a
+   blocking policy and prints the exact remedy. Only if scripts are refused:
    ```powershell
    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
    ```

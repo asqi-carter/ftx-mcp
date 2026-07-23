@@ -1,2 +1,2 @@
 """ftx-mcp service package — see docs/architecture.md for surface contracts."""
-__version__ = "1.0.2"
+__version__ = "1.0.3"
