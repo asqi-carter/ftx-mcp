@@ -95,7 +95,10 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             "after a restart) -> optix_cdp_screenshot (verify; optix_cdp_fill "
             "types into fields). Pull one playbook with optix_get_skill(name) "
             "when the task matches it. Run optix_doctor first if anything "
-            "seems broken."
+            "seems broken.\n"
+            "FILES: the service filesystem is unreachable from sandboxed "
+            "clients - never ask for host folder access. Use "
+            "optix_routes_save, return_image=true, and sweep/diff text."
         ),
     )
     # FastMCP doesn't expose a version kwarg; set it on the underlying

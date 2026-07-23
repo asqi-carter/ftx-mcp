@@ -12,8 +12,11 @@ blind against the banked structure.
 
 ## The per-project UI cache
 
-Keep a JSON cache in the project workspace (convention: `dev/ftx_ui_map.json`)
-holding:
+Bank the cache with `optix_routes_save` (project, routes payload) -- the
+service writes `dev/ftx_ui_map.json` itself; read it back with
+`optix_routes_get`. NEVER ask for host folder access or write the file with
+client-side tools (the service filesystem is not reachable from sandboxed
+clients). The cache holds:
 
 - **Navigation routes** as normalized (0..1) click coordinates — portable
   across window sizes (headless and visible windows differ).
@@ -30,8 +33,10 @@ holding:
    wrote is cheap text and catches most mistakes.
 4. **Spend at most ONE screenshot** on final visual confirmation of a change.
    If nothing visual changed by design, spend zero.
-5. **Bank anything newly discovered** back into the JSON before moving on —
-   the next session starts ahead.
+5. **Bank anything newly discovered** back via `optix_routes_save` before
+   moving on — extra top-level keys (structure maps, notes) are preserved
+   alongside `routes`, so one file carries the whole cache. The next
+   session starts ahead.
 
 ## Capture discipline (when you do shoot)
 

@@ -11,8 +11,8 @@ diff -> read TEXT deltas. Images are only opened as a last resort.
 
 ## 1. Bank routes (once per project)
 
-Build a routes file (convention: `dev/ftx_ui_map.json`) with one route per
-screen you care about. Use `optix_cdp_find_text` on visible labels to get
+Build a routes file with `optix_routes_save` (one route per screen you
+care about) -- the service owns the file; never ask for host folder access. Use `optix_cdp_find_text` on visible labels to get
 clickable centers, then store NORMALIZED coords (0..1) so routes survive
 window-size changes. Give important steps an `expect_text` so a broken route
 fails loudly instead of capturing the wrong screen.
