@@ -4231,6 +4231,184 @@ def _validate_route_steps(steps: Any) -> tuple[list, str | None, int | None]:
     return steps, None, None
 
 
+# ---- routes file management (S7): service owns routes CRUD end-to-end ----
+#
+# MOTIVATION: a Cowork field test needed to CREATE a routes file for
+# optix_cdp_navigate/optix_cdp_sweep and, having no MCP tool to do it, the
+# model reached for host folder-access permission instead — its own
+# sandboxed file tools cannot see the ftx-mcp service's filesystem. That is
+# exactly the failure mode this service exists to prevent: no client should
+# ever need local file access to drive Optix. These three functions (+ the
+# optix_routes_save/get/list tools that wrap them) make the service the sole
+# owner of routes files end-to-end, so the intended loop is entirely
+# server-side: optix_cdp_find_text (discover) -> optix_routes_save (bank) ->
+# optix_cdp_navigate/optix_cdp_sweep (replay by name).
+
+_DEV_NAME_RE = re.compile(r"[a-zA-Z0-9._-]+")
+
+
+def _valid_dev_name(name: str) -> bool:
+    """True if `name` is safe to use as a `dev/<name>.json` filename stem.
+
+    No path separators and no leading dot. Combined with the fixed `dev/`
+    prefix and `.json` suffix this is traversal-safe on its own — the
+    allowed character class cannot encode '..', an absolute path, or a
+    hidden/dotfile name, so there is nothing for resolve_subpath's
+    is_relative_to check to catch that this doesn't already rule out.
+    """
+    return (
+        bool(name)
+        and "/" not in name
+        and "\\" not in name
+        and not name.startswith(".")
+        and _DEV_NAME_RE.fullmatch(name) is not None
+    )
+
+
+def _normalize_routes_payload(routes: Any) -> Any:
+    """Accept either the full versioned shape (`{"version": 1, "routes":
+    {...}}`) or a bare `{route_name: {...}}` mapping and return the inner
+    routes mapping either way, unvalidated — the caller validates each
+    route's steps. A dict whose only keys are a subset of {"version",
+    "routes"} with a dict "routes" value is treated as the versioned
+    wrapper and unwrapped; anything else (including a dict that happens to
+    contain a route literally named "routes") passes through as-is, since a
+    route file legitimately naming a route "routes" is an edge case not
+    worth adding a second sentinel for.
+    """
+    if (
+        isinstance(routes, dict)
+        and isinstance(routes.get("routes"), dict)
+        and set(routes.keys()) <= {"version", "routes"}
+    ):
+        return routes["routes"]
+    return routes
+
+
+def routes_save(cfg: Config, project: str, routes: dict, name: str = "ftx_ui_map") -> dict:
+    """Write a routes file under `<project_dir>/dev/<name>.json` — the
+    service-owned save half of the routes-banking loop (see the S7
+    MOTIVATION comment above _valid_dev_name).
+
+    `routes` accepts either the full versioned shape (`{"version": 1,
+    "routes": {...}}`, as read back by routes_get/cdp_navigate) or a bare
+    `{route_name: {"steps": [...]}, ...}` mapping — both normalize to the
+    versioned shape on disk (see _normalize_routes_payload). Every route's
+    `steps` is validated with the SAME _validate_route_steps check
+    cdp_navigate_runtime uses, BEFORE anything is written: a malformed step
+    anywhere in the payload fails the whole save with error='routes_invalid'
+    naming the offending route and step index — never a partial write.
+
+    `name` is sanitized to `[a-zA-Z0-9._-]`, no path separators, no leading
+    dot (see _valid_dev_name); anything else fails with error='bad_name'
+    rather than touching the filesystem. `dev/` is created if missing.
+    Saving over an existing `name` REPLACES its content wholesale (atomic
+    tmp-file + os.replace, UTF-8) — it is not a merge.
+
+    Returns {state: 'succeeded', path, routes: [route names], bytes} on
+    success. `path` is the absolute path to the written file and is directly
+    usable as `routes_path` for cdp_navigate_runtime / cdp_sweep_runtime —
+    no separate lookup needed.
+    """
+    project_dir = resolve_project(cfg, project)
+    if not _valid_dev_name(name):
+        return {"state": "failed", "error": "bad_name", "name": name}
+    inner = _normalize_routes_payload(routes)
+    if not isinstance(inner, dict):
+        return {
+            "state": "failed", "error": "routes_invalid",
+            "detail": "routes must be an object mapping route name -> {steps: [...]}",
+        }
+    for route_name, route_def in inner.items():
+        raw_steps = route_def.get("steps") if isinstance(route_def, dict) else None
+        _, verr, bad_idx = _validate_route_steps(raw_steps)
+        if verr is not None:
+            return {
+                "state": "failed", "error": "routes_invalid",
+                "route": route_name, "step": bad_idx, "detail": verr,
+            }
+    dev_dir = project_dir / "dev"
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    target = dev_dir / f"{name}.json"
+    payload = {"version": 1, "routes": inner}
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    tmp = dev_dir / f".{name}.json.tmp-{os.getpid()}"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
+    audit(cfg, "routes_save", project=project, name=name, path=str(target),
+          routes=sorted(inner.keys()))
+    return {
+        "state": "succeeded", "path": str(target),
+        "routes": sorted(inner.keys()), "bytes": len(text.encode("utf-8")),
+    }
+
+
+def routes_get(cfg: Config, project: str, name: str = "ftx_ui_map") -> dict:
+    """Read back a routes file saved with routes_save (or hand-banked at the
+    same `dev/<name>.json` convention) — {state, path, routes: <full parsed
+    versioned dict>} on success.
+
+    Uses the SAME loader as cdp_navigate_runtime/cdp_sweep_runtime
+    (_load_routes_file), so "routes_get says it's fine" and "cdp_navigate
+    can read it" are the same guarantee. A bad `name` fails with
+    error='bad_name' before touching disk (see _valid_dev_name). A missing
+    file fails with error='routes_file_not_found' and `path` naming the
+    exact path looked for; unparseable/malformed JSON fails with
+    error='routes_file_invalid'. Never raises for a missing/bad file.
+    """
+    project_dir = resolve_project(cfg, project)
+    if not _valid_dev_name(name):
+        return {"state": "failed", "error": "bad_name", "name": name}
+    path = project_dir / "dev" / f"{name}.json"
+    data, err = _load_routes_file(str(path))
+    if err is not None:
+        err = dict(err)
+        err["path"] = err.pop("routes_path")
+        return err
+    return {"state": "succeeded", "path": str(path), "routes": data}
+
+
+def routes_list(cfg: Config, project: str) -> dict:
+    """List every routes file saved under `<project_dir>/dev/*.json` — the
+    discovery half of the routes-banking loop, for "what routes have I
+    already banked for this project".
+
+    Only files that parse as a valid routes file (JSON object with a dict
+    "routes" key — same shape check as _load_routes_file) are listed; a
+    `dev/*.json` file that fails to parse or doesn't match that shape (a
+    stray unrelated JSON file someone dropped in dev/) is skipped SILENTLY
+    per-file rather than failing the whole listing, and only counted in
+    `skipped` — one bad file should never hide the rest.
+
+    Returns {state: 'succeeded', files: [{name, path, routes: [route
+    names], mtime}, ...], count, skipped}. No `dev/` directory yet is not an
+    error — files=[], count=0, skipped=0.
+    """
+    project_dir = resolve_project(cfg, project)
+    dev_dir = project_dir / "dev"
+    files: list[dict] = []
+    skipped = 0
+    if dev_dir.is_dir():
+        for p in sorted(dev_dir.glob("*.json")):
+            if not p.is_file():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                skipped += 1
+                continue
+            if not isinstance(data, dict) or not isinstance(data.get("routes"), dict):
+                skipped += 1
+                continue
+            files.append({
+                "name": p.stem,
+                "path": str(p),
+                "routes": sorted(data["routes"].keys()),
+                "mtime": _now_iso(p.stat().st_mtime),
+            })
+    return {"state": "succeeded", "files": files, "count": len(files), "skipped": skipped}
+
+
 def _resolve_point(sess: Any, point: Any) -> tuple[list[float] | None, str | None]:
     """Resolve a route step's `click` [x, y] to absolute CSS pixels.
 

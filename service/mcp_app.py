@@ -2111,6 +2111,126 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         return core.cdp_find_text_runtime(
             cfg, text, navigate_url=navigate_url, settle_seconds=settle_seconds)
 
+    # ---- routes file management (S7) -----------------------------------
+    # MOTIVATION: a Cowork field test needed to CREATE a routes file for
+    # optix_cdp_navigate/optix_cdp_sweep and, having no MCP tool to do it,
+    # the model reached for host folder-access permission instead — its own
+    # sandboxed file tools cannot see this service's filesystem. These three
+    # tools make the service own routes files end-to-end so no client ever
+    # needs local file access: optix_cdp_find_text (discover) ->
+    # optix_routes_save (bank) -> optix_cdp_navigate/optix_cdp_sweep (replay).
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+    def optix_routes_save(
+        project: str, routes: dict, name: str = "ftx_ui_map",
+    ) -> dict:
+        """Save a navigation routes file server-side — the CREATE half of
+        the routes-banking loop for optix_cdp_navigate / optix_cdp_sweep.
+
+        Routes files are owned by the ftx-mcp service - create and read
+        them with optix_routes_save / optix_routes_get. Do NOT ask the user
+        for host folder access or try to write project files with
+        client-side file tools; the service filesystem is not reachable
+        from sandboxed clients.
+
+        `routes` accepts either the full versioned shape (`{"version": 1,
+        "routes": {"<name>": {"steps": [...]}}}`, the same shape
+        optix_routes_get / optix_cdp_navigate read) or a bare `{"<name>":
+        {"steps": [...]}}` mapping — both normalize to the versioned shape
+        on disk. Each route's `steps` is validated with the SAME check
+        optix_cdp_navigate uses BEFORE anything is written: a malformed
+        step anywhere fails the whole save with error='routes_invalid'
+        naming the offending route and step index, rather than writing a
+        partial file.
+
+        Saved at `<project>/dev/<name>.json` (default name "ftx_ui_map",
+        the optix-blind-authoring skill's cache convention). `name` is
+        sanitized to `[a-zA-Z0-9._-]`, no path separators, no leading dot —
+        anything else fails with error='bad_name' before touching disk.
+        Saving over an existing `name` REPLACES its content wholesale
+        (atomic write) — it is not a merge.
+
+        Returns {state: 'succeeded', path, routes: [route names], bytes}.
+        `path` is directly usable as `routes_path` for optix_cdp_navigate /
+        optix_cdp_sweep — no extra lookup needed.
+
+        Use this when:
+          - you've discovered a click sequence (via optix_cdp_find_text /
+            optix_cdp_screenshot) and want to bank it for cheap replay
+          - creating a NEW routes file, or adding/updating routes in one
+            you already own
+
+        Do NOT use this when:
+          - the routes file already has the route you need — just
+            optix_cdp_navigate by name, no need to re-save
+          - you only want to read what's banked (optix_routes_get /
+            optix_routes_list)
+        """
+        return core.routes_save(cfg, project, routes, name=name)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def optix_routes_get(project: str, name: str = "ftx_ui_map") -> dict:
+        """Read back a routes file saved with optix_routes_save —
+        {state, path, routes: <full parsed versioned dict>}.
+
+        Routes files are owned by the ftx-mcp service - create and read
+        them with optix_routes_save / optix_routes_get. Do NOT ask the user
+        for host folder access or try to read project files with
+        client-side file tools; the service filesystem is not reachable
+        from sandboxed clients.
+
+        Looks at `<project>/dev/<name>.json`. A bad `name` fails with
+        error='bad_name' before touching disk (see optix_routes_save for
+        the sanitization rule). A missing file fails with
+        error='routes_file_not_found' and `path` naming the exact path
+        looked for; malformed JSON fails with error='routes_file_invalid'.
+        Never raises for a missing/bad file.
+
+        Use this when:
+          - inspecting what routes/steps a banked file actually contains,
+            e.g. before editing it via optix_routes_save
+          - a caller needs the raw routes dict itself, not just to replay
+            it (optix_cdp_navigate reads the file directly — you don't
+            need this first just to navigate)
+
+        Do NOT use this when:
+          - you just want to replay a route (optix_cdp_navigate reads the
+            file directly)
+          - you don't know the file's `name` (optix_routes_list first)
+        """
+        return core.routes_get(cfg, project, name=name)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def optix_routes_list(project: str) -> dict:
+        """List every routes file saved under a project's `dev/` — what's
+        already banked, before you navigate/sweep or save more.
+
+        Routes files are owned by the ftx-mcp service - create and read
+        them with optix_routes_save / optix_routes_get. Do NOT ask the user
+        for host folder access or try to list/read project files with
+        client-side file tools; the service filesystem is not reachable
+        from sandboxed clients.
+
+        Only files that parse as a valid routes file (JSON object with a
+        dict "routes" key) are listed; anything else under dev/*.json is
+        skipped silently per-file and counted in `skipped` — one bad file
+        never hides the rest.
+
+        Returns {state: 'succeeded', files: [{name, path, routes: [route
+        names], mtime}, ...], count, skipped}. No dev/ directory yet is not
+        an error — files=[], count=0, skipped=0.
+
+        Use this when:
+          - you don't remember what routes files (or route names) already
+            exist for this project before saving a new one or navigating
+          - auditing what's banked across a project
+
+        Do NOT use this when:
+          - you already know the exact `name` (optix_routes_get is more
+            direct) or route (optix_cdp_navigate reads the file itself)
+        """
+        return core.routes_list(cfg, project)
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
     def optix_cdp_navigate(
         route: str, routes_path: str, expect: bool = True,
@@ -2128,7 +2248,14 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         across window sizes. Convention: bank routes at `dev/ftx_ui_map.json`
         in the project workspace — see the optix-blind-authoring skill for
         the cache workflow (discover once with optix_cdp_find_text, bank the
-        route, navigate blind from then on).
+        route, navigate blind from then on). `routes_path` accepts the
+        `path` returned by optix_routes_save directly.
+
+        Routes files are owned by the ftx-mcp service - create and read
+        them with optix_routes_save / optix_routes_get. Do NOT ask the user
+        for host folder access or try to write project files with
+        client-side file tools; the service filesystem is not reachable
+        from sandboxed clients.
 
         expect_text verification needs tesseract: with expect=true (the
         default) and a step carrying expect_text, this OCRs the frame after
@@ -2175,7 +2302,16 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         against.
 
         Loads routes_path exactly like optix_cdp_navigate (same routes
-        file format and error contract). Sweeps all routes in file order,
+        file format and error contract, and `routes_path` likewise accepts
+        the `path` returned by optix_routes_save directly).
+
+        Routes files are owned by the ftx-mcp service - create and read
+        them with optix_routes_save / optix_routes_get. Do NOT ask the user
+        for host folder access or try to write project files with
+        client-side file tools; the service filesystem is not reachable
+        from sandboxed clients.
+
+        Sweeps all routes in file order,
         or just the names in `routes` (in the order given) — an unknown
         name in `routes` fails the whole call with error='route_not_found',
         same as optix_cdp_navigate. Each route's steps replay exactly like

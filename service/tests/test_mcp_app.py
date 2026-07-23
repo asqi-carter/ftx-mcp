@@ -80,6 +80,9 @@ EXPECTED_TOOLS = {
     "optix_cdp_ocr",
     "optix_cdp_read_text",
     "optix_cdp_find_text",
+    "optix_routes_save",
+    "optix_routes_get",
+    "optix_routes_list",
     "optix_cdp_navigate",
     "optix_cdp_sweep",
     "optix_cdp_diff",
@@ -127,7 +130,8 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             "optix_cdp_read_text","optix_cdp_find_text","optix_cdp_diff",
             "optix_bridge_validate_expression",
             "optix_emulator_status", "optix_runtime_log_tail",
-            "optix_get_project_map", "optix_list_skills", "optix_get_skill"}
+            "optix_get_project_map", "optix_list_skills", "optix_get_skill",
+            "optix_routes_get", "optix_routes_list"}
     DESTRUCTIVE = {"optix_deploy","optix_deploy_updatesvc","optix_bridge_delete_node",
                    "optix_runtime_stop","optix_cdp_click","optix_cdp_type",
                    "optix_cdp_key","optix_cdp_fill","optix_cdp_navigate",
@@ -514,6 +518,100 @@ def test_cdp_find_text_tool_no_match_is_not_an_error(
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
     out = tool.fn(text="Nonexistent")
     assert out["state"] == "succeeded" and out["found"] is False
+
+
+# ---- optix_routes_save / optix_routes_get / optix_routes_list (S7) ------
+#
+# Motivation: a field test needed to CREATE a routes file server-side and
+# had no tool for it, so the model reached for host folder access. These
+# tests pin the tool-layer forwarding contract; core.py's test_cdp.py tests
+# cover the save->navigate round-trip and validation behavior.
+
+def test_routes_save_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_save(cfg_, project, routes, name="ftx_ui_map"):
+        seen.update(project=project, routes=routes, name=name)
+        return {"state": "succeeded", "path": "/p/dev/ftx_ui_map.json",
+                "routes": ["home"], "bytes": 42}
+
+    monkeypatch.setattr(core, "routes_save", fake_save)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
+    out = tool.fn(project="Alpha", routes={"home": {"steps": [{"click": [0, 0]}]}})
+    assert out["state"] == "succeeded" and out["path"] == "/p/dev/ftx_ui_map.json"
+    assert seen == {"project": "Alpha",
+                    "routes": {"home": {"steps": [{"click": [0, 0]}]}},
+                    "name": "ftx_ui_map"}
+
+
+def test_routes_save_tool_custom_name_forwarded(cfg: core.Config, monkeypatch) -> None:
+    seen = {}
+    monkeypatch.setattr(core, "routes_save", lambda cfg_, project, routes, name="ftx_ui_map": (
+        seen.update(name=name) or {"state": "succeeded", "path": "p", "routes": [], "bytes": 2}))
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
+    tool.fn(project="Alpha", routes={}, name="custom")
+    assert seen["name"] == "custom"
+
+
+def test_routes_save_tool_surfaces_bad_name_as_dict(cfg: core.Config, monkeypatch) -> None:
+    monkeypatch.setattr(core, "routes_save", lambda cfg_, project, routes, name="ftx_ui_map": {
+        "state": "failed", "error": "bad_name", "name": name})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
+    out = tool.fn(project="Alpha", routes={}, name="../escape")
+    assert out["state"] == "failed" and out["error"] == "bad_name"
+
+
+def test_routes_get_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_get(cfg_, project, name="ftx_ui_map"):
+        seen.update(project=project, name=name)
+        return {"state": "succeeded", "path": "/p/dev/ftx_ui_map.json",
+                "routes": {"version": 1, "routes": {"home": {"steps": []}}}}
+
+    monkeypatch.setattr(core, "routes_get", fake_get)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_get")
+    out = tool.fn(project="Alpha")
+    assert out["state"] == "succeeded"
+    assert out["routes"]["routes"]["home"] == {"steps": []}
+    assert seen == {"project": "Alpha", "name": "ftx_ui_map"}
+
+
+def test_routes_get_tool_not_found_surfaces_as_dict(cfg: core.Config, monkeypatch) -> None:
+    monkeypatch.setattr(core, "routes_get", lambda cfg_, project, name="ftx_ui_map": {
+        "state": "failed", "error": "routes_file_not_found", "path": "/p/dev/missing.json"})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_get")
+    out = tool.fn(project="Alpha", name="missing")
+    assert out["state"] == "failed" and out["error"] == "routes_file_not_found"
+
+
+def test_routes_list_tool_registered_and_forwards_to_core(
+    cfg: core.Config, monkeypatch
+) -> None:
+    seen = {}
+
+    def fake_list(cfg_, project):
+        seen["project"] = project
+        return {"state": "succeeded", "files": [
+            {"name": "one", "path": "/p/dev/one.json", "routes": ["home"], "mtime": "t"}],
+            "count": 1, "skipped": 1}
+
+    monkeypatch.setattr(core, "routes_list", fake_list)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_list")
+    out = tool.fn(project="Alpha")
+    assert out["state"] == "succeeded"
+    assert out["count"] == 1 and out["skipped"] == 1
+    assert seen == {"project": "Alpha"}
 
 
 # ---- optix_cdp_sweep / optix_cdp_diff (S6) -------------------------------

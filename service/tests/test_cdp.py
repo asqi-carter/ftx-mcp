@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from service import core, _cdp
-from service.tests.conftest import FakeProc, make_fake_runner
+from service.tests.conftest import FakeProc, make_fake_runner, make_project
 
 
 class FakeWS:
@@ -1028,3 +1028,153 @@ def test_sweep_cdp_transport_error_mid_sweep_continues(cfg, tmp_path: Path, monk
     assert "transport boom" in out["screens"]["b"]["error"]
     assert out["screens"]["a"]["file"] == "a.jpg"
     assert out["screens"]["c"]["file"] == "c.jpg"
+
+
+# ---- routes file management (S7): service-owned routes CRUD ------------
+#
+# Motivation (see core.py's S7 comment): a field test needed to CREATE a
+# routes file and had no MCP tool for it, so the model reached for host
+# folder access instead. These tests pin routes_save/get/list as the
+# service-owned replacement for that gap.
+
+def test_routes_save_happy_path_round_trips_into_navigate(
+    cfg, fake_cdp, projects_root: Path,
+):
+    """save's returned path loads via _load_routes_file AND drives
+    cdp_navigate_runtime end-to-end — proving the save->navigate loop a
+    caller is meant to use never needs local file access."""
+    make_project(projects_root, "Alpha")
+    ws = fake_cdp(results={"Page.getLayoutMetrics": _layout_metrics(1000, 800)})
+
+    out = core.routes_save(
+        cfg, "Alpha",
+        {"version": 1, "routes": {"home": {"steps": [{"click": [0.5, 0.5]}]}}},
+    )
+    assert out["state"] == "succeeded"
+    assert out["routes"] == ["home"]
+    assert out["bytes"] > 0
+    path = out["path"]
+    assert path.endswith(str(Path("dev") / "ftx_ui_map.json"))
+
+    data, err = core._load_routes_file(path)
+    assert err is None
+    assert data["routes"]["home"]["steps"][0]["click"] == [0.5, 0.5]
+
+    nav = core.cdp_navigate_runtime(cfg, route="home", routes_path=path, navigate_url="")
+    assert nav["state"] == "succeeded"
+    assert nav["steps_run"] == 1
+    presses = [(p["x"], p["y"]) for (m, p, _) in ws.sent
+               if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed"]
+    assert presses == [(500.0, 400.0)]
+
+
+def test_routes_save_accepts_bare_inner_mapping_and_normalizes(
+    cfg, projects_root: Path,
+):
+    """Passing just the {name: {steps: [...]}} mapping (no version/routes
+    wrapper) is accepted and normalized to the versioned shape on disk."""
+    make_project(projects_root, "Alpha")
+    out = core.routes_save(
+        cfg, "Alpha", {"home": {"steps": [{"click": [0.1, 0.1]}]}}, name="bare",
+    )
+    assert out["state"] == "succeeded"
+    assert out["routes"] == ["home"]
+    data, err = core._load_routes_file(out["path"])
+    assert err is None
+    assert data == {"version": 1, "routes": {"home": {"steps": [{"click": [0.1, 0.1]}]}}}
+
+
+@pytest.mark.parametrize("bad_name", [
+    "../escape", "..", "a/b", "a\\b", ".hidden", ".", "",
+])
+def test_routes_save_rejects_bad_names(cfg, projects_root: Path, bad_name):
+    make_project(projects_root, "Alpha")
+    out = core.routes_save(cfg, "Alpha", {"home": {"steps": [{"click": [0, 0]}]}},
+                           name=bad_name)
+    assert out["state"] == "failed"
+    assert out["error"] == "bad_name"
+
+
+def test_routes_save_rejects_invalid_step_names_route_and_index(
+    cfg, projects_root: Path,
+):
+    make_project(projects_root, "Alpha")
+    out = core.routes_save(cfg, "Alpha", {
+        "good": {"steps": [{"click": [0.1, 0.1]}]},
+        "bad": {"steps": [{"click": [0.1, 0.1]}, {"no_click": True}]},
+    })
+    assert out["state"] == "failed"
+    assert out["error"] == "routes_invalid"
+    assert out["route"] == "bad"
+    assert out["step"] == 1
+    # nothing written on a rejected save
+    assert not (projects_root / "Alpha" / "dev").exists()
+
+
+def test_routes_save_overwrite_replaces_content_wholesale(cfg, projects_root: Path):
+    make_project(projects_root, "Alpha")
+    first = core.routes_save(cfg, "Alpha", {"a": {"steps": [{"click": [0, 0]}]}})
+    assert first["state"] == "succeeded"
+    second = core.routes_save(cfg, "Alpha", {"b": {"steps": [{"click": [1, 1]}]}})
+    assert second["state"] == "succeeded"
+    assert second["path"] == first["path"]
+
+    data, err = core._load_routes_file(second["path"])
+    assert err is None
+    # "a" is gone — overwrite replaces, it does not merge
+    assert list(data["routes"].keys()) == ["b"]
+
+
+def test_routes_save_unknown_project_raises(cfg):
+    with pytest.raises(core.ProjectNotFound):
+        core.routes_save(cfg, "NoSuchProject", {"a": {"steps": [{"click": [0, 0]}]}})
+
+
+def test_routes_get_happy_path(cfg, projects_root: Path):
+    make_project(projects_root, "Alpha")
+    saved = core.routes_save(cfg, "Alpha", {"home": {"steps": [{"click": [0.2, 0.3]}]}})
+    out = core.routes_get(cfg, "Alpha")
+    assert out["state"] == "succeeded"
+    assert out["path"] == saved["path"]
+    assert out["routes"]["routes"]["home"]["steps"][0]["click"] == [0.2, 0.3]
+
+
+def test_routes_get_not_found_names_the_path(cfg, projects_root: Path):
+    make_project(projects_root, "Alpha")
+    out = core.routes_get(cfg, "Alpha", name="missing")
+    assert out["state"] == "failed"
+    assert out["error"] == "routes_file_not_found"
+    assert out["path"].endswith(str(Path("dev") / "missing.json"))
+
+
+def test_routes_get_unknown_project_raises(cfg):
+    with pytest.raises(core.ProjectNotFound):
+        core.routes_get(cfg, "NoSuchProject")
+
+
+def test_routes_list_counts_valid_and_skips_junk(cfg, projects_root: Path):
+    project_dir = make_project(projects_root, "Alpha")
+    core.routes_save(cfg, "Alpha", {"home": {"steps": [{"click": [0, 0]}]}}, name="one")
+    core.routes_save(cfg, "Alpha", {"setup": {"steps": [{"click": [0, 0]}]}}, name="two")
+    (project_dir / "dev" / "junk.json").write_text("not valid json")
+
+    out = core.routes_list(cfg, "Alpha")
+    assert out["state"] == "succeeded"
+    assert out["count"] == 2
+    assert out["skipped"] == 1
+    names = {f["name"] for f in out["files"]}
+    assert names == {"one", "two"}
+    one = next(f for f in out["files"] if f["name"] == "one")
+    assert one["routes"] == ["home"]
+    assert "mtime" in one
+
+
+def test_routes_list_no_dev_dir_is_empty_not_an_error(cfg, projects_root: Path):
+    make_project(projects_root, "Alpha")
+    out = core.routes_list(cfg, "Alpha")
+    assert out == {"state": "succeeded", "files": [], "count": 0, "skipped": 0}
+
+
+def test_routes_list_unknown_project_raises(cfg):
+    with pytest.raises(core.ProjectNotFound):
+        core.routes_list(cfg, "NoSuchProject")
