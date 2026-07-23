@@ -94,6 +94,12 @@ def _list_tools(mcp) -> list:
     return mcp._tool_manager.list_tools()
 
 
+def _tool_fn(tool):
+    """Directly-callable fn for a tool: offloaded (async-wrapped) tools keep
+    their original sync fn at _ftx_sync_fn; fast tools are tool.fn as-is."""
+    return getattr(tool, "_ftx_sync_fn", tool.fn)
+
+
 def test_mcp_registers_every_spec_tool(cfg: core.Config) -> None:
     mcp = make_mcp(cfg)
     names = {t.name for t in _list_tools(mcp)}
@@ -167,7 +173,7 @@ def test_mcp_bridge_tool_returns_structured_nudge_on_failure(
         "nudge": "Open the project in Studio and run StartBridge."})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_set_property")
-    out = tool.fn(project="Alpha", node_path="UI/MainWindow/L1", name="Text", value="hi")
+    out = _tool_fn(tool)(project="Alpha", node_path="UI/MainWindow/L1", name="Text", value="hi")
     assert out["state"] == "failed"
     assert out["reason_code"] == "bridge_unreachable_studio_closed"
     assert "StartBridge" in out["nudge"]
@@ -176,7 +182,7 @@ def test_mcp_bridge_tool_returns_structured_nudge_on_failure(
 def test_mcp_health_tool_returns_expected_keys(cfg: core.Config) -> None:
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_health")
-    out = tool.fn()
+    out = _tool_fn(tool)()
     for key in (
         "projects_root",
         "studio_exe",
@@ -193,7 +199,7 @@ def test_mcp_list_projects_tool_returns_known_project(
     make_project(projects_root, "Alpha")
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_list_projects")
-    out = tool.fn()
+    out = _tool_fn(tool)()
     assert "projects" in out
     names = [p["name"] for p in out["projects"]]
     assert "Alpha" in names
@@ -205,7 +211,7 @@ def test_mcp_deploy_preflight_tool_returns_envelope(
     make_project(projects_root, "Alpha")
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_deploy_preflight")
-    out = tool.fn(project="Alpha")
+    out = _tool_fn(tool)(project="Alpha")
     for key in ("ready", "blockers", "warnings", "checks"):
         assert key in out, f"preflight envelope missing {key!r}: {out}"
 
@@ -221,10 +227,13 @@ def test_shellout_tools_are_offloaded_async(cfg: core.Config) -> None:
     by_name = {t.name: t for t in _list_tools(mcp)}
     for n in ("optix_emulator_status", "optix_run_emulator", "optix_restart_emulator",
               "optix_cdp_screenshot", "optix_cdp_click", "optix_studio_version",
-              "optix_doctor", "optix_services_status", "optix_save"):
+              "optix_doctor", "optix_services_status", "optix_save",
+              "optix_cdp_read_text", "optix_cdp_find_text", "optix_cdp_navigate",
+              "optix_cdp_sweep", "optix_cdp_diff"):
         assert by_name[n].is_async is True, f"{n} must be offloaded (async)"
     for n in ("optix_health", "optix_list_projects", "optix_describe_node",
-              "optix_bridge_set_property", "optix_get_project_map"):
+              "optix_bridge_set_property", "optix_get_project_map",
+              "optix_routes_save", "optix_routes_get", "optix_routes_list"):
         assert by_name[n].is_async is False, f"{n} should stay sync"
 
 
@@ -357,7 +366,7 @@ def test_cdp_screenshot_default_returns_dict_with_hint(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(save_path=str(shot))
+    out = _tool_fn(tool)(save_path=str(shot))
     assert isinstance(out, dict)
     assert out["state"] == "succeeded"
     assert "hint" in out and "file tool" in out["hint"]
@@ -383,7 +392,7 @@ def test_cdp_screenshot_return_image_yields_typed_image_content(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(save_path=str(shot), return_image=True)
+    out = _tool_fn(tool)(save_path=str(shot), return_image=True)
     assert isinstance(out, list) and len(out) == 2
     meta = _json.loads(out[0])
     assert meta["state"] == "succeeded" and meta["path"] == str(shot)
@@ -404,7 +413,7 @@ def test_cdp_screenshot_return_image_failure_stays_dict(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(return_image=True)
+    out = _tool_fn(tool)(return_image=True)
     assert isinstance(out, dict)
     assert out["state"] == "failed"
 
@@ -427,7 +436,7 @@ def test_cdp_screenshot_region_forwarded_to_core(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(save_path=str(shot), region=[0.1, 0.1, 0.2, 0.2])
+    out = _tool_fn(tool)(save_path=str(shot), region=[0.1, 0.1, 0.2, 0.2])
     assert seen["region"] == [0.1, 0.1, 0.2, 0.2]
     assert out["region"] == [10.0, 10.0, 20.0, 20.0]
 
@@ -452,7 +461,7 @@ def test_cdp_screenshot_region_composes_with_return_image(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(save_path=str(shot), region=[0.0, 0.0, 0.1, 0.1], return_image=True)
+    out = _tool_fn(tool)(save_path=str(shot), region=[0.0, 0.0, 0.1, 0.1], return_image=True)
     assert isinstance(out, list) and len(out) == 2
     meta = _json.loads(out[0])
     assert meta["state"] == "succeeded" and meta["region"] == [5.0, 5.0, 15.0, 15.0]
@@ -470,7 +479,7 @@ def test_cdp_screenshot_bad_region_returns_dict_not_raise(
     monkeypatch.setattr(core, "cdp_screenshot_runtime", fake_capture)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_screenshot")
-    out = tool.fn(region=[1, 2, 3])
+    out = _tool_fn(tool)(region=[1, 2, 3])
     assert isinstance(out, dict)
     assert out["state"] == "failed" and out["error"] == "bad_region"
 
@@ -489,7 +498,7 @@ def test_cdp_read_text_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "cdp_read_text_runtime", fake_read_text)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_read_text")
-    out = tool.fn(region=[0.0, 0.0, 0.5, 0.5], psm=7)
+    out = _tool_fn(tool)(region=[0.0, 0.0, 0.5, 0.5], psm=7)
     assert out["text"] == "SP-101"
     assert seen == {"region": [0.0, 0.0, 0.5, 0.5], "psm": 7}
 
@@ -502,7 +511,7 @@ def test_cdp_read_text_tool_degrades_on_missing_tesseract(
         "hint": "install tesseract"})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_read_text")
-    out = tool.fn()
+    out = _tool_fn(tool)()
     assert out["state"] == "failed" and out["error"] == "tesseract_not_installed"
 
 
@@ -521,7 +530,7 @@ def test_cdp_find_text_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "cdp_find_text_runtime", fake_find_text)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
-    out = tool.fn(text="Start")
+    out = _tool_fn(tool)(text="Start")
     assert out["found"] is True and seen["text"] == "Start"
     assert out["matches"][0]["center_px"] == [2.5, 4.0]
 
@@ -534,7 +543,7 @@ def test_cdp_find_text_tool_no_match_is_not_an_error(
         "viewport": {"w": 1000, "h": 800}})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_find_text")
-    out = tool.fn(text="Nonexistent")
+    out = _tool_fn(tool)(text="Nonexistent")
     assert out["state"] == "succeeded" and out["found"] is False
 
 
@@ -558,7 +567,7 @@ def test_routes_save_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "routes_save", fake_save)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
-    out = tool.fn(project="Alpha", routes={"home": {"steps": [{"click": [0, 0]}]}})
+    out = _tool_fn(tool)(project="Alpha", routes={"home": {"steps": [{"click": [0, 0]}]}})
     assert out["state"] == "succeeded" and out["path"] == "/p/dev/ftx_ui_map.json"
     assert seen == {"project": "Alpha",
                     "routes": {"home": {"steps": [{"click": [0, 0]}]}},
@@ -571,7 +580,7 @@ def test_routes_save_tool_custom_name_forwarded(cfg: core.Config, monkeypatch) -
         seen.update(name=name) or {"state": "succeeded", "path": "p", "routes": [], "bytes": 2}))
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
-    tool.fn(project="Alpha", routes={}, name="custom")
+    _tool_fn(tool)(project="Alpha", routes={}, name="custom")
     assert seen["name"] == "custom"
 
 
@@ -580,7 +589,7 @@ def test_routes_save_tool_surfaces_bad_name_as_dict(cfg: core.Config, monkeypatc
         "state": "failed", "error": "bad_name", "name": name})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_save")
-    out = tool.fn(project="Alpha", routes={}, name="../escape")
+    out = _tool_fn(tool)(project="Alpha", routes={}, name="../escape")
     assert out["state"] == "failed" and out["error"] == "bad_name"
 
 
@@ -597,7 +606,7 @@ def test_routes_get_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "routes_get", fake_get)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_get")
-    out = tool.fn(project="Alpha")
+    out = _tool_fn(tool)(project="Alpha")
     assert out["state"] == "succeeded"
     assert out["routes"]["routes"]["home"] == {"steps": []}
     assert seen == {"project": "Alpha", "name": "ftx_ui_map"}
@@ -608,7 +617,7 @@ def test_routes_get_tool_not_found_surfaces_as_dict(cfg: core.Config, monkeypatc
         "state": "failed", "error": "routes_file_not_found", "path": "/p/dev/missing.json"})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_get")
-    out = tool.fn(project="Alpha", name="missing")
+    out = _tool_fn(tool)(project="Alpha", name="missing")
     assert out["state"] == "failed" and out["error"] == "routes_file_not_found"
 
 
@@ -626,7 +635,7 @@ def test_routes_list_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "routes_list", fake_list)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_routes_list")
-    out = tool.fn(project="Alpha")
+    out = _tool_fn(tool)(project="Alpha")
     assert out["state"] == "succeeded"
     assert out["count"] == 1 and out["skipped"] == 1
     assert seen == {"project": "Alpha"}
@@ -647,7 +656,7 @@ def test_cdp_sweep_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "cdp_sweep_runtime", fake_sweep)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_sweep")
-    out = tool.fn(routes_path="dev/routes.json", out_dir="dev/shots",
+    out = _tool_fn(tool)(routes_path="dev/routes.json", out_dir="dev/shots",
                   routes=["home"], warmup=False)
     assert out["state"] == "succeeded"
     assert seen == {"routes_path": "dev/routes.json", "out_dir": "dev/shots",
@@ -661,7 +670,7 @@ def test_cdp_sweep_tool_reports_partial_errors(cfg: core.Config, monkeypatch) ->
         "screens": {"a": {"error": "boom"}}, "errors": 1})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_sweep")
-    out = tool.fn(routes_path="r.json", out_dir="out")
+    out = _tool_fn(tool)(routes_path="r.json", out_dir="out")
     assert out["state"] == "succeeded" and out["errors"] == 1
 
 
@@ -679,7 +688,7 @@ def test_cdp_diff_tool_registered_and_forwards_to_core(
     monkeypatch.setattr(core, "cdp_diff_runtime", fake_diff)
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_diff")
-    out = tool.fn(dir_a="dev/before", dir_b="dev/after", threshold=5.0)
+    out = _tool_fn(tool)(dir_a="dev/before", dir_b="dev/after", threshold=5.0)
     assert out["state"] == "succeeded"
     assert seen == {"dir_a": "dev/before", "dir_b": "dev/after", "threshold": 5.0}
 
@@ -691,5 +700,5 @@ def test_cdp_diff_tool_manifest_not_found_surfaces_as_dict(
         "state": "failed", "error": "manifest_not_found", "dir": dir_a})
     mcp = make_mcp(cfg)
     tool = next(t for t in _list_tools(mcp) if t.name == "optix_cdp_diff")
-    out = tool.fn(dir_a="missing", dir_b="also_missing")
+    out = _tool_fn(tool)(dir_a="missing", dir_b="also_missing")
     assert out["state"] == "failed" and out["error"] == "manifest_not_found"

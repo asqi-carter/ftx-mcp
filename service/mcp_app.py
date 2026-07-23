@@ -2461,6 +2461,10 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         "optix_cdp_screenshot", "optix_cdp_click", "optix_cdp_fill",
         "optix_cdp_type", "optix_cdp_key", "optix_cdp_ocr", "optix_cdp_restart",
         "optix_runtime_start", "optix_runtime_stop", "optix_runtime_status",
+        # v1.0.3 additions - all drive multi-second CDP sessions and/or
+        # tesseract subprocesses; diff decodes N JPEG pairs (Pillow, CPU).
+        "optix_cdp_read_text", "optix_cdp_find_text", "optix_cdp_navigate",
+        "optix_cdp_sweep", "optix_cdp_diff",
     ))
     for _name, _tool in mcp._tool_manager._tools.items():
         if _name not in _OFFLOAD_TOOLS or _tool.is_async:
@@ -2472,6 +2476,9 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         _offloaded.__name__ = getattr(_sync_fn, "__name__", "tool")
         _offloaded.__doc__ = _sync_fn.__doc__
+        # Original sync fn kept reachable for tests that call the tool
+        # surface directly without an event loop.
+        _tool._ftx_sync_fn = _sync_fn
         _tool.fn = _offloaded
         _tool.is_async = True
 
