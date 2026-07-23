@@ -38,9 +38,28 @@ use); the install fixes close out the 2026-07-22 field session.
   into per-screen captures + OCR text manifests, then diff two sweeps:
   pixel gate (Pillow, `pip install ftx-mcp[visual]`) + text-level deltas;
   degrades to text-only without Pillow.
+- `optix_routes_save` / `get` / `list` — the service owns routes files
+  end-to-end: schema-validated before write, atomic, traversal-guarded.
+  Sandboxed clients (Cowork) never need host folder access to bank routes.
 - `optix_doctor` now reports tesseract and Pillow with install hints.
 - New skill `optix-visual-regression` documents the bank -> baseline ->
   compare -> text-first-diff loop.
+
+## Robustness
+
+- **Shell-out tools no longer stall the server** (@PlantwideIntegration).
+  FastMCP runs sync tools directly on the shared event loop; a slow
+  subprocess (a 15s process scan) could hang every connected client and
+  drop the MCP transport. Slow tools are now offloaded to worker threads,
+  with a lock-in test; the v1.0.3 CDP/OCR tools are covered.
+- `run_emulator` no longer reports a false failure while the runtime is
+  still identifying itself (@PlantwideIntegration).
+- CDP recovery clears a wedged Chrome and its profile lock before relaunch,
+  scoped strictly to ftx-mcp's own Chrome (@PlantwideIntegration).
+- Tesseract output is decoded as UTF-8 on all platforms (fixes a Windows
+  cp1252 reader-thread crash on multi-byte OCR output).
+- Setup no longer auto-starts the service - one explicit
+  `services.ps1 start` brings up both tasks together.
 
 ## Skills
 
