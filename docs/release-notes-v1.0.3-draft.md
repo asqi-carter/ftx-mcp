@@ -37,7 +37,9 @@ use); the install fixes close out the 2026-07-22 field session.
 - `optix_cdp_sweep` / `optix_cdp_diff` — walk a route map in one session
   into per-screen captures + OCR text manifests, then diff two sweeps:
   pixel gate (Pillow, `pip install ftx-mcp[visual]`) + text-level deltas;
-  degrades to text-only without Pillow.
+  degrades to text-only without Pillow. Text is its own channel
+  (`text_changed` + always-computed deltas) so a small label edit is named
+  even when it moves too few pixels to trip the threshold.
 - `optix_routes_save` / `get` / `list` — the service owns routes files
   end-to-end: schema-validated before write, atomic, traversal-guarded.
   Sandboxed clients (Cowork) never need host folder access to bank routes.
@@ -57,7 +59,9 @@ use); the install fixes close out the 2026-07-22 field session.
 - CDP recovery clears a wedged Chrome and its profile lock before relaunch,
   scoped strictly to ftx-mcp's own Chrome (@PlantwideIntegration).
 - Tesseract output is decoded as UTF-8 on all platforms (fixes a Windows
-  cp1252 reader-thread crash on multi-byte OCR output).
+  cp1252 reader-thread crash on multi-byte OCR output); routes files and
+  sweep manifests are read/written as explicit UTF-8 (fixes non-ASCII
+  mojibake in the save/get round-trip).
 - Setup no longer auto-starts the service - one explicit
   `services.ps1 start` brings up both tasks together.
 
