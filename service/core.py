@@ -4329,24 +4329,22 @@ def _valid_dev_name(name: str) -> bool:
     )
 
 
-def _normalize_routes_payload(routes: Any) -> Any:
-    """Accept either the full versioned shape (`{"version": 1, "routes":
-    {...}}`) or a bare `{route_name: {...}}` mapping and return the inner
-    routes mapping either way, unvalidated — the caller validates each
-    route's steps. A dict whose only keys are a subset of {"version",
-    "routes"} with a dict "routes" value is treated as the versioned
-    wrapper and unwrapped; anything else (including a dict that happens to
-    contain a route literally named "routes") passes through as-is, since a
-    route file legitimately naming a route "routes" is an edge case not
-    worth adding a second sentinel for.
+def _normalize_routes_payload(routes: Any) -> tuple[Any, dict]:
+    """Accept either the wrapped shape (`{"version": 1, "routes": {...},
+    ...extras}`) or a bare `{route_name: {...}}` mapping. Returns
+    (inner_routes_mapping, extra_top_level_keys). Any dict with a dict
+    "routes" key is the wrapped shape — EXTRA top-level keys (e.g. the
+    screen "structure" maps the blind-authoring cache banks alongside its
+    routes) are preserved verbatim through save, not rejected: the loader
+    (_load_routes_file) has always tolerated them, and a combined
+    routes+structure cache in one dev/ file is the intended workflow. A
+    bare mapping containing a route literally named "routes" misdetects as
+    wrapped — accepted edge case (documented tradeoff).
     """
-    if (
-        isinstance(routes, dict)
-        and isinstance(routes.get("routes"), dict)
-        and set(routes.keys()) <= {"version", "routes"}
-    ):
-        return routes["routes"]
-    return routes
+    if isinstance(routes, dict) and isinstance(routes.get("routes"), dict):
+        extras = {k: v for k, v in routes.items() if k not in ("version", "routes")}
+        return routes["routes"], extras
+    return routes, {}
 
 
 def routes_save(cfg: Config, project: str, routes: dict, name: str = "ftx_ui_map") -> dict:
@@ -4377,7 +4375,7 @@ def routes_save(cfg: Config, project: str, routes: dict, name: str = "ftx_ui_map
     project_dir = resolve_project(cfg, project)
     if not _valid_dev_name(name):
         return {"state": "failed", "error": "bad_name", "name": name}
-    inner = _normalize_routes_payload(routes)
+    inner, extras = _normalize_routes_payload(routes)
     if not isinstance(inner, dict):
         return {
             "state": "failed", "error": "routes_invalid",
@@ -4394,7 +4392,7 @@ def routes_save(cfg: Config, project: str, routes: dict, name: str = "ftx_ui_map
     dev_dir = project_dir / "dev"
     dev_dir.mkdir(parents=True, exist_ok=True)
     target = dev_dir / f"{name}.json"
-    payload = {"version": 1, "routes": inner}
+    payload = {"version": 1, "routes": inner, **extras}
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     tmp = dev_dir / f".{name}.json.tmp-{os.getpid()}"
     tmp.write_text(text, encoding="utf-8")

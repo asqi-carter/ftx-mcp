@@ -1178,3 +1178,26 @@ def test_routes_list_no_dev_dir_is_empty_not_an_error(cfg, projects_root: Path):
 def test_routes_list_unknown_project_raises(cfg):
     with pytest.raises(core.ProjectNotFound):
         core.routes_list(cfg, "NoSuchProject")
+
+
+def test_routes_save_preserves_extra_top_level_keys(cfg, projects_root):
+    """A combined cache (routes + screen-structure notes in ONE dev/ file -
+    the blind-authoring workflow) saves cleanly: extras ride through
+    verbatim, and the file still loads for navigate."""
+    from service import core
+    make_project(projects_root, "Alpha")
+    payload = {
+        "version": 1,
+        "routes": {"home": {"steps": [{"click": [0.5, 0.5]}]}},
+        "structure": {"SetupValuesPage": {"row_container": "UI/Rows", "index_base": 1}},
+        "notes": ["description auto-fills from row 2"],
+    }
+    out = core.routes_save(cfg, "Alpha", payload)
+    assert out["state"] == "succeeded"
+    import json as _json
+    from pathlib import Path
+    on_disk = _json.loads(Path(out["path"]).read_text(encoding="utf-8"))
+    assert on_disk["structure"]["SetupValuesPage"]["index_base"] == 1
+    assert on_disk["notes"] == ["description auto-fills from row 2"]
+    data, err = core._load_routes_file(out["path"])
+    assert err is None and "home" in data["routes"]
