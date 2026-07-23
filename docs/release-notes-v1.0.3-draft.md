@@ -1,8 +1,8 @@
 # ftx-mcp v1.0.3 — draft release notes
 
 Theme: token economy + install UX. The efficiency tools implement a
-field-validated workflow (thanks to Isaac's field reports from production
-use); the install fixes close out the 2026-07-22 field session.
+workflow validated in production field use; the install fixes close out
+field-reported friction.
 
 ## Install / lifecycle UX
 
