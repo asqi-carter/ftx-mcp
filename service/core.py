@@ -3954,7 +3954,8 @@ def cdp_ocr_runtime(
                 "navigated": shot.get("navigated", False),
             }
         proc = runner.run(
-            [tesseract, str(img), "stdout", "--psm", str(int(psm))], timeout=30)
+            [tesseract, str(img), "stdout", "--psm", str(int(psm))],
+            timeout=30, encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             return {
                 "state": "failed", "text": None,
@@ -4009,7 +4010,8 @@ def cdp_read_text_runtime(
                 "navigated": shot.get("navigated", False),
             }
         proc = runner.run(
-            [tesseract, str(img), "stdout", "--psm", str(int(psm))], timeout=30)
+            [tesseract, str(img), "stdout", "--psm", str(int(psm))],
+            timeout=30, encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             return {
                 "state": "failed", "text": None,
@@ -4144,7 +4146,8 @@ def cdp_find_text_runtime(
     with tempfile.TemporaryDirectory() as td:
         img = Path(td) / "runtime.jpg"
         img.write_bytes(jpeg)
-        proc = runner.run([tesseract, str(img), "stdout", "tsv"], timeout=30)
+        proc = runner.run([tesseract, str(img), "stdout", "tsv"],
+                          timeout=30, encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             return {
                 "state": "failed", "found": False, "matches": [],
@@ -4307,7 +4310,8 @@ def _run_route_steps(
                 img = Path(td) / "nav.jpg"
                 img.write_bytes(jpeg)
                 proc = runner.run(
-                    [tesseract, str(img), "stdout", "--psm", "6"], timeout=30)
+                    [tesseract, str(img), "stdout", "--psm", "6"],
+                    timeout=30, encoding="utf-8", errors="replace")
                 read_back = (proc.stdout or "") if proc.returncode == 0 else ""
             if expect_text.lower() not in read_back.lower():
                 return p["steps_run"], p["verified_steps"], {
@@ -4543,7 +4547,8 @@ def cdp_sweep_runtime(
             entry: dict[str, Any] = {"file": out_file.name, "size_bytes": len(jpeg)}
             if tesseract is not None:
                 proc = runner.run(
-                    [tesseract, str(out_file), "stdout", "--psm", "6"], timeout=30)
+                    [tesseract, str(out_file), "stdout", "--psm", "6"],
+                    timeout=30, encoding="utf-8", errors="replace")
                 text = (proc.stdout or "") if proc.returncode == 0 else ""
                 entry["text"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
             screens[route] = entry

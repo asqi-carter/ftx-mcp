@@ -41,8 +41,8 @@ If you downloaded a ZIP instead of cloning, run
 ```powershell
 git clone https://github.com/asqi-carter/ftx-mcp.git
 cd ftx-mcp
-.\bootstrap\setup.ps1                                  # install + start the service
-.\bootstrap\services.ps1 start                         # start the mcp
+.\bootstrap\setup.ps1                                  # install (does not start anything)
+.\bootstrap\services.ps1 start                         # start the service + cdp chrome
 .\bootstrap\services.ps1 status                        # verify health
 http://127.0.0.1:8765/ui                               # health dashboard
 ```

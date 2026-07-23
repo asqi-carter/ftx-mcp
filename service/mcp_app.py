@@ -1964,8 +1964,11 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         `return_image=true` additionally returns the capture as TYPED MCP image
         content (not b64-in-JSON) so the model sees it in the same turn with no file
-        round-trip — use when your host's file tool cannot reach the service's
-        filesystem. If your host stalls rendering it, go back to the file-path flow.
+        round-trip. Field-verified on Cowork (2026-07-22): typed image content
+        renders cleanly — the stall was specific to b64-in-JSON. PREFER
+        return_image=true when your host's file tool cannot reach the service's
+        filesystem (Cowork's sandboxed bash); combine with region= to keep the
+        payload small.
         Returns {state, path, size_bytes, navigated, captured_at, hint, region}. The
         coordinate system matches optix_cdp_click.
 

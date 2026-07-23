@@ -455,8 +455,9 @@ if ($NoServiceRegister) {
         -Principal $principal | Out-Null
     Ok "scheduled task '$taskName' registered (manual start; use bootstrap\services.ps1)"
 
-    # Optional: kick it off now so the smoke test below can hit /health
-    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    # Deliberately NOT started here (field feedback 2026-07-22): setup used to
+    # start the main task but not chrome-cdp, leaving a confusing half-started
+    # state. One explicit `services.ps1 start` after setup starts BOTH.
     Start-Sleep -Seconds 3
 }
 
@@ -485,17 +486,17 @@ if ($NoServiceRegister) {
 } else {
     $healthPort = $env:OPTIX_HTTP_PORT
     if (-not $healthPort) { $healthPort = 8765 }
+    # Setup no longer auto-starts the service (one explicit services.ps1
+    # start brings up BOTH tasks). A single quick probe covers the
+    # re-install-over-a-running-service case; "not running" is the
+    # expected fresh-install outcome, not a warning.
     $ok = $false
-    for ($i = 0; $i -lt 10; $i++) {
-        try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$healthPort/health" -TimeoutSec 2 -UseBasicParsing
-            if ($resp.StatusCode -eq 200) { $ok = $true; break }
-        } catch {
-            Start-Sleep -Seconds 1
-        }
-    }
+    try {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$healthPort/health" -TimeoutSec 2 -UseBasicParsing
+        if ($resp.StatusCode -eq 200) { $ok = $true }
+    } catch { }
     if (-not $ok) {
-        Write-Host "WARN: /health did not return 200 within 10s. Check the scheduled task logs at $logsDir." -ForegroundColor Yellow
+        Ok "service not started (expected). Start it: .\bootstrap\services.ps1 start - then verify via /health or optix_doctor."
     } else {
         Ok "/health returned 200"
         $health = $resp.Content | ConvertFrom-Json
@@ -526,6 +527,8 @@ if ($NoServiceRegister) {
 
 Section "Done"
 Write-Host "ftx-mcp install complete." -ForegroundColor Green
+Write-Host ""
+Write-Host "  START THE SERVICE (both tasks):  .\bootstrap\services.ps1 start" -ForegroundColor Cyan
 Write-Host "  HTTP   http://127.0.0.1:$httpPort"
 Write-Host "  MCP    http://127.0.0.1:$mcpPort/mcp"
 Write-Host "  state  $state"
