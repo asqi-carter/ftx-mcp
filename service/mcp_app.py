@@ -2371,14 +2371,23 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         OCR text (both sweeps must have run with tesseract installed) —
         pixel_pct is null and the response carries degraded='no_pillow';
         with neither Pillow nor OCR text this fails outright
-        (error='no_pillow_no_ocr'). Every 'changed' screen gets a
-        text_added/text_removed explainer diffing the two sweeps' OCR text
-        (capped at 40 lines each).
+        (error='no_pillow_no_ocr').
+
+        TEXT is its own channel, independent of the pixel threshold: every
+        screen gets text_added/text_removed (OCR-line diff, 40-line cap)
+        and a text_changed flag. READ text_changed FIRST for label/value
+        edits - a single-label change moves well under 1% of pixels on a
+        busy screen, so pixel status stays 'same' at the 2.0 default (the
+        threshold is tuned for layout/graphic changes; lower it only when
+        hunting small VISUAL changes with no text signature). Live-updating
+        values naturally churn the text deltas between sweeps - treat
+        deltas that look like process values as benign.
 
         Returns {state, threshold, degraded?, screens: {route: {status,
-        pixel_pct, text_added?, text_removed?}}, added, removed, summary:
-        {same, changed, size_mismatch, errors}}. A missing manifest.json in
-        either dir returns state='failed', error='manifest_not_found'.
+        pixel_pct, text_added, text_removed, text_changed}}, added,
+        removed, summary: {same, changed, size_mismatch, errors,
+        text_changed}}. A missing manifest.json in either dir returns
+        state='failed', error='manifest_not_found'.
 
         Use this when:
           - checking whether a deploy/edit changed the rendered HMI,

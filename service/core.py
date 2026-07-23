@@ -4252,7 +4252,7 @@ def _load_routes_file(routes_path: str) -> tuple[dict | None, dict | None]:
         return None, {"state": "failed", "error": "routes_file_not_found",
                        "routes_path": str(path)}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         return None, {"state": "failed", "error": "routes_file_invalid",
                        "routes_path": str(path), "detail": str(e)}
@@ -4802,7 +4802,8 @@ def cdp_sweep_runtime(
         "viewport": {"w": vp_w, "h": vp_h}, "ocr": tesseract is not None,
         "screens": screens,
     }
-    (out_path / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_path / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     result: dict[str, Any] = {"state": "succeeded", **manifest}
     if errors:
@@ -4902,8 +4903,8 @@ def cdp_diff_runtime(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
     if not manifest_b.is_file():
         return {"state": "failed", "error": "manifest_not_found", "dir": str(path_b)}
     try:
-        data_a = json.loads(manifest_a.read_text())
-        data_b = json.loads(manifest_b.read_text())
+        data_a = json.loads(manifest_a.read_text(encoding="utf-8"))
+        data_b = json.loads(manifest_b.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         return {"state": "failed", "error": "manifest_invalid", "detail": str(e)}
 
@@ -4928,7 +4929,8 @@ def cdp_diff_runtime(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
         degraded = "no_pillow"
 
     screens: dict[str, dict] = {}
-    summary = {"same": 0, "changed": 0, "size_mismatch": 0, "errors": 0}
+    summary = {"same": 0, "changed": 0, "size_mismatch": 0, "errors": 0,
+               "text_changed": 0}
     for route in common:
         entry_a = screens_a.get(route) or {}
         entry_b = screens_b.get(route) or {}
@@ -4956,9 +4958,19 @@ def cdp_diff_runtime(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
                 continue
             status = "changed" if pct > threshold else "same"
             screen_entry: dict[str, Any] = {"status": status, "pixel_pct": round(pct, 2)}
-            if status == "changed":
-                _add_text_diff(screen_entry, entry_a.get("text") or [],
-                               entry_b.get("text") or [])
+            # Text deltas are computed UNCONDITIONALLY (when OCR text exists),
+            # not gated on the pixel threshold: a single-label edit moves
+            # ~0.6% of pixels on a busy screen - under the 2% default - and
+            # was silently swallowed in the field (2026-07-23 Cowork run).
+            # Text diffing is nearly free, and live-value churn in the deltas
+            # is informative rather than harmful. `text_changed` gives the
+            # cheap-text signal its own channel independent of pixel status.
+            _add_text_diff(screen_entry, entry_a.get("text") or [],
+                           entry_b.get("text") or [])
+            screen_entry["text_changed"] = bool(
+                screen_entry.get("text_added") or screen_entry.get("text_removed"))
+            if screen_entry["text_changed"]:
+                summary["text_changed"] = summary.get("text_changed", 0) + 1
             screens[route] = screen_entry
             summary[status] += 1
         else:
@@ -4966,8 +4978,10 @@ def cdp_diff_runtime(dir_a: str, dir_b: str, threshold: float = 2.0) -> dict:
             text_b = entry_b.get("text") or []
             status = "same" if text_a == text_b else "changed"
             screen_entry = {"status": status, "pixel_pct": None}
-            if status == "changed":
-                _add_text_diff(screen_entry, text_a, text_b)
+            _add_text_diff(screen_entry, text_a, text_b)
+            screen_entry["text_changed"] = status == "changed"
+            if screen_entry["text_changed"]:
+                summary["text_changed"] = summary.get("text_changed", 0) + 1
             screens[route] = screen_entry
             summary[status] += 1
 

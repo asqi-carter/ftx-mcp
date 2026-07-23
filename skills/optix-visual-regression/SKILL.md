@@ -34,12 +34,14 @@ Capture discipline (matters for diff quality):
 After changes: `optix_cdp_sweep(routes_path, out_dir="dev/compare")`, then
 `optix_cdp_diff("dev/baseline", "dev/compare")`.
 
-Read the result as text:
-- `same` screens: done, zero cost.
-- `changed` screens: read `text_added` / `text_removed` first - for label,
-  value, and state changes that IS the answer ("50.0" removed, "51.2"
-  added). Only screenshot (`region` + `return_image`) when the text delta
-  doesn't explain the pixel change (layout/color/graphic edits).
+Read the result as text, `text_changed` FIRST:
+- `text_changed: true` screens: `text_added` / `text_removed` IS the answer
+  for label, value, and state edits ("PUMP CONTROL" removed, "PUMP CONTROL
+  v2" added) - even when pixel status says `same` (a one-label edit moves
+  <1% of pixels, under the 2% default threshold). Expect benign churn from
+  live process values.
+- `changed` (pixel) screens with no text delta: a layout/color/graphic
+  edit - screenshot it (`region` + `return_image`).
 - `size_mismatch`: the window config drifted between sweeps - redo the
   comparison sweep with the same window, don't interpret it.
 

@@ -1201,3 +1201,23 @@ def test_routes_save_preserves_extra_top_level_keys(cfg, projects_root):
     assert on_disk["notes"] == ["description auto-fills from row 2"]
     data, err = core._load_routes_file(out["path"])
     assert err is None and "home" in data["routes"]
+
+
+def test_routes_roundtrip_preserves_non_ascii(cfg, projects_root):
+    """2026-07-23 field bug: routes_save wrote UTF-8 but the loader read with
+    the platform default codec, mojibaking an em dash on Windows. The full
+    save -> get round-trip must preserve non-ASCII exactly."""
+    from service import core
+    make_project(projects_root, "Alpha")
+    payload = {
+        "version": 1,
+        "routes": {"overview": {"steps": [
+            {"click": [0.5, 0.5], "expect_text": "LINE 4 — OVERVIEW"}]}},
+        "structure": {"MainWindow": {"title": "LINE 4 — OVERVIEW"}},
+    }
+    out = core.routes_save(cfg, "Alpha", payload)
+    assert out["state"] == "succeeded"
+    back = core.routes_get(cfg, "Alpha")
+    assert back["state"] == "succeeded"
+    assert back["routes"]["structure"]["MainWindow"]["title"] == "LINE 4 — OVERVIEW"
+    assert back["routes"]["routes"]["overview"]["steps"][0]["expect_text"] == "LINE 4 — OVERVIEW"

@@ -135,11 +135,14 @@ def test_diff_degraded_text_only_mode(tmp_path: Path, monkeypatch) -> None:
     assert out["degraded"] == "no_pillow"
     assert out["screens"]["home"]["status"] == "same"
     assert out["screens"]["home"]["pixel_pct"] is None
-    assert "text_added" not in out["screens"]["home"]
+    assert out["screens"]["home"]["text_added"] == []
+    assert out["screens"]["home"]["text_changed"] is False
     assert out["screens"]["setup"]["status"] == "changed"
     assert out["screens"]["setup"]["text_added"] == ["New Line"]
     assert out["screens"]["setup"]["text_removed"] == []
-    assert out["summary"] == {"same": 1, "changed": 1, "size_mismatch": 0, "errors": 0}
+    assert out["screens"]["setup"]["text_changed"] is True
+    assert out["summary"] == {"same": 1, "changed": 1, "size_mismatch": 0,
+                              "errors": 0, "text_changed": 1}
 
 
 def test_diff_screen_with_sweep_error_reports_error_status(tmp_path: Path, monkeypatch) -> None:
@@ -203,7 +206,9 @@ def test_diff_pixel_same_below_threshold(tmp_path: Path) -> None:
     assert "degraded" not in out
     assert out["screens"]["home"]["status"] == "same"
     assert out["screens"]["home"]["pixel_pct"] == 0.0
-    assert out["summary"] == {"same": 1, "changed": 0, "size_mismatch": 0, "errors": 0}
+    assert out["screens"]["home"]["text_changed"] is False
+    assert out["summary"] == {"same": 1, "changed": 0, "size_mismatch": 0,
+                              "errors": 0, "text_changed": 0}
 
 
 @pytest.mark.skipif(not HAS_PIL, reason="Pillow not installed in this venv")
@@ -282,3 +287,30 @@ def test_diff_pixel_missing_file_degrades_to_error(tmp_path: Path) -> None:
     out = core.cdp_diff_runtime(str(dir_a), str(dir_b))
     assert out["screens"]["home"]["status"] == "error"
     assert out["summary"]["errors"] == 1
+
+
+@pytest.mark.skipif(not HAS_PIL, reason="Pillow not installed in this venv")
+def test_diff_small_text_edit_below_pixel_threshold_still_reports_text_delta(
+    tmp_path: Path,
+) -> None:
+    """The 2026-07-23 field case: a single-label edit moved ~0.6% of pixels
+    (under the 2% default), status stayed 'same', and the text delta was
+    silently swallowed. Text deltas are now computed regardless of pixel
+    status, with text_changed as their own channel."""
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    _make_image(dir_a / "pump.jpg", color=(128, 128, 128))
+    _make_image(dir_b / "pump.jpg", color=(129, 128, 128))  # tiny pixel delta
+    _write_manifest(dir_a, {"pump": {"file": "pump.jpg", "size_bytes": 1,
+                                     "text": ["PUMP CONTROL", "START"]}}, ocr=True)
+    _write_manifest(dir_b, {"pump": {"file": "pump.jpg", "size_bytes": 1,
+                                     "text": ["PUMP CONTROL v2", "START"]}}, ocr=True)
+    out = core.cdp_diff_runtime(str(dir_a), str(dir_b))
+    scr = out["screens"]["pump"]
+    assert scr["status"] == "same" and scr["pixel_pct"] < 2.0
+    assert scr["text_changed"] is True
+    assert scr["text_added"] == ["PUMP CONTROL v2"]
+    assert scr["text_removed"] == ["PUMP CONTROL"]
+    assert out["summary"]["text_changed"] == 1
