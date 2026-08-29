@@ -30,6 +30,23 @@ def _no_host_runtime(monkeypatch) -> None:
                         lambda cfg, runner=None: False)
 
 
+@pytest.fixture(autouse=True)
+def _emulator_target_by_default(monkeypatch, tmp_path) -> None:
+    """The F5 guard (v1.0.7) reads the REAL machine's Studio
+    Configuration.xml (via OPTIX_STUDIO_CONFIG_XML / the %LOCALAPPDATA%
+    default) unless overridden — so on a dev box that actually has
+    FactoryTalk Optix Studio installed with a non-emulator target
+    selected, these pre-guard tests would spuriously trip the guard and
+    never reach the F5 keystroke they're asserting on. Point the guard at
+    a path that doesn't exist by default: studio_active_deployment_target()
+    then returns known=False and the guard fails open, matching the
+    pre-1.0.7 behavior these tests were written against. Tests that
+    exercise the guard itself call _config(tmp_path, monkeypatch, ...)
+    (below) with a real target, which overrides this default.
+    """
+    monkeypatch.setenv("OPTIX_STUDIO_CONFIG_XML", str(tmp_path / "no-studio-config.xml"))
+
+
 def _proj(projects_root: Path) -> None:
     make_project(projects_root, "Alpha")
 

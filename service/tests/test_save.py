@@ -222,11 +222,16 @@ def test_save_uses_gentle_ps_by_default(cfg: core.Config, projects_root: Path, m
     assert "IsIconic($h)" in ps
 
 
-def test_run_emulator_f5_is_gentle_by_default(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+def test_run_emulator_f5_is_gentle_by_default(cfg: core.Config, projects_root: Path, monkeypatch, tmp_path) -> None:
     """The F5 path must not resize Studio either (pre-1.3 it hardcoded gentle=False)."""
     monkeypatch.delenv("FTX_SAVE_GENTLE_FOCUS", raising=False)
     monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: False)
     monkeypatch.setattr(core, "_bridge_cfg_for", lambda cfg, project: None)
+    # F5 guard (v1.0.7) reads the real machine's Studio Configuration.xml
+    # unless overridden — this test predates the guard and isn't testing
+    # it, so point it at a path that doesn't exist (known=False -> fails
+    # open), same fix as test_run_emulator.py's _emulator_target_by_default.
+    monkeypatch.setenv("OPTIX_STUDIO_CONFIG_XML", str(tmp_path / "no-studio-config.xml"))
     make_project(projects_root, "Alpha")
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
     core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
