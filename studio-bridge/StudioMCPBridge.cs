@@ -1421,6 +1421,8 @@ public class StudioMCPBridge : BaseNetLogic
         switch (name)
         {
             case "Boolean": return OpcUa.DataTypes.Boolean;
+            case "Byte": return OpcUa.DataTypes.Byte;
+            case "SByte": return OpcUa.DataTypes.SByte;
             case "Int16": return OpcUa.DataTypes.Int16;
             case "Int32": return OpcUa.DataTypes.Int32;
             case "Int64": return OpcUa.DataTypes.Int64;
@@ -1432,7 +1434,25 @@ public class StudioMCPBridge : BaseNetLogic
             case "String": return OpcUa.DataTypes.String;
             case "NodeId": return OpcUa.DataTypes.NodeId;   // was silently Boolean
             case "DateTime": return OpcUa.DataTypes.DateTime;
-            default: return OpcUa.DataTypes.Boolean;
+            case "LocalizedText": return OpcUa.DataTypes.LocalizedText;
+            case "Range": return OpcUa.DataTypes.Range;
+            case "Color": return FTOptix.Core.DataTypes.Color;
+            case "ResourceUri": return FTOptix.Core.DataTypes.ResourceUri;
+            default:
+                // Unrecognized datatype names USED TO silently fall through to
+                // Boolean here - a caller asking for "Color" (or any typo or
+                // unsupported name) got a Boolean variable back with no error
+                // and no warning that the requested type was not honored
+                // (found via live probing 2026-08-31: a create_variable batch
+                // validate for datatype="Color", and even a nonsense string,
+                // both reported clean with zero errors). Fail loud instead -
+                // list exactly what IS supported so the caller can fix the
+                // request, rather than silently handing back the wrong type.
+                throw new ArgumentException(
+                    "unsupported datatype '" + name + "' - expected one of: " +
+                    "Boolean, Byte, SByte, Int16, Int32, Int64, UInt16, UInt32, " +
+                    "UInt64, Float, Double, String, DateTime, NodeId, " +
+                    "LocalizedText, Range, Color, ResourceUri");
         }
     }
 
