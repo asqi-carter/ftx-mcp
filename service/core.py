@@ -2319,6 +2319,20 @@ _BRIDGE_EDIT_POSITIONAL = {
 # _normalize_edit_op accepts them as aliases or the batch surface adds them.
 _OP_COMMON_FIELDS: frozenset[str] = frozenset({"op", "node_path", "prop_name"})
 
+# Verbs whose blast radius is the whole node at `path` (no partial/scoped form
+# exists for any of them — there is no "delete just this property" op). An
+# unknown field on one of these is not "an extra the applier ignores"; it is
+# very likely a caller trying to SCOPE the op down (e.g. delete's old `name`
+# guess for "just this property") and getting the full-node op instead.
+# REGRESSION-CITE (2026-09-02): {"op": "delete", "path": "<NavigationPanel>",
+# "name": "AttachedPanelLoader"} was meant to clear one property. `name` isn't
+# a delete field, so under strict=false (the default) it was a WARNING only —
+# report stayed ok:true — and delete ran against the whole node at `path`,
+# taking the entire NavigationPanel with it. Recovered by the caller's own
+# Ctrl+Z in Studio; the bridge had no undo. These verbs must hard-fail on an
+# unknown field even when the caller didn't ask for strict.
+_DESTRUCTIVE_OP_VERBS: frozenset[str] = frozenset({"delete", "move", "reorder"})
+
 
 def unknown_op_fields(op: dict) -> list[str]:
     """Field names on `op` that its verb does not define.
@@ -2503,16 +2517,45 @@ def bridge_edit(
     # names, so a typo used to sail through as `applied: 1 succeeded`. Under
     # strict this is an error (refuse the batch); otherwise a warning, so
     # existing callers that pass harmless extras are not broken outright.
-    field_errs = [
-        {"op_index": i, "code": "unknown_op_field",
-         "message": (f"op {op.get('op')!r} has no field(s) "
-                     f"{', '.join(repr(f) for f in unknown)} — they would be "
-                     f"silently ignored and the op applied anyway"),
-         "unknown_fields": unknown}
-        for i, op in enumerate(ops)
-        if (unknown := unknown_op_fields(op))
-    ]
-    report = bridge_validate_ops(cfg, project, ops, strict=strict)
+    #
+    # EXCEPTION: destructive ops (_DESTRUCTIVE_OP_VERBS — delete/move/reorder)
+    # hard-fail on an unknown field UNCONDITIONALLY, strict or not. There is no
+    # scoped/partial form of these ops, so an unrecognized field is likely a
+    # caller trying to narrow the blast radius (e.g. delete's `name`) and
+    # instead silently getting the whole node at `path`. Warn-and-proceed is
+    # not an acceptable default for an op with no undo. See
+    # _DESTRUCTIVE_OP_VERBS's docstring for the incident that motivated this.
+    field_errs: list[dict] = []
+    destructive_field_errs: list[dict] = []
+    for i, op in enumerate(ops):
+        unknown = unknown_op_fields(op)
+        if not unknown:
+            continue
+        verb = op.get("op")
+        if verb in _DESTRUCTIVE_OP_VERBS:
+            destructive_field_errs.append({
+                "op_index": i, "code": "unknown_op_field",
+                "message": (f"op {verb!r} (destructive, no scoped form) has no "
+                            f"field(s) {', '.join(repr(f) for f in unknown)} — "
+                            "refusing rather than silently widening this to a "
+                            "whole-node op at `path`"),
+                "unknown_fields": unknown,
+            })
+        else:
+            field_errs.append({
+                "op_index": i, "code": "unknown_op_field",
+                "message": (f"op {verb!r} has no field(s) "
+                            f"{', '.join(repr(f) for f in unknown)} — they would be "
+                            f"silently ignored and the op applied anyway"),
+                "unknown_fields": unknown,
+            })
+    # Shallow-copy: this dict may be a caller/test fixture or otherwise shared;
+    # mutating it in place (below) would corrupt state the caller still holds
+    # a reference to. Cheap and correct regardless of where it came from.
+    report = dict(bridge_validate_ops(cfg, project, ops, strict=strict))
+    if destructive_field_errs:
+        report["errors"] = list(report.get("errors") or []) + destructive_field_errs
+        report["ok"] = False
     if field_errs:
         if strict:
             report["errors"] = list(report.get("errors") or []) + field_errs

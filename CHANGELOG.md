@@ -4,6 +4,24 @@ All notable changes to ftx-mcp. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Per-release detail lives in
 `docs/release-notes-v<version>.md`.
 
+## [Unreleased]
+
+### Fixed
+- **Destructive ops (`delete`/`move`/`reorder`) now hard-fail on an unknown
+  field, regardless of `strict`.** These verbs have no scoped/partial form —
+  there is no "delete just this property" op — so an unrecognized field
+  (e.g. a `name` meant to scope a `delete` down to one property) is very
+  likely a caller trying to narrow the blast radius, not a harmless extra.
+  Previously `unknown_op_field` was only a warning under the (default)
+  non-strict mode, and the op still applied against the whole node at
+  `path`. Live incident: a `delete` op on a `NavigationPanel` carrying
+  `name: "AttachedPanelLoader"` deleted the entire node instead of clearing
+  the one property, recovered only via the caller's own Ctrl+Z in Studio —
+  the bridge has no undo. `bridge_edit` also no longer mutates the report
+  dict returned by `bridge_validate_ops` in place (it was a shared/caller
+  object in some paths — surfaced as cross-test pollution while adding
+  regression coverage for this fix).
+
 ## [1.0.7]
 
 The largest release since 1.0.0, consolidating three development streams.

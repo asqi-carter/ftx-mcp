@@ -935,6 +935,81 @@ def test_bridge_edit_reports_partial_application_honestly(alpha, monkeypatch):
     assert "not atomic" in out["nudge"]
 
 
+# --- I9 follow-up (2026-09-02): destructive ops must hard-fail on an
+# unknown field even when strict is left at its default (False). Reproduces
+# the CELL4 incident: a delete op carrying `name`, meant to scope the delete
+# to one property, instead silently ran against the whole node at `path`.
+
+def test_destructive_op_unknown_field_hard_fails_even_when_not_strict(
+    alpha, monkeypatch,
+):
+    """delete has no scoped/property-level form. Passing `name` (the natural
+    but wrong guess for "just this property") must refuse the batch — not
+    warn and delete the whole node at `path`, which is what actually happened
+    on CELL4's TAB_LIST_SETTING before this fix."""
+    applied: list = []
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_apply_one_edit",
+                        lambda cfg, project, op: applied.append(op["op"]))
+
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "delete", "path": "UI/Screens/3-SETTINGS/TAB_LIST_SETTING",
+         "name": "AttachedPanelLoader"}])
+
+    assert out["state"] == "validated"
+    assert out["applied"] == 0 and applied == [], (
+        "the whole node must NOT be deleted just because `name` was unknown"
+    )
+    assert out["report"]["ok"] is False
+    err = out["report"]["errors"][0]
+    assert err["code"] == "unknown_op_field"
+    assert err["unknown_fields"] == ["name"]
+
+
+def test_destructive_op_hard_fail_applies_to_move_and_reorder_too(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_apply_one_edit",
+                        lambda cfg, project, op: (_ for _ in ()).throw(
+                            AssertionError("must not apply")))
+
+    for op in (
+        {"op": "move", "path": "UI/Screens/Foo", "new_parent": "UI/Screens",
+         "bogus": 1},
+        {"op": "reorder", "path": "UI/Screens/Foo", "position": 0, "bogus": 1},
+    ):
+        out = core.bridge_edit(alpha, "Alpha", [op])
+        assert out["state"] == "validated"
+        assert out["report"]["ok"] is False
+        assert out["report"]["errors"][0]["unknown_fields"] == ["bogus"]
+
+
+def test_non_destructive_op_unknown_field_still_only_warns_by_default(
+    alpha, monkeypatch,
+):
+    """Regression guard: the destructive hard-fail must not spill over onto
+    non-destructive verbs — existing lenient-by-default behavior for those
+    (e.g. create_folder/set_property) is unchanged."""
+    applied: list = []
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_apply_one_edit",
+                        lambda cfg, project, op: applied.append(op["op"]))
+
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "create_folder", "parent": "Model", "name": "X",
+         "bogus_field_that_does_not_exist": "xyz"}])
+
+    assert out["state"] == "succeeded"
+    assert out["applied"] == 1
+    assert out["report"]["ok"] is True
+    assert out["report"]["warnings"][0]["code"] == "unknown_op_field"
+
+
 # --- rename sugar op (lowered to move: same parent + new_name) ---
 
 def test_rename_op_lowers_to_move_before_validation(alpha, monkeypatch):
