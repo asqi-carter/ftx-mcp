@@ -48,7 +48,7 @@ def test_observe_screenshot_forwards_to_core(cfg, monkeypatch, tmp_path):
     seen = {}
 
     def fake(cfg_, save_path=None, quality=65, navigate_url=None,
-             settle_seconds=None, fresh=False, region=None):
+             settle_seconds=None, fresh=False, region=None, project=None):
         seen.update(save_path=save_path, quality=quality,
                     navigate_url=navigate_url, settle_seconds=settle_seconds,
                     fresh=fresh, region=region)
@@ -207,7 +207,7 @@ def test_interact_fill_forwards_to_core(cfg, monkeypatch):
     seen = {}
 
     def fake(cfg_, x=None, y=None, text=None, submit="Enter", select_all=True,
-             navigate_url=None, settle_seconds=None):
+             navigate_url=None, settle_seconds=None, project=None):
         seen.update(x=x, y=y, text=text, submit=submit, select_all=select_all,
                     navigate_url=navigate_url, settle_seconds=settle_seconds)
         return {"state": "succeeded"}
@@ -258,7 +258,8 @@ def test_interact_key_forwards_to_core(cfg, monkeypatch):
 def test_interact_navigate_forwards_to_core(cfg, monkeypatch):
     seen = {}
 
-    def fake(cfg_, route=None, routes_path=None, expect=True, navigate_url=None):
+    def fake(cfg_, route=None, routes_path=None, expect=True, navigate_url=None,
+             project=None):
         seen.update(route=route, routes_path=routes_path, expect=expect,
                     navigate_url=navigate_url)
         return {"state": "succeeded", "route": route}

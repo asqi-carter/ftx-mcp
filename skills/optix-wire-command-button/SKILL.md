@@ -49,8 +49,17 @@ To run a NetLogic `[ExportMethod]` on click, pass `method_path` instead of
 
 ## Notes
 
-- **One event, multiple actions is NOT yet supported** — a second `wire_event`
-  on the same node+event appends another command handler; chaining several
+- **Re-wiring an existing handler** — if the event node already has a handler
+  for the event type, `wire_event` updates it **in place** (args and
+  ObjectPointer are replaced and read back). `via` in the result reports the
+  outcome as a suffix on the route token: `+existing` (updated in place),
+  `+replaced` (delete-then-create), or none (created) — e.g.
+  `"eventhandler+args+lateobj+existing"`. `changed: false`
+  means the existing handler already matched exactly and no write was issued.
+  When the bridge cannot safely identify the existing handler it returns
+  `handler_exists` with the conflicting handler's details; pass `replace=true`
+  to force delete-then-create instead.
+- **One event, multiple actions is NOT yet supported** — chaining several
   actions in sequence (e.g. ChangeUser→Close) needs the future multi-command
   tool. For a single Set/Toggle this is complete.
 - **Describe first** if unsure of the event name: `optix_describe_type("Button")`

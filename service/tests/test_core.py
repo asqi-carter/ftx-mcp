@@ -615,3 +615,277 @@ def test_module_entrypoint_forwards_argv() -> None:
             "__main__.py calls main() with no arguments -- command-line flags "
             "will be silently ignored under `python -m service`"
         )
+
+
+# ---------------------------------------------------------------------------
+# read_netlogic tests
+# ---------------------------------------------------------------------------
+
+def _make_netlogic(projects_root: Path, project: str, cls: str, content: bytes) -> Path:
+    """Create a NetSolution .cs file in a minimal Optix project tree."""
+    p = make_project(projects_root, project)
+    net_dir = p / "ProjectFiles" / "NetSolution"
+    net_dir.mkdir(parents=True, exist_ok=True)
+    cs_file = net_dir / f"{cls}.cs"
+    cs_file.write_bytes(content)
+    return p
+
+
+class TestReadNetlogicValidation:
+    """Class-name validation fires BEFORE any filesystem access."""
+
+    def test_empty_cls_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "")
+
+    def test_cs_extension_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "MyLogic.cs")
+
+    def test_wildcard_star_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "My*Logic")
+
+    def test_wildcard_question_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "My?Logic")
+
+    def test_leading_digit_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "1BadName")
+
+    def test_non_identifier_chars_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "My-Logic")
+
+    def test_space_in_name_raises_invalid(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.InvalidNetLogicClass):
+            core.read_netlogic(cfg, "Alpha", "My Logic")
+
+    def test_forward_slash_raises_traversal(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.PathTraversal):
+            core.read_netlogic(cfg, "Alpha", "sub/MyLogic")
+
+    def test_backslash_raises_traversal(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.PathTraversal):
+            core.read_netlogic(cfg, "Alpha", "sub\\MyLogic")
+
+    def test_dotdot_raises_traversal(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.PathTraversal):
+            core.read_netlogic(cfg, "Alpha", "..MyLogic")
+
+    def test_drive_letter_raises_traversal(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.PathTraversal):
+            core.read_netlogic(cfg, "Alpha", "C:MyLogic")
+
+    def test_valid_identifier_with_underscore(self, cfg: core.Config, projects_root: Path) -> None:
+        """Underscores are valid in C# identifiers."""
+        _make_netlogic(projects_root, "Alpha", "_MyLogic", b"// cs\n")
+        out = core.read_netlogic(cfg, "Alpha", "_MyLogic")
+        assert out["path"].endswith("_MyLogic.cs")
+
+    def test_valid_identifier_with_digits_inside(self, cfg: core.Config, projects_root: Path) -> None:
+        """Digits inside the identifier are fine."""
+        _make_netlogic(projects_root, "Alpha", "Logic2", b"// cs\n")
+        out = core.read_netlogic(cfg, "Alpha", "Logic2")
+        assert out["path"].endswith("Logic2.cs")
+
+
+class TestReadNetlogicHappyPath:
+    """Successful reads: result shape, sha256, total_lines, etc."""
+
+    def test_returns_expected_keys(self, cfg: core.Config, projects_root: Path) -> None:
+        content = b"using System;\nnamespace X { }\n"
+        _make_netlogic(projects_root, "Alpha", "MyLogic", content)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic")
+        assert out["path"] == "ProjectFiles/NetSolution/MyLogic.cs"
+        assert out["size"] == len(content)
+        assert out["source"] == "disk"
+        assert "studio_open" in out
+        assert isinstance(out["studio_open"], bool)
+        assert out["total_lines"] == 2
+        assert "sha256" in out
+        assert "content" in out
+
+    def test_content_is_untrusted_wrapped(self, cfg: core.Config, projects_root: Path) -> None:
+        _make_netlogic(projects_root, "Alpha", "MyLogic", b"hello\n")
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic")
+        assert out["content"] == core._untrusted("hello\n", "read_netlogic")
+
+    def test_sha256_matches_whole_file(self, cfg: core.Config, projects_root: Path) -> None:
+        import hashlib
+        content = b"int x = 1;\n"
+        _make_netlogic(projects_root, "Alpha", "MyLogic", content)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic")
+        assert out["sha256"] == hashlib.sha256(content).hexdigest()
+
+    def test_no_truncated_key_for_small_file(self, cfg: core.Config, projects_root: Path) -> None:
+        _make_netlogic(projects_root, "Alpha", "MyLogic", b"small\n")
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic")
+        assert "truncated" not in out
+
+
+class TestReadNetlogicFileNotFound:
+    """FileNotFound includes the project-relative path and sibling .cs files."""
+
+    def test_missing_class_raises_file_not_found(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.FileNotFound):
+            core.read_netlogic(cfg, "Alpha", "DoesNotExist")
+
+    def test_missing_class_message_includes_rel_path(self, cfg: core.Config, projects_root: Path) -> None:
+        make_project(projects_root, "Alpha")
+        with pytest.raises(core.FileNotFound) as exc_info:
+            core.read_netlogic(cfg, "Alpha", "DoesNotExist")
+        assert "ProjectFiles/NetSolution/DoesNotExist.cs" in str(exc_info.value)
+
+    def test_missing_class_lists_siblings(self, cfg: core.Config, projects_root: Path) -> None:
+        p = make_project(projects_root, "Alpha")
+        net_dir = p / "ProjectFiles" / "NetSolution"
+        net_dir.mkdir(parents=True, exist_ok=True)
+        (net_dir / "SiblingLogic.cs").write_bytes(b"// sibling\n")
+        with pytest.raises(core.FileNotFound) as exc_info:
+            core.read_netlogic(cfg, "Alpha", "DoesNotExist")
+        assert "SiblingLogic.cs" in str(exc_info.value)
+
+
+class TestReadNetlogicBinaryFile:
+    """BinaryFile raised for non-UTF-8 content."""
+
+    def test_binary_content_raises(self, cfg: core.Config, projects_root: Path) -> None:
+        _make_netlogic(projects_root, "Alpha", "MyLogic", b"\xff\xfe\x00\x01")
+        with pytest.raises(core.BinaryFile):
+            core.read_netlogic(cfg, "Alpha", "MyLogic")
+
+
+class TestReadNetlogicLineRange:
+    """start_line / end_line slicing and BadLineRange errors."""
+
+    def _setup(self, projects_root: Path) -> None:
+        content = b"L1\nL2\nL3\nL4\nL5\n"
+        _make_netlogic(projects_root, "Alpha", "MyLogic", content)
+
+    def test_line_range_returns_slice(self, cfg: core.Config, projects_root: Path) -> None:
+        self._setup(projects_root)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=2, end_line=3)
+        assert out["content"] == core._untrusted("L2\nL3\n", "read_netlogic")
+        assert out["start_line"] == 2
+        assert out["end_line"] == 3
+
+    def test_end_line_clamped_to_eof(self, cfg: core.Config, projects_root: Path) -> None:
+        self._setup(projects_root)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=4, end_line=999)
+        assert out["end_line"] == 5  # clamped to total_lines
+        assert out["content"] == core._untrusted("L4\nL5\n", "read_netlogic")
+
+    def test_start_line_zero_raises_bad_range(self, cfg: core.Config, projects_root: Path) -> None:
+        self._setup(projects_root)
+        with pytest.raises(core.BadLineRange):
+            core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=0)
+
+    def test_end_before_start_raises_bad_range(self, cfg: core.Config, projects_root: Path) -> None:
+        self._setup(projects_root)
+        with pytest.raises(core.BadLineRange):
+            core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=3, end_line=2)
+
+    def test_start_past_eof_raises_bad_range(self, cfg: core.Config, projects_root: Path) -> None:
+        self._setup(projects_root)
+        with pytest.raises(core.BadLineRange):
+            core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=100)
+
+    def test_size_and_sha256_describe_whole_file_on_slice(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        import hashlib
+        content = b"L1\nL2\nL3\nL4\nL5\n"
+        self._setup(projects_root)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic", start_line=2, end_line=3)
+        assert out["size"] == len(content)
+        assert out["sha256"] == hashlib.sha256(content).hexdigest()
+        assert out["total_lines"] == 5
+
+
+class TestReadNetlogicTruncation:
+    """Files over _NETLOGIC_MAX_BYTES are truncated with a nudge."""
+
+    def test_large_file_truncated_flag(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        big = b"x" * (core._NETLOGIC_MAX_BYTES + 1)
+        _make_netlogic(projects_root, "Alpha", "BigLogic", big)
+        out = core.read_netlogic(cfg, "Alpha", "BigLogic")
+        assert out["truncated"] is True
+        assert "truncation_hint" in out
+        assert "start_line" in out["truncation_hint"] or "end_line" in out["truncation_hint"]
+
+    def test_large_file_size_is_whole_file(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        big = b"y" * (core._NETLOGIC_MAX_BYTES + 100)
+        _make_netlogic(projects_root, "Alpha", "BigLogic", big)
+        out = core.read_netlogic(cfg, "Alpha", "BigLogic")
+        assert out["size"] == len(big)
+
+    def test_small_file_not_truncated(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        small = b"z" * (core._NETLOGIC_MAX_BYTES - 1)
+        _make_netlogic(projects_root, "Alpha", "SmallLogic", small)
+        out = core.read_netlogic(cfg, "Alpha", "SmallLogic")
+        assert "truncated" not in out
+
+
+class TestRequireCodeEditorsClosed:
+    """require_code_editors_closed raises EditorProjectOpen for VS/VS Code,
+    but does NOT block on a running Studio."""
+
+    def test_raises_when_editor_has_project_open(
+        self, cfg: core.Config, projects_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from service import studio_guard
+        p = make_project(projects_root, "Alpha")
+        # Simulate VS Code with the project directory in its cmdline.
+        # Name must be lowercase to match EDITOR_PROCS = ("devenv.exe", "code.exe").
+        monkeypatch.setattr(
+            studio_guard, "_scan",
+            lambda: [{"name": "code.exe", "pid": 999, "cmdline": ["code.exe", str(p)]}],
+        )
+        studio_guard.reset_cache()
+        with pytest.raises(core.EditorProjectOpen):
+            core.require_code_editors_closed(cfg, p)
+
+    def test_does_not_raise_when_no_editors(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        # _no_host_processes fixture already patches _scan to return []
+        p = make_project(projects_root, "Alpha")
+        core.require_code_editors_closed(cfg, p)  # must not raise
+
+    def test_read_netlogic_does_not_block_on_studio_running(
+        self, cfg: core.Config, projects_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Studio running alone does NOT block read_netlogic (unlike read_file)."""
+        from service import studio_guard
+        _make_netlogic(projects_root, "Alpha", "MyLogic", b"// ok\n")
+        # Simulate Studio running (but no editors).
+        # Name must be lowercase to match STUDIO_PROCS = ("ftoptixstudio.exe",).
+        monkeypatch.setattr(
+            studio_guard, "_scan",
+            lambda: [{"name": "ftoptixstudio.exe", "pid": 42, "cmdline": []}],
+        )
+        studio_guard.reset_cache()
+        # read_netlogic should succeed (Studio alone doesn't block it)
+        out = core.read_netlogic(cfg, "Alpha", "MyLogic")
+        assert out["studio_open"] is True
+        assert out["source"] == "disk"

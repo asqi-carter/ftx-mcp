@@ -57,7 +57,10 @@ optix_bridge_edit(project, ops=[
    ScrollView's scrollbar appears exactly when content overflows.
 4. Add children to the LAYOUT (not the ScrollView) — they stack in order;
    `reorder` (op verb, field `path` + `position`/`index`) changes stacking
-   position. Only the ScrollView/layout skeleton needs its own dry-run — new
+   position. `index` counts among **graphic children** only (variables and
+   sub-objects are excluded from the count) and is direction-independent —
+   `achieved` in the report tells you where the node landed. Only the
+   ScrollView/layout skeleton needs its own dry-run — new
    children can join the same batch as more `create_widget`+`set_property`
    ops once the skeleton is confirmed.
 

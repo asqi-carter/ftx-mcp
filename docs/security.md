@@ -19,6 +19,25 @@ save, emulator lifecycle, CDP input) appends a JSON line to
 `%LOCALAPPDATA%\ftx-mcp\logs\audit.jsonl`. Plain local JSONL — no
 rotation is performed by the service; handle per site policy.
 
+## State-directory inventory
+
+All runtime state lives under `%LOCALAPPDATA%\ftx-mcp\` (overridable via
+`OPTIX_STATE_DIR`):
+
+| Path | Contents | Retention |
+|---|---|---|
+| `logs\audit.jsonl` | Per-op audit trail (see above) | Not rotated — handle per site policy |
+| `logs\bridge.jsonl` | Bridge transport diagnostics | Size-rotated (`.jsonl` → `.1` → `.2`) |
+| `logs\traffic.jsonl` | Tool name + request/response sizes | Size-rotated |
+| `logs\service.jsonl` | Service lifecycle events | Size-rotated (`.jsonl` → `.1` → `.2` → `.3`) |
+| `bridges\<port>.json` | Per-port bridge registry entries | Removed when the bridge stops or is found dead |
+| `secrets\tokens.json.dpapi` | DPAPI-encrypted bearer-token hash table | Persists until explicitly revoked |
+| `batches\<batch_id>.json` | Per-batch op journal — op bodies, applied count, timings, remaining ops | Pruned automatically after `OPTIX_BATCH_JOURNAL_DAYS` days (default 7) |
+
+`batches\` holds the full op payload for every chunked or in-flight batch —
+treat it with the same care as the audit log on a system where op content is
+sensitive.
+
 ## Untrusted tool-response content
 
 Read tools return text the model did not author: a project file's contents,

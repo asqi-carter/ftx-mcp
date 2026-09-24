@@ -9,9 +9,11 @@ them as tool errors.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -19,17 +21,18 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
-import dataclasses
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import psutil
 
-from . import studio_guard
-from . import studio_uia
+from . import studio_guard, studio_uia
 from .deploy_lock import DeployLock
+
+_log = logging.getLogger(__name__)
 
 # ---- domain errors ----------------------------------------------------
 
@@ -105,10 +108,24 @@ class BridgeUnavailable(CoreError):
     hint = "The design-time bridge is not serving this project. Open the project in Studio and right-click the StudioBridge NetLogic -> StartBridge, or rely on the file-path fallback."
 
 
+class BridgeLoading(CoreError):
+    http_status = 503
+    code = "bridge_loading"
+    hint = ("The design-time bridge is mid-rebuild or still loading its model — "
+            "the response was truncated (IncompleteRead) or the connection was "
+            "dropped (RemoteDisconnected). This is transient: retry in a few seconds.")
+
+
 class BridgeWriteFailed(CoreError):
     http_status = 502
     code = "bridge_write_failed"
     hint = "The bridge reached the live model but the authoring call failed (see message). Common causes: bad node path, unknown UI type, or a value that can't coerce to the property type."
+
+
+class InvalidBatchId(CoreError):
+    http_status = 400
+    code = "invalid_batch_id"
+    hint = "batch_id is the opaque id a prior optix_bridge_edit call returned (letters, digits, '_' or '-')."
 
 
 class DeployConfigError(CoreError):
@@ -193,6 +210,15 @@ class StructuralEditUnsupported(CoreError):
     http_status = 422
     code = "structural_edit_unsupported"
     hint = "This shape isn't covered by the granular tool; fall back to an anchored optix_deploy edit"
+
+
+class InvalidNetLogicClass(CoreError):
+    http_status = 400
+    code = "netlogic_class_invalid"
+    hint = (
+        "cls must be a bare C# class name (letters, digits, underscores; "
+        "no extension, no path separators, no wildcards, no leading digit)"
+    )
 
 
 # ---- runner (subprocess injection point for tests) -------------------
@@ -361,6 +387,15 @@ def _default_studio_exe() -> Path:
 # Anything else read from the environment collapses to "blanket".
 _STUDIO_GUARD_MODES = frozenset({"blanket", "attributed"})
 
+# Single authoritative Python-side defaults for the bridge port window.
+# PortRangeSize in StudioMCPBridge.cs is the single authoritative cap for the
+# number of concurrent bridge instances; _BRIDGE_PORT_BASE/_BRIDGE_PORT_RANGE
+# must stay in sync with C# BasePort/PortRangeSize in StudioMCPBridge.cs.
+# Read by Config.from_env (env vars OPTIX_BRIDGE_PORT_BASE/_RANGE override)
+# and used as fallback defaults for the port-range scan in studio_arm.py.
+_BRIDGE_PORT_BASE: int = 8768
+_BRIDGE_PORT_RANGE: int = 4  # ports 8768..8771; matches PortRangeSize in StudioMCPBridge.cs
+
 # Default CDP emulated-device viewport (Config.cdp_viewport_width/height).
 # chrome-cdp launches with --window-size=800,600 (bootstrap/install-chrome-cdp.ps1)
 # and the Optix WebPresentationEngine renders to FILL whatever size it's given —
@@ -463,8 +498,8 @@ class Config:
     # unused at rest; every bridge call resolves a project-specific URL from the
     # scanned range (see _bridge_cfg_for / list_bridges).
     bridge_url_pinned: bool = False
-    bridge_port_base: int = 8768
-    bridge_port_range: int = 4  # ports 8768..8771 by default
+    bridge_port_base: int = _BRIDGE_PORT_BASE
+    bridge_port_range: int = _BRIDGE_PORT_RANGE  # ports 8768..8771 by default
     # Studio-open corruption-guard mode. "blanket" (default) = the original
     # 2026-03 behavior: any running FTOptixStudio.exe blocks every project's
     # reads/writes with no per-project attribution (see docs/studio-open-detection.md
@@ -592,8 +627,8 @@ class Config:
             # unset = the new default, multi-instance range-scan mode.
             bridge_url=os.environ.get("OPTIX_BRIDGE_URL", "http://127.0.0.1:8768"),
             bridge_url_pinned="OPTIX_BRIDGE_URL" in os.environ,
-            bridge_port_base=int(os.environ.get("OPTIX_BRIDGE_PORT_BASE", "8768")),
-            bridge_port_range=int(os.environ.get("OPTIX_BRIDGE_PORT_RANGE", "4")),
+            bridge_port_base=int(os.environ.get("OPTIX_BRIDGE_PORT_BASE", str(_BRIDGE_PORT_BASE))),
+            bridge_port_range=int(os.environ.get("OPTIX_BRIDGE_PORT_RANGE", str(_BRIDGE_PORT_RANGE))),
             bridge_token=os.environ.get("OPTIX_BRIDGE_TOKEN"),
             bridge_enabled=os.environ.get("OPTIX_BRIDGE_ENABLED", "true").strip().lower()
                 in ("1", "true", "yes", "on"),
@@ -667,30 +702,305 @@ def _now_iso(ts: float | None = None) -> str:
 
 # dropped the old outright rejection of "/" and "\\" in
 # `project` (only ".." is still rejected up front). That extra check blocked
-# every legitimately nested project name (e.g. "RCB/CELL 4/RCB_LV2_...")
+# every legitimately nested project name (e.g. "Site/Cell 4/Line_HMI_...")
 # even though the real security boundary — the is_relative_to(root) check
 # below, after .resolve() — already prevents escaping projects_root. Needed
 # so users can reorganize project folders into subdirectories without
 # breaking the MCP.
-def resolve_project(cfg: Config, project: str) -> Path:
-    """Resolve a project name — which may be a subpath, e.g. a project nested
-    several folders under projects_root ("RCB/CELL 4/RCB_LV2_...") — to its
-    directory. ".." is rejected outright (cheap, early); an absolute path
-    (a drive letter, UNC, or leading slash) is rejected by the is_relative_to
-    check below, since joining projects_root with an absolute path just
-    replaces it entirely (pathlib behavior) rather than escaping character by
-    character. That is_relative_to check is the actual security boundary —
-    the ".." check is defense in depth, not the only guard.
+_OPTIX_SUFFIX = ".optix"
+
+
+def _is_bare_project_name(project: str) -> bool:
+    """True when `project` is a bare NAME and cannot itself carry a path.
+
+    The gate on resolve_project's out-of-root fallback. A bare name has no
+    separator (`/`, `\\`), no drive/stream colon, no traversal, and is not a
+    relative-directory token. Everything the fallback then matches against
+    comes from the OS process table, never from this string — so the caller
+    can select among directories Studio already has open, but can never name
+    one.
+    """
+    stripped = (project or "").strip()
+    if not stripped or stripped in (".", ".."):
+        return False
+    return not any(c in stripped for c in ("/", "\\", ":", "\x00")) and ".." not in stripped
+
+
+def _studio_open_candidates(force: bool = False) -> list[dict]:
+    """Project directories a RUNNING FTOptixStudio.exe was launched on.
+
+    Evidence source (a) for resolve_project's out-of-root fallback. Reuses
+    studio_guard.studio_state() — the SAME cached process snapshot the
+    corruption guard already takes (one psutil pass, name-filtered BEFORE any
+    cmdline is read, 2s TTL) — rather than standing up a second scanner: see
+    _emulator_pids on why asking process_iter for "cmdline" across every
+    process on the box costs tens of seconds unelevated. Nothing new is
+    cached here; the only cache is studio_guard's.
+
+    A token is a candidate only when it is an ABSOLUTE path (Studio's CLI is
+    always handed one — see _studio_open — and a relative token would resolve
+    against this service's cwd, which is not evidence of anything) that names
+    either a directory or a .optix file, and the resulting directory holds
+    EXACTLY ONE .optix file. Zero .optix means it is not a project directory;
+    two or more means the directory cannot be attributed to one project, so
+    both are rejected rather than guessed at.
+
+    Returns [{"dir": Path, "optix": Path, "names": {<dir name>, <.optix stem>}
+    (lower-cased)}, ...]. Studio opened from the GUI carries no project on its
+    command line (studio_guard's module docstring records the measurement), so
+    such a process simply contributes no candidate — that is normal, not an
+    error.
+    """
+    import ntpath
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for cmd in studio_guard.studio_cmdlines(studio_guard.studio_state(force=force)):
+        for tok in cmd:
+            if not tok or tok.startswith("-"):
+                continue
+            low = tok.lower()
+            if low.endswith(".exe"):
+                continue
+            # ntpath.isabs also answers True for a POSIX-absolute token, so
+            # this one test covers the Windows box this runs on AND the
+            # POSIX box the suite runs on.
+            if not (ntpath.isabs(tok) or os.path.isabs(tok)):
+                continue
+            try:
+                cand = Path(tok)
+                cand = (cand.parent if low.endswith(_OPTIX_SUFFIX) else cand).resolve()
+                if not cand.is_dir():
+                    continue
+                optix = sorted(cand.glob("*" + _OPTIX_SUFFIX))
+            except (OSError, ValueError):
+                continue
+            if len(optix) != 1:
+                continue
+            key = str(cand).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "dir": cand,
+                "optix": optix[0],
+                # The dir basename is NOT enough: Line4_HMI lives at
+                # ...\Desktop\Line4_HMI\HMI and is served as "Line4_HMI",
+                # the .optix stem. (project_served_names() computes a richer
+                # set for bridge routing, including the root node's Name from
+                # Nodes/<stem>.yaml; this stays at the two names the security
+                # rule is written against, and reads no project file.)
+                "names": {cand.name.strip().lower(), optix[0].stem.strip().lower()},
+            })
+    return out
+
+
+def _registry_open_candidates() -> list[dict]:
+    """Project directories advertised by armed bridge registry entries.
+
+    Evidence source (b) for resolve_project's out-of-root fallback.  Reads
+    the bridge registry directory (``%LOCALAPPDATA%\\ftx-mcp\\bridges\\``) and
+    returns one candidate per entry whose ``project_path`` resolves to an
+    existing directory that holds exactly one ``.optix`` file.
+
+    The matching set for each candidate includes three lower-cased strings:
+    the ``project`` field as the bridge reported it, the resolved directory's
+    basename, and the ``.optix`` stem — mirroring what ``_studio_open_candidates``
+    builds from the Studio command line.
+
+    ``project_path`` may be either the ``.optix`` file itself (from SDK
+    reflection) or the directory that contains it (from ``Environment.
+    CurrentDirectory``); both shapes are handled identically to the command-
+    line token in ``_studio_open_candidates``.
+
+    Returns [{"dir": Path, "optix": Path, "project": str,
+    "names": {<lower-cased>}}, ...].
+    """
+    d = _bridge_registry_dir()
+    if d is None:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for f in sorted(d.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        project_name = data.get("project")
+        project_path = data.get("project_path")
+        if not project_name or not project_path:
+            continue
+        try:
+            pp = Path(str(project_path))
+            low = str(project_path).lower()
+            cand = (pp.parent if low.endswith(_OPTIX_SUFFIX) else pp).resolve()
+            if not cand.is_dir():
+                continue
+            optix = sorted(cand.glob("*" + _OPTIX_SUFFIX))
+        except (OSError, ValueError):
+            continue
+        if len(optix) != 1:
+            continue
+        key = str(cand).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "dir": cand,
+            "optix": optix[0],
+            "project": project_name,
+            "names": {
+                project_name.strip().lower(),
+                cand.name.strip().lower(),
+                optix[0].stem.strip().lower(),
+            },
+        })
+    return out
+
+
+def _studio_pid_for_project(project_dir: Path, force: bool = False) -> int:
+    """PID of the running FTOptixStudio.exe whose command line names
+    `project_dir` (the directory, or its .optix file). 0 when none does.
+
+    Same evidence as _studio_open_candidates (a Studio launched on a project
+    path — by this service's optix_project, or a shell double-click — carries
+    it as an absolute argv token; a GUI-opened Studio carries nothing and is
+    simply not attributable). Used by save() to target Ctrl+S at the right
+    instance when no bridge serves the project.
+    """
+    import ntpath
+
+    try:
+        want = str(Path(project_dir).resolve()).lower()
+    except (OSError, ValueError):
+        return 0
+    state = studio_guard.studio_state(force=force)
+    for p in state.get("studio", {}).get("procs", []) or []:
+        for tok in (p.get("cmdline") or []):
+            if not tok or tok.startswith("-") or tok.lower().endswith(".exe"):
+                continue
+            if not (ntpath.isabs(tok) or os.path.isabs(tok)):
+                continue
+            try:
+                cand = Path(tok)
+                cand = cand.parent if tok.lower().endswith(_OPTIX_SUFFIX) else cand
+                if str(cand.resolve()).lower() == want:
+                    return int(p.get("pid") or 0)
+            except (OSError, ValueError):
+                continue
+    return 0
+
+
+def resolve_project_info(cfg: Config, project: str) -> dict:
+    """resolve_project's answer WITH its provenance:
+    {"dir": Path, "source": "projects_root" | "studio_process" | "registry"}.
+
+    THE SECURITY RULE, in order:
+
+      1. ".." anywhere in `project` -> reject (cheap, early, before any scan).
+      2. Join onto projects_root and canonicalize. If the result is not under
+         projects_root, reject — this is what catches an ABSOLUTE name (a
+         drive letter, UNC, or leading slash), because joining an absolute
+         path onto projects_root replaces it entirely (pathlib behavior)
+         rather than escaping character by character. An absolute name is
+         rejected HERE and is never eligible for steps 4-5.
+      3. If the joined directory exists, that is the answer (source
+         "projects_root"). This is the normal case and costs nothing extra —
+         no process scan runs.
+      4. ONLY when step 3 missed: the project may ALSO resolve to a directory
+         that is demonstrably OPEN IN STUDIO on this box. `project` must be a
+         bare name (see _is_bare_project_name) — a subpath never takes this
+         path — and the directory must come from a running FTOptixStudio.exe
+         command line (see _studio_open_candidates), exist, and hold exactly
+         one .optix file whose stem, or whose directory basename, equals
+         `project` case-insensitively. The caller's string is only ever
+         COMPARED against that evidence; no path is ever taken from it.
+      5. ONLY when step 4 also missed: a bridge registry entry (see
+         _registry_open_candidates) whose ``project`` field matches the target
+         and whose ``project_path`` exists on disk and contains exactly one
+         .optix file qualifies as project evidence. The same bare-name and
+         comparison-only security rules from step 4 apply here.
+
+    Why step 4 exists: Studio can open a project from ANYWHERE (the field case
+    is Line4_HMI at C:\\Users\\<u>\\Desktop\\Line4_HMI\\HMI, outside projects_root
+    and armed). Every bridge-routed tool already worked with it — they find the
+    bridge by the project it reports — while every resolve_project caller
+    answered "project not found". _bridge_want_names already carried the same
+    observation in its fallback comment.
+
+    Why step 5 exists: the bridge registry (1.0.8+) writes
+    ``%LOCALAPPDATA%\\ftx-mcp\\bridges\\<port>.json`` files that include the
+    ``project_path`` field alongside ``project``. This gives a path-yielding
+    evidence source even when no Studio process is visible in the scan (e.g.
+    the process scanner is denied access or the bridge outlives Studio via
+    an armed-but-headless scenario). The caller's string is still only ever
+    COMPARED against that evidence; no path is ever taken from it.
     """
     if ".." in project:
         raise ProjectNotFound(f"invalid project name: {project!r}")
-    project_dir = (cfg.projects_root / project).resolve()
     root = cfg.projects_root.resolve()
-    if not project_dir.is_dir():
-        raise ProjectNotFound(f"project not found: {project}")
+    project_dir = (cfg.projects_root / project).resolve()
     if not project_dir.is_relative_to(root):
+        # Checked BEFORE existence so an absolute name is rejected as what it
+        # is, and — load-bearing — can never reach the Studio fallback below.
         raise ProjectNotFound(f"project not under projects_root: {project}")
-    return project_dir
+    shadow = None
+    if project_dir.is_dir():
+        if not _is_bare_project_name(project) or any(project_dir.glob("*.optix")):
+            return {"dir": project_dir, "source": "projects_root"}
+        # A same-named in-root folder that is NOT a project (no .optix) - the
+        # field shape Desktop\Line4_HMI\HMI with projects_root=Desktop. It used
+        # to win here and every tool silently got the container folder. Let an
+        # open-in-Studio / registry match answer first; keep it as the fallback.
+        shadow = project_dir
+
+    # --- fallback: demonstrably open in Studio --------------------------
+    if not _is_bare_project_name(project):
+        raise ProjectNotFound(
+            f"project not found: {project} (resolved_from: "
+            f"projects_root={cfg.projects_root}; open-in-Studio fallback not "
+            f"attempted: {project!r} is a subpath, not a bare project name)"
+        )
+    want = project.strip().lower()
+    candidates = _studio_open_candidates()
+    for c in candidates:
+        if want in c["names"]:
+            return {"dir": c["dir"], "source": "studio_process"}
+
+    # --- fallback: bridge registry entry --------------------------------
+    reg_candidates = _registry_open_candidates()
+    for c in reg_candidates:
+        if want in c["names"]:
+            return {"dir": c["dir"], "source": "registry"}
+
+    if shadow is not None:
+        return {"dir": shadow, "source": "projects_root"}
+    if candidates:
+        # Project NAMES only — the point is to explain the miss, not to
+        # enumerate other people's directories back to the caller.
+        seen = ", ".join(sorted({c["optix"].stem for c in candidates}))
+        detail = f"Studio has {seen} open, not {project}"
+    else:
+        detail = ("no running FTOptixStudio.exe names a project directory on its "
+                  "command line (a GUI-opened Studio carries none)")
+    raise ProjectNotFound(
+        f"project not found: {project} (resolved_from: "
+        f"projects_root={cfg.projects_root}; open-in-Studio fallback: {detail})"
+    )
+
+
+def resolve_project(cfg: Config, project: str) -> Path:
+    """Resolve a project name — which may be a subpath, e.g. a project nested
+    several folders under projects_root ("Site/Cell 4/Line_HMI_...") — to its
+    directory.
+
+    Thin wrapper over resolve_project_info(), which documents the full
+    security rule (including the out-of-root "open in Studio" fallback) and
+    reports WHICH of the two sources answered. Use that one when the
+    provenance matters (doctor(), bridge_arm()); use this one everywhere the
+    directory is all the caller needs.
+    """
+    return resolve_project_info(cfg, project)["dir"]
 
 
 def resolve_subpath(cfg: Config, project: str, subpath: str) -> Path:
@@ -736,13 +1046,18 @@ def _parse_msbuild_diagnostics(
         raw = m.group("file").strip()
         path = raw
         if strip_prefix is not None and rebase_to is not None:
+            # MSBuild diagnostics are ALWAYS Windows paths (the compile runs
+            # on the Studio box), so compare them as such regardless of the
+            # host: on POSIX a plain Path() keeps the backslashes as a single
+            # component and no prefix ever matches. PureWindowsPath is also
+            # case-insensitive, which is the right rule for these paths.
             try:
-                p = Path(raw)
-                sp, rt = Path(strip_prefix), Path(rebase_to)
+                p = PureWindowsPath(raw)
+                sp, rt = PureWindowsPath(strip_prefix), PureWindowsPath(rebase_to)
                 if p.is_relative_to(sp):
                     p = rt / p.relative_to(sp)
                 if p.is_relative_to(rt):
-                    path = str(p.relative_to(rt)).replace("\\", "/")
+                    path = p.relative_to(rt).as_posix()
                 else:
                     path = str(p)
             except (ValueError, OSError):
@@ -903,14 +1218,14 @@ _LIST_PROJECTS_MAX_DEPTH = 4  # folders under projects_root a project may be nes
 
 # rewrote from a flat, single-level iterdir() to a recursive
 # walk (capped at _LIST_PROJECTS_MAX_DEPTH, skipping _LIST_PROJECTS_SKIP_DIRS)
-# so projects organized into subfolders (e.g. RCB/CELL 4/<project>) actually
+# so projects organized into subfolders (e.g. Site/Cell 4/<project>) actually
 # show up. Companion fix to the resolve_project relaxation above — both were
 # needed to support arbitrarily nested project directories without an
 # unhandled exception.
 def list_projects(cfg: Config) -> list[dict]:
     """Every project under projects_root, however deep it's nested (up to
     _LIST_PROJECTS_MAX_DEPTH folders). `name` is the project's path relative
-    to projects_root with forward slashes (e.g. "RCB/CELL 4/RCB_LV2_..."),
+    to projects_root with forward slashes (e.g. "Site/Cell 4/Line_HMI_..."),
     which resolve_project accepts directly — a top-level project's name is
     unchanged from before (just its own folder name), so this is backward
     compatible with every existing caller.
@@ -1048,6 +1363,34 @@ def require_editors_closed(
     return None
 
 
+def require_code_editors_closed(cfg: Config, project_dir: Path) -> None:
+    """Raise EditorProjectOpen if VS or VS Code attributably has *project_dir* open.
+
+    This is the VS/VS Code attributed-editor half of `require_editors_closed`,
+    intentionally WITHOUT the Studio-process check.  The asymmetry is deliberate:
+    `read_netlogic` is a read-only operation and reads a single well-named
+    .cs file from the NetSolution subtree; a running Studio does NOT make that
+    stale the way a write would (Studio's in-memory model for .cs files is the
+    file itself — it does not buffer C# source).  The VS/VS Code check is kept
+    because an editor with the project open may have an unsaved buffer that
+    differs from the disk copy, making what we serve misleading.
+
+    `build_check` uses the same asymmetry as precedent: it copies the NetSolution
+    to a temp dir without blocking on a running Studio, yet still surfaces
+    attribution-detectable editor conflicts.
+
+    Detection errors do NOT block (studio_guard returns an empty list on error),
+    consistent with the policy in `require_editors_closed`.
+    """
+    state = studio_guard.studio_state()
+    hits = studio_guard.attributed_editors(state, project_dir)
+    if hits:
+        ed = hits[0]
+        raise EditorProjectOpen(
+            f"{ed['name']} (pid {ed['pid']}) has {project_dir.name} open"
+        )
+
+
 def read_file(
     cfg: Config,
     project: str,
@@ -1101,10 +1444,170 @@ def read_file(
     return out
 
 
+# C# bare-identifier pattern (no extension, no path parts, no wildcards).
+_CS_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def read_netlogic(
+    cfg: Config,
+    project: str,
+    cls: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> dict:
+    """Read a NetLogic .cs file from ProjectFiles/NetSolution/<cls>.cs.
+
+    Returns a dict with keys: ``path``, ``size``, ``sha256``, ``total_lines``,
+    ``content``, ``source`` (always ``'disk'``), ``studio_open`` (bool).
+    Optional keys: ``start_line``, ``end_line`` (echoed from params when a range
+    was requested), ``truncated`` (True when the file exceeds
+    ``_NETLOGIC_MAX_BYTES`` and no line range was given).
+
+    ``size``, ``sha256``, and ``total_lines`` always describe the WHOLE file,
+    even when only a slice is returned via ``start_line``/``end_line``.
+
+    ``content`` is ``<untrusted>``-delimited (see ``_untrusted``).
+
+    Class-name validation rejects path injection attempts before touching the
+    filesystem (PathTraversal), then rejects malformed-but-safe names
+    (InvalidNetLogicClass).  A second ``resolve_subpath`` call provides
+    belt-and-braces path-traversal protection after the project resolves.
+
+    The guard only checks VS / VS Code attribution (``require_code_editors_closed``),
+    NOT a running Studio — .cs reads are not stale while Studio is open because
+    Studio does not buffer C# source in memory.  See ``require_code_editors_closed``
+    and ``build_check`` for the documented precedent.
+    """
+    # ------------------------------------------------------------------
+    # 1. Class-name validation BEFORE any filesystem access.
+    # ------------------------------------------------------------------
+    # PathTraversal: anything that looks like a path component (security gate).
+    if '/' in cls or '\\' in cls:
+        raise PathTraversal(
+            f"netlogic class name must not contain path separators: {cls!r}"
+        )
+    if '..' in cls:
+        raise PathTraversal(
+            f"netlogic class name must not contain '..': {cls!r}"
+        )
+    # Drive-letter absolute path (e.g. "C:SomeClass")
+    if len(cls) >= 2 and cls[1] == ':':
+        raise PathTraversal(
+            f"netlogic class name must not be an absolute path: {cls!r}"
+        )
+
+    # InvalidNetLogicClass: valid-looking but semantically wrong input.
+    if not cls:
+        raise InvalidNetLogicClass("cls must be non-empty")
+    if cls.endswith('.cs'):
+        raise InvalidNetLogicClass(
+            f"cls must be a bare class name without the .cs extension: {cls!r}"
+        )
+    if '*' in cls or '?' in cls:
+        raise InvalidNetLogicClass(
+            f"cls must not contain wildcards: {cls!r}"
+        )
+    if not _CS_IDENTIFIER_RE.match(cls):
+        # Catches leading digit, spaces, dots, hyphens, unicode non-identifiers, etc.
+        raise InvalidNetLogicClass(
+            f"cls must be a bare C# identifier (letters/digits/underscores, "
+            f"no leading digit): {cls!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. resolve_subpath — belt-and-braces path-traversal gate.
+    # ------------------------------------------------------------------
+    rel = f'ProjectFiles/NetSolution/{cls}.cs'
+    project_dir = resolve_project(cfg, project)
+    full = resolve_subpath(cfg, project, rel)
+
+    # ------------------------------------------------------------------
+    # 3. Editor check (VS / VS Code only — Studio is NOT blocked here).
+    # ------------------------------------------------------------------
+    require_code_editors_closed(cfg, project_dir)
+
+    # ------------------------------------------------------------------
+    # 4. Studio-open status for the result dict (informational).
+    # ------------------------------------------------------------------
+    _gstate = studio_guard.studio_state()
+    studio_open = bool(_gstate.get("studio", {}).get("running"))
+
+    # ------------------------------------------------------------------
+    # 5. File presence — FileNotFound lists up to 20 sibling .cs files.
+    # ------------------------------------------------------------------
+    if not full.is_file():
+        net_dir = full.parent
+        siblings: list[str] = []
+        if net_dir.is_dir():
+            siblings = sorted(
+                p.name for p in net_dir.iterdir()
+                if p.suffix == '.cs' and p.is_file()
+            )[:20]
+        msg = f"NetLogic class not found: {rel}"
+        if siblings:
+            msg += f"; available in NetSolution: {', '.join(siblings)}"
+        raise FileNotFound(msg)
+
+    # ------------------------------------------------------------------
+    # 6. Read and decode.
+    # ------------------------------------------------------------------
+    data = full.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BinaryFile(f"file is not valid UTF-8: {rel}") from exc
+
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+
+    out: dict = {
+        "path": rel,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "total_lines": total,
+        "source": "disk",
+        "studio_open": studio_open,
+    }
+
+    # ------------------------------------------------------------------
+    # 7. Line-range slice or whole-file (with cap).
+    # ------------------------------------------------------------------
+    if start_line is not None or end_line is not None:
+        s = start_line if start_line is not None else 1
+        e = end_line if end_line is not None else total
+        if s < 1 or e < s:
+            raise BadLineRange(f"start_line={s}, end_line={e}")
+        if s > total and total > 0:
+            raise BadLineRange(
+                f"start_line={s} is past EOF (total_lines={total})"
+            )
+        e = min(e, total)
+        out["content"] = _untrusted("".join(lines[s - 1 : e]), "read_netlogic")
+        out["start_line"] = s
+        out["end_line"] = e
+    elif len(data) > _NETLOGIC_MAX_BYTES:
+        # No range requested but file exceeds the byte cap: return the first
+        # _NETLOGIC_MAX_BYTES bytes and flag truncation.  Nudge the caller to
+        # use start_line / end_line for targeted access.
+        truncated_text = data[:_NETLOGIC_MAX_BYTES].decode("utf-8", errors="ignore")
+        out["content"] = _untrusted(truncated_text, "read_netlogic")
+        out["truncated"] = True
+        out["truncation_hint"] = (
+            f"File is {len(data):,} bytes (>{_NETLOGIC_MAX_BYTES:,} byte cap); "
+            f"only the first {_NETLOGIC_MAX_BYTES:,} bytes are shown. "
+            f"Use start_line / end_line to read specific sections."
+        )
+    else:
+        out["content"] = _untrusted(text, "read_netlogic")
+
+    return out
+
+
 # Directory parts that never hold user-meaningful Optix source. bin/obj are
 # the NetSolution build outputs Studio regenerates on every compile.
 _FIND_SKIP_PARTS = frozenset({".git", "bin", "obj", ".venv", "__pycache__", ".vs"})
 _FIND_MAX_FILE_BYTES = 2_000_000
+_NETLOGIC_MAX_BYTES = 1_000_000
 
 
 def find_in_project(
@@ -1258,7 +1761,7 @@ def bridge_event(cfg: Config, **fields) -> None:
                         os.replace(src, d / f"bridge.jsonl.{i}")
         except Exception:
             pass
-        rec = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds"),
+        rec = {"ts": _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds"),
                **fields}
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
@@ -1274,7 +1777,7 @@ def _bridge_log_call(cfg: Config, path: str, method: str, latency_ms: int,
     global _bridge_last_ok_at, _bridge_last_health_ok
     ok = error is None and status is not None and status < 400
     if ok:
-        _bridge_last_ok_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        _bridge_last_ok_at = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
     if path.startswith("/bridge/health"):
         should_log = ok != _bridge_last_health_ok   # transition (or first probe) only
         _bridge_last_health_ok = ok
@@ -1297,7 +1800,12 @@ def _bridge_http(
     empty body purely to select the verb. Every attempt is timed and logged to
     bridge.jsonl (see _bridge_log_call). `retries` re-attempts ONLY the transport-
     failure path (safe for idempotent GETs), backoff 0.3s; writes pass retries=0.
+
+    IncompleteRead / RemoteDisconnected are retried within the same budget and,
+    if exhausted, classified as BridgeLoading (the bridge is mid-rebuild) rather
+    than BridgeUnavailable (which implies it was never up).
     """
+    import http.client
     import urllib.error
     import urllib.request
     url = cfg.bridge_url.rstrip("/") + path
@@ -1317,6 +1825,24 @@ def _bridge_http(
             body = e.read() or b""
             _bridge_log_call(cfg, path, method, int((time.monotonic() - t0) * 1000), e.code, None)
             return e.code, body
+        except (http.client.IncompleteRead, http.client.RemoteDisconnected) as e:
+            # The bridge accepted the connection but the response was truncated or
+            # the connection was dropped — a signature of a bridge that is currently
+            # being rebuilt / reloading its model.  Must be checked BEFORE the
+            # URLError/OSError handler because RemoteDisconnected is also a
+            # ConnectionResetError (OSError subclass) and would otherwise be
+            # swallowed by the more general clause.  Retry within the caller's
+            # budget so a brief mid-rebuild window self-heals; if retries are
+            # exhausted, surface BridgeLoading (retryable 503) rather than a raw
+            # http.client traceback.
+            _bridge_log_call(cfg, path, method, int((time.monotonic() - t0) * 1000), None, str(e))
+            if attempt < retries:
+                attempt += 1
+                time.sleep(0.25 * attempt + random.uniform(0.0, 0.4))
+                continue
+            raise BridgeLoading(
+                f"bridge at {url} returned a partial response (mid-rebuild?): {e}"
+            ) from e
         except (urllib.error.URLError, OSError) as e:
             _bridge_log_call(cfg, path, method, int((time.monotonic() - t0) * 1000), None, str(e))
             if attempt < retries:
@@ -1371,6 +1897,7 @@ def _bridge_post_body(
     rely on. Timeout is longer than a single write: the bridge reflects over
     every op in the batch.
     """
+    import http.client
     import urllib.error
     import urllib.request
     url = cfg.bridge_url.rstrip("/") + path
@@ -1385,6 +1912,11 @@ def _bridge_post_body(
             status = resp.status
     except urllib.error.HTTPError as e:
         status, raw = e.code, (e.read() or b"")
+    except (http.client.IncompleteRead, http.client.RemoteDisconnected) as e:
+        # Must precede OSError: RemoteDisconnected is also a ConnectionResetError.
+        raise BridgeLoading(
+            f"bridge at {url} returned a partial response (mid-rebuild?): {e}"
+        ) from e
     except (urllib.error.URLError, OSError) as e:
         raise BridgeUnavailable(f"bridge unreachable at {url}: {e}") from e
     try:
@@ -1403,6 +1935,10 @@ def _bridge_write_result(op: str, status: int, data: dict) -> dict:
     if status == 200 and data.get("ok") is True:
         return data
     err = data.get("error")
+    # per-op nudge attached to the exception so that
+    # classify_bridge_failure can surface it as a structured, handler-specific
+    # nudge rather than the generic write_failed connection message.
+    exc_nudge: str | None = None
     if isinstance(err, dict):
         msg = err.get("message") or err.get("code") or "unknown bridge error"
         code = err.get("code")
@@ -1410,9 +1946,31 @@ def _bridge_write_result(op: str, status: int, data: dict) -> dict:
         # to the caller — the message alone may not name it.
         if code and code not in msg:
             msg = f"{code}: {msg}"
+        # when the bridge refuses because in-place rewrite is
+        # unsafe, append a nudge naming the existing handler and the replace=True
+        # escape hatch so the caller always knows the recovery path.
+        if code == "handler_exists":
+            existing = err.get("existing") or {}
+            browse = existing.get("browse_name", "")
+            if browse:
+                inline = (f" — call wire_event again with replace=True to delete"
+                          f" '{browse}' and create a fresh handler")
+                exc_nudge = (f"handler_exists: '{browse}' already handles this event"
+                             f" — call wire_event again with replace=True to delete"
+                             f" it and create a fresh handler")
+            else:
+                inline = (" — call wire_event again with replace=True to delete"
+                          " the existing handler and create a fresh one")
+                exc_nudge = ("handler_exists: an event handler already exists for"
+                             " this event type — call wire_event again with"
+                             " replace=True to delete it and create a fresh handler")
+            msg += inline
     else:
         msg = err or f"status={status}"
-    raise BridgeWriteFailed(f"bridge {op} failed: {msg}")
+    exc = BridgeWriteFailed(f"bridge {op} failed: {msg}")
+    if exc_nudge is not None:
+        exc.nudge = exc_nudge  # type: ignore[attr-defined]
+    raise exc
 
 
 def _bridge_write_guard(cfg: Config, project: str) -> Config:
@@ -1449,13 +2007,19 @@ def classify_bridge_failure(cfg: Config, project: str, exc: Exception) -> dict:
 
     # BridgeWriteFailed = the bridge answered and rejected the op. It is UP —
     # do not let the model misfire an "open Studio" nudge.
+    # per-op refusals (e.g. handler_exists) may carry a
+    # specific nudge attribute; use it when present so the caller gets
+    # actionable guidance instead of the generic "check the property" message.
     if isinstance(exc, BridgeWriteFailed):
+        exc_nudge = getattr(exc, "nudge", None)
         return {
             "state": "failed", "reason_code": "write_failed",
-            "nudge": ("The design-time bridge is up and serving this project — this is a "
-                      "per-operation error, not a connection problem, so do NOT restart "
-                      "Studio. Check the property name/value; the bridge's own message is "
-                      "in `detail`."),
+            "nudge": exc_nudge if exc_nudge else (
+                "The design-time bridge is up and serving this project — this is a "
+                "per-operation error, not a connection problem, so do NOT restart "
+                "Studio. Check the property name/value; the bridge's own message is "
+                "in `detail`."
+            ),
             "detail": detail,
             "bridge": {"reachable": True, "serving": project, "model_loaded": True},
         }
@@ -1547,6 +2111,29 @@ def _reject_node_attribute(verb: str, name: str) -> None:
         )
 
 
+def _value_prop_nudge_suffix(node_path: str) -> str:
+    """Build the pre-1.0.8 bridge nudge for unknown_property / 'Value' errors.
+
+    Older bridges (< 1.0.8) cannot set the OPC-UA ``Value`` attribute via the
+    ``name='Value'`` spelling on the variable node itself.  The working
+    alternative is to address the *parent* node and use the variable's browse
+    name as the property name — i.e. ``path=<parent>, name=<VariableName>``.
+    This suffix is appended to the raised ``BridgeWriteFailed`` message (write
+    path) and to the matching report error ``message`` (batch-edit path) so the
+    LLM caller always sees the correction.
+    """
+    if "/" in node_path:
+        parent, var_name = node_path.rsplit("/", 1)
+    else:
+        parent, var_name = "", node_path
+    return (
+        f" — pre-1.0.8 bridge: 'Value' is the OPC-UA variable's own value "
+        f"attribute, not a settable child property; use "
+        f"path={parent!r}, name={var_name!r} to write the variable's value "
+        f"(address the parent node, use the variable name as the property name)"
+    )
+
+
 def bridge_set_property(
     cfg: Config, project: str, node_path: str, name: str, value: str,
     locale: str = "en-US",
@@ -1557,6 +2144,24 @@ def bridge_set_property(
     GetOrCreateVariable so it persists AND renders (the fix for the GetVariable-
     returns-null trap). Requires Studio
     open with this project + the bridge running.
+
+    **Setting a variable's value — two equivalent spellings (neither deprecated):**
+
+    1. *On the variable node itself* — ``name="Value"`` targets the node's own
+       built-in Value attribute::
+
+           bridge_set_property(cfg, project, "Model/MyVar", "Value", "42")
+
+    2. *From the parent node* — ``name=<VariableName>`` reaches the same UA
+       variable through its parent, which is often the more natural address when
+       the caller already holds the parent path::
+
+           bridge_set_property(cfg, project, "Model", "MyVar", "42")
+
+       Both forms write to identical storage; choose whichever path you already
+       have in hand.  A bridge older than 1.0.8 does not support spelling (1) and
+       will return ``unknown_property`` — the exception message will suggest
+       spelling (2) as a fallback in that case.
 
     Array-typed properties (String[] like GridLayout.Columns/Rows, NodeId[] like
     NavigationPanelItem.AliasNodeArray) are NOT writable: the bridge rejects them
@@ -1587,19 +2192,82 @@ def bridge_set_property(
             f"AliasNodeArray) can't be written via set_property; author them in "
             f"Studio directly."
         )
-    return _bridge_write(
-        cfg, project, "set_property", "/bridge/node/property",
-        {"path": node_path, "name": name, "value": value, "locale": locale},
-    )
+    try:
+        return _bridge_write(
+            cfg, project, "set_property", "/bridge/node/property",
+            {"path": node_path, "name": name, "value": value, "locale": locale},
+        )
+    except BridgeWriteFailed as exc:
+        msg = str(exc)
+        if name == "Value" and "has no settable property 'Value'" in msg:
+            raise BridgeWriteFailed(msg + _value_prop_nudge_suffix(node_path)) from exc
+        raise
+
+
+# Child node names that must reside in the FTOptix.UI namespace (not the project
+# namespace) for the engine to honour their properties. A bridge older than 1.0.8
+# creates these in the project namespace, where writes like RowStart/ColumnStart
+# are silently accepted and equally silently ignored at render time.
+_UI_NAMESPACE_CHILDREN: frozenset[str] = frozenset({"GridLayoutProperties"})
+
+_UI_NAMESPACE_NUDGE = (
+    "note: a bridge older than 1.0.8 creates this node in the project namespace "
+    "where RowStart/ColumnStart are silently ignored; bridge ≥ 1.0.8 creates "
+    "it in FTOptix.UI as the engine requires"
+)
+
+
+def _bridge_write_ui_ns_child(
+    cfg: Config, project: str, op: str, endpoint: str, params: dict,
+) -> dict:
+    """Like _bridge_write but with UI-namespace-child post-processing.
+
+    For names in _UI_NAMESPACE_CHILDREN the bridge may return wrong_namespace
+    (the child was created in the wrong namespace and the path is in the response)
+    or ui_namespace_child_unsupported (both creation paths failed). Both are
+    surfaced as BridgeWriteFailed with the created_path in the message so the
+    caller can clean up. On success, ui_namespace_child:True and a nudge are
+    injected into the returned dict.
+    """
+    from urllib.parse import quote, urlencode
+    cfg = _bridge_write_guard(cfg, project)
+    qs = urlencode(params, quote_via=quote)
+    status, data = _bridge_post_json(cfg, f"{endpoint}?{qs}")
+    # Pre-check: surface namespace errors with the created path before the
+    # standard error handler discards the extra fields.
+    if isinstance(data, dict) and isinstance(data.get("error"), str):
+        err_code = data["error"]
+        if err_code in ("wrong_namespace", "ui_namespace_child_unsupported"):
+            created = data.get("created_path", "")
+            exc = BridgeWriteFailed(
+                f"bridge {op} failed: {err_code}"
+                + (f"; created_path={created}" if created else "")
+            )
+            audit(cfg, "bridge_write", project=project, op=op, params=params,
+                  ok=False, error=str(exc))
+            raise exc
+    try:
+        out = _bridge_write_result(op, status, data)
+    except Exception as exc:
+        audit(cfg, "bridge_write", project=project, op=op, params=params,
+              ok=False, error=str(exc))
+        raise
+    audit(cfg, "bridge_write", project=project, op=op, params=params, ok=True)
+    out["ui_namespace_child"] = True
+    out["note"] = _UI_NAMESPACE_NUDGE
+    return out
 
 
 def bridge_create_widget(
     cfg: Config, project: str, screen: str, name: str, widget_type: str = "Label",
 ) -> dict:
     """Create a builtin UI widget on a screen in the live model via the bridge."""
+    params = {"name": name, "screen": screen, "type": widget_type}
+    if name in _UI_NAMESPACE_CHILDREN:
+        return _bridge_write_ui_ns_child(
+            cfg, project, "create_widget", "/bridge/ui/widget", params)
     return _bridge_write(
-        cfg, project, "create_widget", "/bridge/ui/widget",
-        {"name": name, "screen": screen, "type": widget_type},
+        cfg, project, "create_widget", "/bridge/ui/widget", params,
     )
 
 
@@ -1632,6 +2300,9 @@ def bridge_create_object(
     params = {"parent": parent, "name": name}
     if object_type:
         params["type"] = object_type
+    if name in _UI_NAMESPACE_CHILDREN:
+        return _bridge_write_ui_ns_child(
+            cfg, project, "create_object", "/bridge/model/object", params)
     return _bridge_write(
         cfg, project, "create_object", "/bridge/model/object", params)
 
@@ -1756,7 +2427,7 @@ def audit(cfg: Config, event: str, **fields) -> None:
     try:
         d = cfg.state_dir / "logs"
         d.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        rec = {"ts": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
                "event": event, **fields}
         with open(d / "audit.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
@@ -1775,7 +2446,7 @@ def traffic(cfg: Config, tool: str, chars_in: int, chars_out: int,
     try:
         d = cfg.state_dir / "logs"
         d.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        rec = {"ts": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
                "tool": tool, "chars_in": chars_in, "chars_out": chars_out,
                "ms": ms, "ok": ok}
         with open(d / "traffic.jsonl", "a", encoding="utf-8") as f:
@@ -1839,12 +2510,112 @@ def service_event(cfg: Config, event: str, **fields) -> None:
                         os.replace(src, d / f"service.jsonl.{i}")
         except Exception:
             pass
-        rec = {"ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        rec = {"ts": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
                "event": event, **fields}
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
+
+
+def _read_service_lifecycle(cfg: Config, n: int = 5) -> dict:
+    """Read the service-lifecycle log and return a structured digest.
+
+    Reads ``state_dir/logs/service.jsonl`` and its size-rotated predecessors
+    (``.1`` through ``.3``), normalises each entry to the four canonical
+    fields (event, ts, version, pid), enriches ``crash`` entries with
+    ``exc_type`` (type name parsed from the ``error`` field) and
+    ``first_frame`` (the first ``File …`` line in the traceback), then
+    derives a synthetic ``external_kill`` row for every ``start`` that has no
+    following ``stop`` or ``crash`` anywhere in the full log.
+
+    Returns ``{"entries": [...], "n": n}`` where ``entries`` is the *last*
+    ``n`` records (including any derived rows appended at the end).  When the
+    log directory has never been written a ``"note": "no_log"`` key is
+    included and ``entries`` is empty.
+    """
+    d = cfg.state_dir / "logs"
+    # Assemble file list oldest → newest so entries end up chronological.
+    paths: list[Path] = []
+    for i in range(_SERVICE_LOG_BACKUPS, 0, -1):
+        p = d / f"service.jsonl.{i}"
+        if p.exists():
+            paths.append(p)
+    primary = d / "service.jsonl"
+    if primary.exists():
+        paths.append(primary)
+
+    if not paths:
+        return {"entries": [], "n": n, "note": "no_log"}
+
+    # --- parse all JSONL lines in chronological order ---
+    all_recs: list[dict] = []
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                all_recs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    # --- normalise each record to the canonical field set ---
+    def _norm(rec: dict) -> dict:
+        evt = rec.get("event", "")
+        row: dict = {
+            "event": evt,
+            "ts": rec.get("ts"),
+            "version": rec.get("version"),
+            "pid": rec.get("pid"),
+        }
+        if evt == "crash":
+            error = rec.get("error") or ""
+            row["exc_type"] = (
+                error.split(": ", 1)[0] if ": " in error else (error or None)
+            )
+            tb = rec.get("traceback") or ""
+            first_frame: str | None = None
+            for tb_line in tb.splitlines():
+                stripped = tb_line.strip()
+                if stripped.startswith('File "'):
+                    first_frame = stripped
+                    break
+            row["first_frame"] = first_frame
+        return row
+
+    normalized = [_norm(r) for r in all_recs]
+
+    # --- derive external_kill rows ---
+    # A "start" with no following "stop" or "crash" in the full log means
+    # the process was killed externally (SIGKILL, Task Scheduler
+    # ExecutionTimeLimit, or a manual stop that did not go through our
+    # shutdown path).
+    for i, rec in enumerate(all_recs):
+        if rec.get("event") != "start":
+            continue
+        has_closer = any(
+            e.get("event") in ("stop", "crash")
+            for e in all_recs[i + 1:]
+        )
+        if not has_closer:
+            normalized.append({
+                "event": "external_kill",
+                "ts": rec.get("ts"),
+                "version": rec.get("version"),
+                "pid": rec.get("pid"),
+                "note": (
+                    "start with no following stop or crash — "
+                    "process was killed externally "
+                    "(SIGKILL, Task Scheduler ExecutionTimeLimit, or manual stop)"
+                ),
+            })
+
+    return {"entries": normalized[-n:], "n": n}
 
 
 def _bridge_write(
@@ -1853,12 +2624,12 @@ def _bridge_write(
 ) -> dict:
     """Guard + (POST|GET) a bridge authoring endpoint + interpret the result.
 
-    Shared shape for the semantic-authoring wrappers below. Several target
-    endpoints require the bridge's main-thread-marshaled write path;
-    until that ships the bridge replies not_implemented / property_not_materialized
-    and this raises BridgeWriteFailed with the message (no crash).
+    Shared shape for the semantic-authoring wrappers below. A write the
+    bridge cannot perform safely on its HTTP thread answers not_implemented /
+    property_not_materialized, and this raises
+    BridgeWriteFailed with the message (no crash).
     """
-    from urllib.parse import urlencode, quote
+    from urllib.parse import quote, urlencode
     cfg = _bridge_write_guard(cfg, project)
     # quote_via=quote (percent-encoding, space -> %20) NOT the default quote_plus
     # (space -> +): the bridge's C# query parser percent-decodes but treats '+' as a
@@ -2105,11 +2876,30 @@ def _canonicalize_event(event_type: str) -> dict | None:
     return None  # unknown — bridge is the authority
 
 
+# Native FTOptix.UI commands `command` accepts by NAME. They live on the builtin
+# UICommands object OUTSIDE the project root, so none of them can be reached as a
+# `method_path` (that answers node_not_found) — which is why they are a command.
+# Their InputArguments ride in `args`:
+#   OpenDialog    Dialog=<Dialog type path>;AliasNode=<node or empty>;ParentItem=
+#   CloseDialog   —
+#   OpenKeyboard  KeyboardType=<Numeric|AlphaNumeric|…>;TargetVariable=<variable
+#                 path>;ParentItem=      (three arguments, per
+#                 Modules/FTOptix.UI/<ver>/Module.xml — a wrong COUNT fails at
+#                 runtime, silently, on the click; the bridge checks the three
+#                 before it builds anything)
+# KEEP IN SYNC with StudioMCPBridge.cs::_UiCommands.
+_UI_COMMANDS: tuple[str, ...] = ("OpenDialog", "CloseDialog", "OpenKeyboard")
+# The builtin VariableCommands the bridge wires without `args`.
+_VARIABLE_COMMANDS: tuple[str, ...] = ("SetVariable", "ToggleVariable")
+
+
 def bridge_wire_event(
     cfg: Config, project: str, node_path: str, event_type: str,
     method_path: str | None = None, *,
     command: str | None = None, variable: str | None = None,
-    value: str | None = None,
+    value: str | None = None, args: str | None = None,
+    object_raw: str | None = None,
+    replace: bool = False,
 ) -> dict:
     """Wire a UI event on `node_path` — to a native command OR a NetLogic ExportMethod.
 
@@ -2118,8 +2908,16 @@ def bridge_wire_event(
         `variable` + `value`) or "ToggleVariable" (needs `variable`). These wire to
         the builtin FTOptix VariableCommands object — the preferred path for common
         actions (set/toggle a variable from a button).
+      - a native UI `command` — "OpenDialog", "CloseDialog" or "OpenKeyboard"
+        (`_UI_COMMANDS`) — whose arguments ride in `args` as "Name=Value;…".
+        OpenKeyboard needs all three of KeyboardType/TargetVariable/ParentItem.
       - a `method_path` ("ObjectPath/MethodName") pointing at a NetLogic [ExportMethod],
         for custom logic.
+
+    When `replace=True`, any existing handler for the same event type is deleted
+    before the new one is created (delete-then-create). This is the explicit
+    caller escape hatch; the default (False) leaves in-place update / conflict
+    error behaviour intact.
 
     A client-side guard catches the common wrong-event-name trap (e.g. "Click" ->
     "MouseClickEvent") and returns a structured suggestion before hitting the bridge;
@@ -2128,16 +2926,60 @@ def bridge_wire_event(
     nudge = _canonicalize_event(event_type)
     if nudge is not None:
         return nudge
+    # Commands are matched by exact name in the bridge; canonicalize casing
+    # here the way event names are, so "opendialog" is not silently routed
+    # down the VariableCommands branch and rejected for carrying `args`.
+    if command:
+        _known = {c.lower(): c for c in _UI_COMMANDS + _VARIABLE_COMMANDS}
+        command = _known.get(command.strip().lower(), command)
+    ui_command = command in _UI_COMMANDS
     if command:
         params: dict[str, str] = {"path": node_path, "event": event_type, "command": command}
         if variable is not None:
             params["variable"] = variable
         if value is not None:
             params["value"] = value
+        # UI commands (_UI_COMMANDS) live on the builtin UICommands object
+        # OUTSIDE the project root, so they are a `command`, not a method_path --
+        # and unlike the variable commands they take their arguments from `args`:
+        # "Dialog=<Dialog type path>;AliasNode=<node or empty>;ParentItem=" for
+        # OpenDialog, "KeyboardType=Numeric;TargetVariable=<path>;ParentItem="
+        # for OpenKeyboard. An empty ParentItem is late-bound to the event node
+        # by the bridge, as a Studio-authored handler does.
+        if ui_command and args:
+            params["args"] = args
     elif method_path:
         params = {"path": node_path, "event": event_type, "method": method_path}
+        # B19: method ARGUMENTS, "Name=Value" pairs separated by ';'. Without
+        # them only argument-LESS methods are reachable, which excludes every
+        # method the converter needs -- ChangePanel(NewPanel),
+        # ChangePanelByTabName(TabName), OpenDialog(Dialog, AliasNode).
+        # A value that resolves to a node becomes a NodePointer argument;
+        # anything else becomes a String. Only valid with method_path: the
+        # command path builds its own InputArguments (VariableToModify/Value/
+        # ArrayIndex) and a second source would collide with it.
+        if args:
+            params["args"] = args
+        # B19: late-bind the call TARGET. An absolute NodeId names the
+        # design-time node; a UI object is instantiated per session, so the
+        # dispatcher finds nothing there. `object_raw` is a literal NodePath
+        # RELATIVE TO THE EVENT NODE (e.g. "../Loader"); the bridge prepends the
+        # four levels up from ObjectPointer and defaults the @NodeId attribute.
+        # Required for every UI-hosted method -- ChangePanel does nothing without
+        # it, silently.
+        if object_raw:
+            params["object_raw"] = object_raw
     else:
         raise BridgeWriteFailed("wire_event needs either command (+variable[/value]) or method_path")
+    if args and command and not ui_command:
+        raise BridgeWriteFailed(
+            "wire_event: `args` applies to method_path only -- the command path "
+            "builds its own InputArguments (VariableToModify/Value/ArrayIndex). "
+            "Passing both would silently drop one of them.")
+    # pass replace=true only when requested so the bridge can
+    # delete the existing handler and create a fresh one.
+    if replace:
+        params["replace"] = "true"
     return _bridge_write(cfg, project, "wire_event", "/bridge/node/event", params)
 
 
@@ -2165,7 +3007,7 @@ def bridge_delete_node(cfg: Config, project: str, node_path: str) -> dict:
 # from here instead of requiring a manual right-click -> Execute in Studio.
 def bridge_invoke_method(
     cfg: Config, project: str, node_path: str, method_name: str,
-    args: str | None = None, timeout: float = 60.0,
+    args: str | None = None, timeout: float = 60.0, unsafe: bool = False,
 ) -> dict:
     """Execute an exported UAMethod on an IUAObject node in the live model.
 
@@ -2175,25 +3017,34 @@ def bridge_invoke_method(
     IUAObject.ExecuteMethod under the hood. Live-model op; requires Studio
     open + the bridge.
 
-    `timeout` (seconds) defaults to 60, well above the 8s default every
-    other bridge write uses : unlike a property set, an
-    arbitrary NetLogic method's runtime is unknowable — e.g. Optix's own
-    SearchBrokenDynamicLinks scans the whole project and can legitimately
-    run long on a large one. Raise it further via this param for a method
-    known to be even slower.
+    The bridge runs the call under a root Optix session
+    (Sessions.ImpersonateRootTemporary). Issue #4 root cause: ExecuteMethod on
+    the bridge's HTTP thread had NO session, and native code dereferencing the
+    missing session killed FTOptixStudio.exe on any method (a throwing one, a
+    no-op, Optix's own SearchBrokenDynamicLinks). Studio's right-click Execute
+    survived only because its GUI thread has a session.
 
-    CONFIRMED HAZARD: calling Optix's own
-    SearchBrokenDynamicLinks.FindBrokenDynamicLink through this endpoint has
-    been observed to kill the entire FTOptixStudio.exe process outright —
-    reproduced twice, across two separate Studio sessions, with no exception
-    ever surfacing. Believed to be a thread-affinity crash: this endpoint
-    calls ExecuteMethod from a background thread, not Studio's main/UI
-    thread, and that built-in tool likely assumes it's driven by the UI's
-    own Execute gesture. Until the bridge adds proper main-thread marshaling
-    for ExecuteMethod, treat ANY call through this endpoint as able to crash
-    Studio, not just this one method. For broken-link finding/fixing
-    specifically, use Studio's own right-click Execute instead.
+    Bridge builds from before that fix still run the call session-less and
+    will take Studio down, so this refuses (`invoke_unsupported_bridge`,
+    before the invoke request) unless the serving bridge's /bridge/health
+    advertises `invoke_session`. `unsafe` is accepted for compatibility
+    and has no effect.
+
+    `timeout` (seconds) defaults to 60, well above the 8s default every
+    other bridge write uses: an arbitrary method's runtime is unknowable.
     """
+    del unsafe  # legacy flag: invoke is session-safe on bridges that allow it
+    routed = _bridge_write_guard(cfg, project)
+    status, health = _bridge_get_json(routed, "/bridge/health")
+    if not (status == 200 and isinstance(health, dict) and health.get("invoke_session")):
+        version = health.get("bridge_version") if isinstance(health, dict) else None
+        raise BridgeWriteFailed(
+            "bridge invoke_method rejected: invoke_unsupported_bridge — the bridge "
+            f"serving {project!r} (version {version or 'unknown'}) runs ExecuteMethod "
+            "without an Optix session, which kills Studio (issue #4). Rebuild the "
+            "NetSolution with the current studio-bridge/StudioMCPBridge.cs and "
+            "re-arm, or use optix_execute_method (Studio's right-click Execute)."
+        )
     params: dict[str, str] = {"path": node_path, "method": method_name}
     if args is not None:
         params["args"] = args
@@ -2207,16 +3058,102 @@ def bridge_reorder_node(
     cfg: Config, project: str, node_path: str,
     position: str | None = None, index: int | None = None,
 ) -> dict:
-    """Reorder a node among its siblings = z-order (render order is child order;
-    last child renders in front). `position` in {front, back} OR an explicit
-    `index`. Uses node.MoveUp()/MoveDown(); only effective on graphic objects inside
-    a TYPE (ScreenType/PanelType). Live-model write."""
+    """Reorder a node among its siblings in the **graphic-children index space**
+    (z-order = render order; last child renders in front).
+
+    ``position`` in {front, back} places the node at one extreme of the
+    graphic-children list.  ``index`` is a zero-based integer offset into that
+    same list — IUAVariable children (node properties) are excluded from the
+    count and do not shift the index, so the graphic index differs from the raw
+    ``parent.Children`` index whenever properties are interspersed.
+
+    Exactly one of ``position`` or ``index`` must be supplied; supplying both is
+    a local error.  A negative or non-integer ``index`` is rejected before the
+    bridge is contacted.
+
+    Uses node.MoveUp()/MoveDown() with a re-reading loop that re-checks
+    GraphicIndexOf after every move and stops on no-progress.  Only effective on
+    graphic objects inside a TYPE (ScreenType/PanelType). Live-model write.
+
+    Returns on success: {ok, path, from, requested, achieved, space:"graphic_children",
+    moves, mode, thread}.  ``achieved`` is the graphic index re-read after all
+    moves; if it differs from ``requested`` the bridge instead returns ok:false
+    with error:"reorder_index_unreached".
+    """
+    if position is not None and index is not None:
+        raise BridgeWriteFailed(
+            "bridge reorder failed: supply position OR index, not both"
+        )
+    if index is not None:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise BridgeWriteFailed(
+                "bridge reorder failed: index must be a non-negative integer"
+            )
+        if index < 0:
+            raise BridgeWriteFailed(
+                f"bridge reorder failed: index must be >= 0, got {index}"
+            )
     params: dict[str, str] = {"path": node_path}
     if position is not None:
         params["position"] = position
     if index is not None:
-        params["index"] = str(int(index))
+        params["index"] = str(index)
     return _bridge_write(cfg, project, "reorder", "/bridge/node/reorder", params)
+
+
+# .NET composite-format positional placeholder: {0}, {0:F2}, {1,8:N1}. `{{`/`}}`
+# are literal braces and are stripped before matching.
+_POSITIONAL_PLACEHOLDER = re.compile(r"\{(\d+)\s*(?:,[^{}:]*)?(?::[^{}]*)?\}")
+
+# Verbs whose `sources` field is a delimited string on the wire. The positional
+# pair splits on ',' (Source0..N); attach_formatter's named `name=path` pairs
+# split on ';'.
+_ATTACH_SOURCE_SEP: dict[str, str] = {
+    "attach_expression": ",",
+    "attach_string_formatter": ",",
+    "attach_formatter": ";",
+}
+
+
+def _coerce_sources(verb: str, sources):
+    """Return `sources` as the delimited string the bridge route reads.
+
+    A list is the natural JSON shape for "several sources", and it used to be
+    passed through `str()` — the bridge then looked up the literal
+    "['Model/X']" and answered source_not_variable. Join it instead. A dict
+    is accepted for attach_formatter's named form ({"navIdx": "Model/..."}).
+    """
+    if sources is None or isinstance(sources, str):
+        return sources
+    sep = _ATTACH_SOURCE_SEP.get(verb, ",")
+    if isinstance(sources, dict):
+        if verb != "attach_formatter":
+            raise BridgeWriteFailed(
+                f"op {verb!r}: `sources` is positional ({{0}}, {{1}}, ..), so pass "
+                f"a list or a comma-separated string, not a name->path mapping")
+        return sep.join(f"{k}={v}" for k, v in sources.items())
+    if isinstance(sources, (list, tuple)):
+        return sep.join(str(x).strip() for x in sources if str(x).strip())
+    raise BridgeWriteFailed(
+        f"op {verb!r}: `sources` must be a string or a list of paths, "
+        f"got {type(sources).__name__}")
+
+
+def unbound_placeholders(format: str, sources) -> list[int]:
+    """Positional placeholders in `format` that no source is bound to.
+
+    "{0:F2}" with no sources attaches a StringFormatter whose Source0 is
+    missing: the bridge reports ok and the label renders the bare format
+    text. That is how a `source` (singular) typo once reached a live project
+    reported as `succeeded`.
+    """
+    if not format:
+        return []
+    stripped = format.replace("{{", "").replace("}}", "")
+    wanted = {int(m) for m in _POSITIONAL_PLACEHOLDER.findall(stripped)}
+    src = _coerce_sources("attach_string_formatter", sources) or ""
+    bound = len([s for s in src.split(",") if s.strip()])
+    return sorted(i for i in wanted if i >= bound)
 
 
 def bridge_attach_expression(
@@ -2229,10 +3166,118 @@ def bridge_attach_expression(
     expression='if({0} > 40, 0xFFFF0000, 0xFF00FF00)', sources='Model/Speed' on a
     FillColor. Subsumes ConditionalConverter/Linear/etc. Live-model write."""
     _reject_node_attribute("attach_expression", prop_name)
+    sources = _coerce_sources("attach_expression", sources)
     params: dict[str, str] = {"path": node_path, "name": prop_name, "expression": expression}
     if sources:
         params["sources"] = sources
     return _bridge_write(cfg, project, "attach_expression", "/bridge/node/attach-expression", params)
+
+
+def bridge_attach_formatter(
+    cfg: Config, project: str, node_path: str, prop_name: str,
+    format: str, sources: str | None = None, mode: str | None = None,
+) -> dict:
+    """Attach a FORMATTED DYNAMIC LINK to a property — a DynamicLink whose path
+    is built by a StringFormatter from NAMED sources.
+
+    The "indirect address" shape: a PanelLoader's `Panel` picked by an integer,
+    with the candidate panels as readable named variables on the loader instead
+    of opaque NodeId GUIDs inside a ValueMapConverter. Equally the
+    "{#value} {#eu}" unit-label shape on a Label's Text.
+
+        format  = "../NavPanel{#navIdx}@Pointer"
+        sources = "navIdx=Model/GlobalVariables/AlarmVariables/AlarmTab"
+
+    `{#name}` binds to a HasSource child called `Source<name>`, so the source
+    NAME is load-bearing — unlike attach_expression, whose sources are
+    POSITIONAL (Source0..N) and which is hard-wired to ExpressionEvaluator.
+    `sources` is name=path pairs separated by ';'. `mode` is Read (default),
+    ReadWrite or Write.
+
+    Replaces whatever was on the property, so migrating off a ValueMapConverter
+    needs no separate teardown. Live-model write — and like every converter, a
+    mis-wired one renders NOTHING with no error, so render-verify rather than
+    trusting ok:true."""
+    _reject_node_attribute("attach_formatter", prop_name)
+    sources = _coerce_sources("attach_formatter", sources)
+    params: dict[str, str] = {"path": node_path, "name": prop_name, "format": format}
+    if sources:
+        params["sources"] = sources
+    if mode:
+        params["mode"] = mode
+    return _bridge_write(cfg, project, "attach_formatter", "/bridge/node/attach-formatter", params)
+
+
+def bridge_attach_string_formatter(
+    cfg: Config, project: str, node_path: str, prop_name: str,
+    format: str, sources: str | list[str] | None = None,
+    raw: str | bool | None = None, mode: str | None = None,
+) -> dict:
+    """Attach a StringFormatter as the converter ON A PROPERTY — the shape that
+    FORMATS A DISPLAY VALUE (a Float rendered "67.7", not "67.701805").
+
+    This is NOT attach_formatter. attach_formatter builds a formatted dynamic
+    LINK (the StringFormatter hangs off the DynamicLink and produces a NodePath,
+    the "indirect address" pattern); used as a value formatter on Label.Text it
+    renders EMPTY. This op puts the StringFormatter where attach_expression puts
+    its ExpressionEvaluator — HasConverter on the property itself — so its output
+    is the rendered text.
+
+        format  = "{0:F1}"   (.NET composite string; {0},{1},.. are the sources)
+        sources = "Model/Water/Temps/RawWaterTemp/value"   (positional -> Source0..N)
+
+    `sources` are POSITIONAL: a comma-separated string or a list. Every {N}
+    in `format` needs a source (else unbound_placeholder, before any write). Pass `raw=True` to attach each
+    source as a LITERAL NodePath (so an alias/template path like "{data}/value"
+    attaches on a PanelType and resolves per instance) — otherwise each source
+    must resolve to a variable now. Live-model write; render-verify (a mis-wired
+    converter renders nothing, ok:true only means attached)."""
+    _reject_node_attribute("attach_string_formatter", prop_name)
+    sources = _coerce_sources("attach_string_formatter", sources)
+    missing = unbound_placeholders(format, sources)
+    if missing:
+        raise BridgeWriteFailed(
+            f"unbound_placeholder: format {format!r} uses "
+            f"{', '.join('{%d}' % i for i in missing)} but only "
+            f"{len([x for x in (sources or '').split(',') if x.strip()])} source(s) "
+            f"are bound — the formatter would attach and render the bare format "
+            f"text. Pass `sources` (plural), positional, e.g. sources='Model/Temp'.")
+    params: dict[str, str] = {"path": node_path, "name": prop_name, "format": format}
+    if sources:
+        params["sources"] = sources
+    if raw is True or (isinstance(raw, str) and raw.lower() in ("1", "true")):
+        params["raw"] = "1"
+    if mode:
+        params["mode"] = mode
+    return _bridge_write(cfg, project, "attach_string_formatter",
+                         "/bridge/node/attach-string-formatter", params)
+
+
+def bridge_retype(
+    cfg: Config, project: str, node_path: str, datatype: str,
+    dims: str | None = None,
+) -> dict:
+    """Change a VARIABLE's DataType in place — optionally its array shape —
+    keeping the node: NodeId, children (DynamicLink, converters, Mode) and
+    every inbound reference survive, which delete+create cannot offer (and
+    create_variable cannot make an array at all).
+
+    The current value is converted element-wise; float→text goes through
+    ToString("R") so 22.3f becomes "22.3", never 22.299999237060547.
+
+        {"op": "retype", "path": "Recipes/RecipeSchema/EditModel/Setpoints",
+         "datatype": "String"}                     # keeps the [10] shape
+        {"op": "retype", "path": "Model/Setpoint", "datatype": "Double",
+         "dims": "scalar"}
+
+    `dims` omitted keeps the current shape; "scalar" collapses to a scalar;
+    "N" sets a one-dimensional array of N. Typical use: storing values as String
+    and letting a driver cast String<->REAL at the link, which means retyping
+    the model arrays and every StoreColumn behind them."""
+    params: dict[str, str] = {"path": node_path, "datatype": datatype}
+    if dims is not None and str(dims) != "":
+        params["dims"] = str(dims)
+    return _bridge_write(cfg, project, "retype", "/bridge/node/retype", params)
 
 
 def bridge_validate_expression(
@@ -2241,9 +3286,25 @@ def bridge_validate_expression(
     """Syntax-check an ExpressionEvaluator formula WITHOUT attaching it.
 
     Optix only validates a formula at RUNTIME (a bad one silently no-ops), so this
-    catches the common author-time mistakes up front (unbalanced ()/{}, out-of-range
-    {N} placeholders, unknown functions). Returns {valid, sources, error?}. The SAME
-    check gates optix_bridge_attach_expression and the bridge's ValidateExpression
+    catches the common author-time mistakes up front:
+      * unbalanced ()/{}, out-of-range {N} placeholders, unknown functions,
+        unterminated strings, number+string concat (pre-existing checks)
+      * invalid_literal — colour-hex: a ``#RRGGBB`` / ``#RGB`` token outside a
+        string is not an ExpressionEvaluator literal; the response carries the
+        converted ``0xAARRGGBB`` form as the actionable fix
+      * invalid_literal — boolean-spelling: capitalised ``True`` / ``False``
+        (Python f-string shape) are rejected at runtime; the response names the
+        lowercase fix (``true`` / ``false``)
+      * invalid_literal — NodeId-valued-result: a top-level result that is a
+        bare NodeId-typed source reference with no comparison or ``isempty``
+        around it is flagged; if the text alone is not conclusive the validator
+        drops the check rather than emit a false positive
+
+    Returns {valid, sources, error?}. When ``valid`` is false the ``error``
+    string starts with the class prefix (e.g. ``invalid_literal: ...``) so
+    callers and ``bridge_edit`` report entries can distinguish literal mistakes
+    from structural ones without parsing the prose.  The SAME check gates
+    optix_bridge_attach_expression and the bridge's ValidateExpression
     right-click method. Read-only (no model change)."""
     params: dict[str, str] = {"expression": expression}
     if sources:
@@ -2283,9 +3344,16 @@ _BRIDGE_EDIT_OPS: dict[str, tuple[str, tuple[str, ...], dict[str, str]]] = {
                           {"position": "position", "index": "index"}),
     "wire_event":        ("bridge_wire_event", ("path", "event_type"),
                           {"method_path": "method_path", "command": "command",
-                           "variable": "variable", "value": "value"}),
+                           "variable": "variable", "value": "value",
+                           "args": "args", "object_raw": "object_raw",
+                           "replace": "replace"}),
     "attach_expression": ("bridge_attach_expression", ("path", "prop_name", "expression"),
                           {"sources": "sources"}),
+    "attach_formatter":  ("bridge_attach_formatter", ("path", "prop_name", "format"),
+                          {"sources": "sources", "mode": "mode"}),
+    "attach_string_formatter": ("bridge_attach_string_formatter", ("path", "prop_name", "format"),
+                          {"sources": "sources", "raw": "raw", "mode": "mode"}),
+    "retype":            ("bridge_retype", ("path", "datatype"), {"dims": "dims"}),
     "add_translation":   ("bridge_add_translation", ("key", "value"), {"locale": "locale"}),
 }
 
@@ -2311,6 +3379,9 @@ _BRIDGE_EDIT_POSITIONAL = {
     "reorder": ("path",),
     "wire_event": ("path", "event_type"),
     "attach_expression": ("path", "prop_name", "expression"),
+    "attach_formatter": ("path", "prop_name", "format"),
+    "attach_string_formatter": ("path", "prop_name", "format"),
+    "retype": ("path", "datatype"),
     "add_translation": ("key", "value"),
 }
 
@@ -2332,6 +3403,16 @@ _OP_COMMON_FIELDS: frozenset[str] = frozenset({"op", "node_path", "prop_name"})
 # Ctrl+Z in Studio; the bridge had no undo. These verbs must hard-fail on an
 # unknown field even when the caller didn't ask for strict.
 _DESTRUCTIVE_OP_VERBS: frozenset[str] = frozenset({"delete", "move", "reorder"})
+
+# Verbs whose node-type field the OTHER surfaces spell `type`. The raw HTTP
+# routes take `type` (/bridge/ui/widget?...&type=PanelLoader) and the
+# HTTP-first callers (make_op("create_widget", ..., type=...)) follow
+# them because it fires over HTTP; the batch op-spec spells it `widget_type` /
+# `object_type`. _normalize_edit_op reconciles the two — see I32.
+_OP_TYPE_ALIAS: dict[str, str] = {
+    "create_widget": "widget_type",
+    "create_object": "object_type",
+}
 
 
 def unknown_op_fields(op: dict) -> list[str]:
@@ -2363,6 +3444,13 @@ def unknown_op_fields(op: dict) -> list[str]:
         return []
     _fn, required, optional = spec
     legal = _OP_COMMON_FIELDS | set(required) | set(optional)
+    # `name` is not one of these verbs' declared fields, but _normalize_edit_op
+    # INJECTS it on purpose (the C# validator reads `name`, the Python applier
+    # reads `prop_name`, so both spellings are set). This check runs AFTER that
+    # normalisation, so without this the caller gets an "unknown_op_field:
+    # name" warning on every single call, for a field the service itself added.
+    if verb in ("attach_expression", "attach_formatter", "attach_string_formatter"):
+        legal = legal | {"name"}
     return sorted(k for k in op if k not in legal)
 
 
@@ -2404,7 +3492,8 @@ def bridge_validate_ops(
 def _normalize_edit_op(op: dict) -> dict:
     """Reconcile the field-name seams between the per-noun bridge tools, the
     batch op-spec, and the C# validator, so an op composed with EITHER surface's
-    naming applies cleanly. Two aliases, both from live-2026-07-25 detours:
+    naming applies cleanly. Three aliases; the first two from live-2026-07-25
+    detours, the third from I32 (2026-09-03):
 
     * `node_path` -> `path`: the standalone tools name the target `node_path`
       (optix_bridge_set_property(node_path=...), optix_bridge_attach_expression,
@@ -2414,6 +3503,20 @@ def _normalize_edit_op(op: dict) -> dict:
       keys the property on `name` (one shape with set_property/bind) while the
       Python applier reads `prop_name`. An op with only one spelling
       validates-but-can't-apply or vice versa (state="partial" mid-apply).
+    * `type` -> `widget_type` (create_widget) / `object_type` (create_object):
+      the raw HTTP routes and the converter that drives them spell the node
+      type `type`; the batch op-spec spells it per-noun. Through bridge_edit
+      the unknown `type` was only an `unknown_op_field` WARNING under the
+      default non-strict mode, so it was DROPPED and the op's own default
+      applied — a `Label` / bare `UAObject` under the right name in the right
+      parent, reported `succeeded`. A wrong-typed node passes every subsequent
+      model read; only a render reveals it. See I32 (and gap-register B4,
+      which tabulated the field names but recorded the failure as a rejection
+      — that holds only for REQUIRED fields). The alias is applied here and
+      the `type` key is REMOVED from the returned op, so the unknown-field
+      check downstream (which runs after this normalisation, see bridge_edit)
+      stays quiet. Both spellings present and DIFFERING raises rather than
+      picking one — there is no safe guess about which type the caller meant.
 
     Coalesce so both spellings are present; `name` wins for attach_expression.
     Returns the SAME object when nothing needs fixing (identity preserved), else
@@ -2446,18 +3549,116 @@ def _normalize_edit_op(op: dict) -> dict:
                 "new_name": new_name}
     needs_path = bool(op.get("node_path")) and not op.get("path")
     prop = None
-    if op.get("op") == "attach_expression":
+    if op.get("op") in ("attach_expression", "attach_formatter", "attach_string_formatter"):
         prop = op.get("name") or op.get("prop_name")
         if prop and op.get("name") == prop and op.get("prop_name") == prop:
             prop = None  # already coalesced
-    if not needs_path and not prop:
+    # I32: `type` is the raw-HTTP spelling of create_widget's
+    # `widget_type` / create_object's `object_type`. Raise on a real conflict;
+    # otherwise fold it into the canonical field and drop the key entirely.
+    canon = _OP_TYPE_ALIAS.get(op.get("op"))
+    drop_type = canon is not None and "type" in op
+    if drop_type:
+        alias_val, canon_val = op.get("type"), op.get(canon)
+        if (alias_val not in (None, "") and canon_val not in (None, "")
+                and alias_val != canon_val):
+            raise BridgeWriteFailed(
+                f"op {op.get('op')!r} carries both {canon}={canon_val!r} and "
+                f"type={alias_val!r} — they name different node types and this "
+                f"service will not guess which one you meant. Pass only "
+                f"{canon} (the batch op field; `type` is the raw HTTP route's "
+                f"spelling of the same thing)."
+            )
+    # `source` -> `sources` on the attach verbs, and a list `sources` joined to
+    # the delimited string the bridge reads. Before this, `source` was only an
+    # unknown_op_field WARNING and was dropped, so the formatter attached with
+    # no Source0 and the batch reported `succeeded` (2026-09-24 live check).
+    fix_sources = False
+    if op.get("op") in _ATTACH_SOURCE_SEP:
+        one, many = op.get("source"), op.get("sources")
+        if "source" in op:
+            if (one not in (None, "", []) and many not in (None, "", [])
+                    and _coerce_sources(op["op"], one) != _coerce_sources(op["op"], many)):
+                raise BridgeWriteFailed(
+                    f"op {op.get('op')!r} carries both source={one!r} and "
+                    f"sources={many!r}; the field is `sources` (plural) — pass only that")
+            fix_sources = True
+        elif many is not None and not isinstance(many, str):
+            fix_sources = True
+    if not needs_path and not prop and not drop_type and not fix_sources:
         return op
     out = dict(op)
+    if fix_sources:
+        one = out.pop("source", None)
+        if out.get("sources") in (None, "", []):
+            out["sources"] = one
+        out["sources"] = _coerce_sources(out["op"], out["sources"])
     if needs_path:
         out["path"] = op["node_path"]
     if prop:
         out["name"] = out["prop_name"] = prop
+    if drop_type:
+        alias_val = out.pop("type")
+        if alias_val not in (None, "") and out.get(canon) in (None, ""):
+            out[canon] = alias_val
     return out
+
+
+# batch_id becomes a filename under <state_dir>/batches, so it must never carry
+# a separator, '..' or a drive prefix.
+_BATCH_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _valid_batch_id(batch_id: object) -> bool:
+    return isinstance(batch_id, str) and _BATCH_ID_RE.fullmatch(batch_id) is not None
+
+
+def _write_batch_journal(cfg: Config, data: dict) -> None:
+    """Write (or update) the per-batch journal to <state_dir>/batches/<batch_id>.json.
+
+    Best-effort — all filesystem I/O is wrapped in a top-level try/except so a
+    write failure never causes a correctly-applying batch to fail.  On each
+    successful write the directory is scanned and journals whose file mtime is
+    older than OPTIX_BATCH_JOURNAL_DAYS (default 7) days are pruned.
+    """
+    try:
+        batch_id = data["batch_id"]
+        if not _valid_batch_id(batch_id):
+            return
+        batches_dir = cfg.state_dir / "batches"
+        batches_dir.mkdir(parents=True, exist_ok=True)
+        journal_path = batches_dir / f"{batch_id}.json"
+        journal_path.write_text(
+            json.dumps(data, default=str), encoding="utf-8"
+        )
+        # Prune stale journals (best-effort — ignore individual errors).
+        days = int(os.environ.get("OPTIX_BATCH_JOURNAL_DAYS", "7"))
+        cutoff = time.time() - days * 86400
+        for p in batches_dir.iterdir():
+            try:
+                if p.suffix == ".json" and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+# Per-op outcome fields a caller cannot recover any other way (how a
+# wire_event landed, which links were made type-relative, where a reorder
+# ended up, what a bind cleared). Everything else in the per-noun result is
+# already implied by the op itself.
+_OP_DETAIL_KEYS = ("via", "relative_sources", "achieved", "prior binding cleared",
+                   "placeholders", "bound", "namespace", "ui_namespace_child")
+
+
+def _op_timing(i: int, op: dict, ms: int, res) -> dict:
+    t = {"index": i, "op": op.get("op"), "ms": ms, "ok": True}
+    if isinstance(res, dict):
+        detail = {k: res[k] for k in _OP_DETAIL_KEYS if k in res}
+        if detail:
+            t["detail"] = detail
+    return t
 
 
 def _apply_one_edit(cfg: Config, project: str, op: dict) -> dict:
@@ -2483,6 +3684,9 @@ def _apply_one_edit(cfg: Config, project: str, op: dict) -> dict:
 def bridge_edit(
     cfg: Config, project: str, ops: list[dict],
     dry_run: bool = False, strict: bool = False,
+    on_progress: Callable[[dict], None] | None = None,
+    batch_id: str | None = None,
+    chunk_index: int = 0,
 ) -> dict:
     """Validate an op batch, then apply it (U16) — the batched authoring path.
 
@@ -2493,11 +3697,37 @@ def bridge_edit(
     the ops applied, sequentially, each through the same per-noun bridge_* call
     its individual tool uses.
 
-    Returns {state, applied, op_count, report, ...}:
+    Returns {state, applied, op_count, batch_id, report, ...}:
       * validation errors, or dry_run  -> state="validated", applied=0
       * all ops applied                -> state="succeeded", applied=len(ops)
       * a mid-batch apply failure       -> state="partial", applied=N,
                                            failed_op={index, op, error}
+      * chunk boundary reached          -> state="chunked", applied=N,
+                                           chunk_reason in {'time','ops'},
+                                           remaining_ops=<count of unstarted ops>
+
+    Per-op timings (A.1): ``validate_ms`` records the bridge_validate_ops
+    round-trip; ``op_timings`` is a list of {index, op, ms, ok} dicts, one per
+    applied op (omitted on dry_run or validation failure); ``apply_ms`` is the
+    total wall-clock time for the apply loop.
+
+    Progress callback (A.2): ``on_progress`` is called (best-effort, wrapped in
+    try/except) once with {batch_id, index:0, total, op:None, phase:'validated'}
+    before the apply loop, then once after each op with {batch_id, index, total,
+    op, ms, applied}. At most one WARNING is logged per batch on the first
+    callback exception.
+
+    Batch journal (B.1): a JSON journal is written to
+    <state_dir>/batches/<batch_id>.json before the first op and rewritten after
+    each op (best-effort — write failures never abort a running batch). Schema:
+    {batch_id, project, state, op_count, applied, started_at, updated_at, pid,
+    chunk_index, op_timings, report, remaining_ops, failed_op?}.
+
+    Chunking (B.2): the apply loop stops early and returns state='chunked' when
+    OPTIX_BATCH_CHUNK_SECONDS (default 90) have elapsed since the loop started,
+    or OPTIX_BATCH_CHUNK_OPS (default 40) ops have been applied and ops remain.
+    Time is the primary boundary (checked first). Pass the returned batch_id to
+    optix_bridge_edit(action='continue', batch_id=...) to process the next chunk.
 
     ATOMICITY IS NOT PROMISED, and the shape says so. The bridge mutates the
     live Studio model op by op; there is no transaction to roll back to, so a
@@ -2506,6 +3736,14 @@ def bridge_edit(
     `state="partial"` reports honestly when it was not enough. Callers must not
     read a missing `failed_op` as "nothing was applied"; read `applied`.
     """
+    # A.3: stable identifier for every terminal state, including dry_run /
+    # validation-refused paths that never enter the apply loop.
+    # Accept a caller-supplied batch_id to support chunk continuation.
+    if not batch_id:
+        batch_id = uuid.uuid4().hex[:12]
+    elif not _valid_batch_id(batch_id):
+        raise InvalidBatchId(f"invalid batch_id {batch_id!r}")
+
     if not isinstance(ops, list) or not ops:
         raise BridgeWriteFailed("bridge_edit requires a non-empty list of ops")
 
@@ -2525,9 +3763,53 @@ def bridge_edit(
     # instead silently getting the whole node at `path`. Warn-and-proceed is
     # not an acceptable default for an op with no undo. See
     # _DESTRUCTIVE_OP_VERBS's docstring for the incident that motivated this.
+    #
+    # Separately (I32): `create_widget` with no type at all defaults to a
+    # `Label`. That default is what turned a dropped `type` field into an
+    # invisible wrong-typed node — it succeeded, was named right, sat in the
+    # right parent, and only a render showed it. The alias above closes the
+    # dropped-field route; this warning makes the remaining silent default
+    # visible in the report rather than only in the rendered screen.
     field_errs: list[dict] = []
     destructive_field_errs: list[dict] = []
+    default_warns: list[dict] = []
     for i, op in enumerate(ops):
+        if op.get("op") == "create_widget" and not op.get("widget_type"):
+            default_warns.append({
+                "op_index": i, "code": "default_widget_type",
+                "message": ("op 'create_widget' carries no widget_type — the "
+                            "bridge will create a 'Label'. The batch field is "
+                            "`widget_type`; the raw HTTP routes spell it "
+                            "`type` (that "
+                            "spelling is accepted here and normalised)."),
+                "default": "Label",
+            })
+        if (op.get("op") == "create_widget"
+                and str(op.get("widget_type") or "").strip().lower() == "gridlayout"):
+            # Rows/Columns are String[] and not settable over the bridge, and a
+            # GridLayout without them in a rendered window blanks the WHOLE web
+            # page (troubleshooting.md, 2026-09-05; re-hit in the 1.0.8 battle
+            # test). The runtime log only says "Skipping layout".
+            default_warns.append({
+                "op_index": i, "code": "gridlayout_without_columns",
+                "message": ("GridLayout Rows/Columns cannot be set over the bridge; "
+                            "until they are defined in Studio, a GridLayout in a "
+                            "rendered window blanks the entire web page. Prefer "
+                            "RowLayout/ColumnLayout, or create it under a non-"
+                            "rendered folder such as UI/Screens."),
+            })
+        if op.get("op") == "attach_string_formatter":
+            missing = unbound_placeholders(op.get("format") or "", op.get("sources"))
+            if missing:
+                # Always an error, strict or not: the op would "succeed" and
+                # render the bare format text — a silent wrong result.
+                destructive_field_errs.append({
+                    "op_index": i, "code": "unbound_placeholder",
+                    "message": (f"format {op.get('format')!r} uses "
+                                f"{', '.join('{%d}' % n for n in missing)} with no "
+                                "source bound; pass `sources` (plural, positional)"),
+                    "unbound": missing,
+                })
         unknown = unknown_op_fields(op)
         if not unknown:
             continue
@@ -2549,10 +3831,13 @@ def bridge_edit(
                             f"silently ignored and the op applied anyway"),
                 "unknown_fields": unknown,
             })
+    # A.1: time the bridge_validate_ops round-trip.
+    _validate_t0 = time.monotonic()
     # Shallow-copy: this dict may be a caller/test fixture or otherwise shared;
     # mutating it in place (below) would corrupt state the caller still holds
     # a reference to. Cheap and correct regardless of where it came from.
     report = dict(bridge_validate_ops(cfg, project, ops, strict=strict))
+    validate_ms: int = int((time.monotonic() - _validate_t0) * 1000)
     if destructive_field_errs:
         report["errors"] = list(report.get("errors") or []) + destructive_field_errs
         report["ok"] = False
@@ -2562,11 +3847,44 @@ def bridge_edit(
             report["ok"] = False
         else:
             report["warnings"] = list(report.get("warnings") or []) + field_errs
+    if default_warns:
+        # Always a warning, strict or not: a default `Label` is legitimate for
+        # a caller who wants one, so this must not refuse an otherwise-clean
+        # batch. It exists so the default is *visible*.
+        report["warnings"] = list(report.get("warnings") or []) + default_warns
+    # Augment unknown_property/'Value' errors with the pre-1.0.8 spelling nudge.
+    # The C# validator rejects ``name='Value'`` on IUAVariable nodes (the applier
+    # handles it correctly since 1.0.5); append the parent/name workaround so the
+    # LLM caller sees the fix without a separate describe_type round-trip.
+    _raw_errs = report.get("errors") or []
+    _augmented = []
+    _value_nudge_needed = False
+    for _err in _raw_errs:
+        if (
+            _err.get("code") == "unknown_property"
+            and "has no settable property 'Value'" in (_err.get("message") or "")
+        ):
+            _idx = _err.get("op_index")
+            if _idx is not None and 0 <= _idx < len(ops):
+                _op = ops[_idx]
+                _op_name = _op.get("name") or _op.get("prop_name") or ""
+                _node_path = _op.get("path") or ""
+                if _op_name == "Value" and _node_path:
+                    _err = dict(_err)
+                    _err["message"] = (
+                        _err["message"] + _value_prop_nudge_suffix(_node_path)
+                    )
+                    _value_nudge_needed = True
+        _augmented.append(_err)
+    if _value_nudge_needed:
+        report["errors"] = _augmented
     out: dict = {
+        "batch_id": batch_id,
         "op_count": len(ops),
         "applied": 0,
         "report": report,
         "dry_run": bool(dry_run),
+        "validate_ms": validate_ms,
     }
     if not report.get("ok") or dry_run:
         out["state"] = "validated"
@@ -2575,13 +3893,151 @@ def bridge_edit(
                 "validation refused the batch; nothing was applied. Each error "
                 "carries op_index — fix those ops and retry."
             )
+        # op_timings omitted: nothing was applied (dry_run or validation failure)
         return out
 
     audit(cfg, "bridge_edit", project=project, ops=len(ops))
-    for i, op in enumerate(ops):
+    # A.2: emit the pre-loop progress event (phase='validated').
+    _progress_warn_logged = False
+    n = len(ops)
+    if on_progress is not None:
         try:
-            _apply_one_edit(cfg, project, op)
+            on_progress({
+                "batch_id": batch_id,
+                "index": 0,
+                "total": n,
+                "op": None,
+                "phase": "validated",
+            })
+        except Exception as _cb_exc:
+            _log.warning(
+                "bridge_edit on_progress callback raised (batch_id=%s): %s",
+                batch_id, _cb_exc,
+            )
+            _progress_warn_logged = True
+
+    # A.1: per-op timings collected here; apply_ms covers the whole loop.
+    # B.1: record apply start time for the journal; B.2: chunk deadline uses it.
+    op_timings: list[dict] = []
+    _apply_t0 = time.monotonic()
+    _started_at = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+
+    # B.1: write the initial journal entry (state='applying') before the first op.
+    # All calls to _write_batch_journal are wrapped in try/except: journal I/O
+    # is best-effort and must never abort a running batch.
+    try:
+        _write_batch_journal(cfg, {
+            "batch_id": batch_id,
+            "project": project,
+            "state": "applying",
+            "op_count": n,
+            "applied": 0,
+            "started_at": _started_at,
+            "updated_at": _started_at,
+            "pid": os.getpid(),
+            "chunk_index": chunk_index,
+            "op_timings": [],
+            "report": report,
+            "remaining_ops": ops,
+        })
+    except Exception:
+        pass
+
+    # B.2: read chunk thresholds once per call (env vars; monkeypatchable).
+    _chunk_seconds = float(os.environ.get("OPTIX_BATCH_CHUNK_SECONDS", "90"))
+    _chunk_ops = int(os.environ.get("OPTIX_BATCH_CHUNK_OPS", "40"))
+
+    for i, op in enumerate(ops):
+        _op_t0 = time.monotonic()
+        try:
+            _res = _apply_one_edit(cfg, project, op)
+            op_ms = int((time.monotonic() - _op_t0) * 1000)
+            op_timings.append(_op_timing(i, op, op_ms, _res))
+            out["applied"] = i + 1
+            # A.2: emit post-op progress event.
+            if on_progress is not None:
+                try:
+                    on_progress({
+                        "batch_id": batch_id,
+                        "index": i + 1,
+                        "total": n,
+                        "op": op.get("op"),
+                        "ms": op_ms,
+                        "applied": i + 1,
+                    })
+                except Exception as _cb_exc:
+                    if not _progress_warn_logged:
+                        _log.warning(
+                            "bridge_edit on_progress callback raised (batch_id=%s): %s",
+                            batch_id, _cb_exc,
+                        )
+                        _progress_warn_logged = True
+            # B.1: rewrite the journal after each successful op.
+            _remaining_ops = ops[i + 1:]
+            _now_iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+            try:
+                _write_batch_journal(cfg, {
+                    "batch_id": batch_id,
+                    "project": project,
+                    "state": "applying",
+                    "op_count": n,
+                    "applied": i + 1,
+                    "started_at": _started_at,
+                    "updated_at": _now_iso,
+                    "pid": os.getpid(),
+                    "chunk_index": chunk_index,
+                    "op_timings": op_timings,
+                    "report": report,
+                    "remaining_ops": _remaining_ops,
+                })
+            except Exception:
+                pass
+            # B.2: check chunk boundary — only when ops remain.
+            if _remaining_ops:
+                _elapsed = time.monotonic() - _apply_t0
+                _chunk_reason: str | None = None
+                if _elapsed >= _chunk_seconds:
+                    _chunk_reason = "time"
+                elif (i + 1) >= _chunk_ops:
+                    _chunk_reason = "ops"
+                if _chunk_reason:
+                    out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+                    out["op_timings"] = op_timings
+                    out["state"] = "chunked"
+                    out["chunk_reason"] = _chunk_reason
+                    out["chunk_index"] = chunk_index
+                    out["remaining_ops"] = len(_remaining_ops)
+                    out["nudge"] = (
+                        f"Batch paused after {i + 1} op(s) "
+                        f"(chunk_reason={_chunk_reason!r}); "
+                        f"{len(_remaining_ops)} op(s) remain. "
+                        f"Continue with: "
+                        f"optix_bridge_edit(action='continue', "
+                        f"batch_id={batch_id!r})"
+                    )
+                    try:
+                        _write_batch_journal(cfg, {
+                            "batch_id": batch_id,
+                            "project": project,
+                            "state": "chunked",
+                            "op_count": n,
+                            "applied": i + 1,
+                            "started_at": _started_at,
+                            "updated_at": _now_iso,
+                            "pid": os.getpid(),
+                            "chunk_index": chunk_index,
+                            "op_timings": op_timings,
+                            "report": report,
+                            "remaining_ops": _remaining_ops,
+                        })
+                    except Exception:
+                        pass
+                    return out
         except Exception as exc:
+            op_ms = int((time.monotonic() - _op_t0) * 1000)
+            op_timings.append({"index": i, "op": op.get("op"), "ms": op_ms, "ok": False})
+            out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+            out["op_timings"] = op_timings
             out["state"] = "partial"
             out["failed_op"] = {
                 "index": i, "op": op.get("op"), "error": str(exc),
@@ -2592,10 +4048,406 @@ def bridge_edit(
                 "earlier ops. Inspect with optix_describe_node before retrying, "
                 "and retry only the remaining ops."
             )
+            # B.1: write failed state to the journal.
+            try:
+                _write_batch_journal(cfg, {
+                    "batch_id": batch_id,
+                    "project": project,
+                    "state": "partial",
+                    "op_count": n,
+                    "applied": out["applied"],
+                    "started_at": _started_at,
+                    "updated_at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+                    "pid": os.getpid(),
+                    "chunk_index": chunk_index,
+                    "op_timings": op_timings,
+                    "failed_op": out["failed_op"],
+                    "report": report,
+                    "remaining_ops": ops[i:],
+                })
+            except Exception:
+                pass
             return out
-        out["applied"] = i + 1
+    out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+    out["op_timings"] = op_timings
     out["state"] = "succeeded"
+    # B.1: write final succeeded state to the journal.
+    try:
+        _write_batch_journal(cfg, {
+            "batch_id": batch_id,
+            "project": project,
+            "state": "succeeded",
+            "op_count": n,
+            "applied": n,
+            "started_at": _started_at,
+            "updated_at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "chunk_index": chunk_index,
+            "op_timings": op_timings,
+            "report": report,
+            "remaining_ops": [],
+        })
+    except Exception:
+        pass
     return out
+
+
+def _load_batch_journal(cfg: Config, batch_id: str) -> dict | None:
+    """Load a batch journal from <state_dir>/batches/<batch_id>.json.
+
+    Returns the parsed dict, or None if the file does not exist or cannot be
+    parsed. Never raises.
+    """
+    if not _valid_batch_id(batch_id):
+        return None
+    try:
+        journal_path = cfg.state_dir / "batches" / f"{batch_id}.json"
+        return json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def bridge_edit_continue(cfg: Config, project: str, batch_id: str) -> dict:
+    """Continue applying the next chunk of a paused (chunked) batch (B.3).
+
+    Loads the journal for batch_id, applies the next chunk of remaining_ops
+    using the same time/op-count thresholds as bridge_edit, and rewrites the
+    journal. Validation is never repeated — the original report from the
+    initial bridge_edit call is echoed unchanged in the returned dict.
+
+    Returns the same output shape as bridge_edit: {state, applied, op_count,
+    batch_id, report, op_timings, chunk_index, and when chunked:
+    chunk_reason, remaining_ops, nudge}.
+
+    Guard rules (all refuse without applying any ops):
+      - batch_project_mismatch: journal project != project argument.
+      - state='abandoned': journal state is 'applying' and its pid is dead —
+        model may have diverged; use optix_describe_node.
+      - batch_not_resumable: state in {succeeded, partial, validated} or any
+        non-chunked terminal state; a partial batch is never auto-continued.
+
+    Raises BridgeWriteFailed if the journal cannot be found.
+    """
+    if not _valid_batch_id(batch_id):
+        raise InvalidBatchId(f"invalid batch_id {batch_id!r}")
+    journal = _load_batch_journal(cfg, batch_id)
+    if journal is None:
+        raise BridgeWriteFailed(
+            f"no journal found for batch_id={batch_id!r}; "
+            "batch may have expired or was never started"
+        )
+
+    batch_state = journal.get("state")
+    journal_project = journal.get("project")
+
+    # Rule 3: project mismatch — refuse before touching anything.
+    if journal_project != project:
+        return {
+            "state": "failed",
+            "error": "batch_project_mismatch",
+            "batch_id": batch_id,
+            "batch_state": batch_state,
+            "message": (
+                f"batch {batch_id!r} was journalled for project "
+                f"{journal_project!r}, not {project!r}"
+            ),
+        }
+
+    # Rule 4: applying with dead pid → abandoned (diverged model state).
+    if batch_state == "applying":
+        pid = journal.get("pid")
+        pid_alive = False
+        if pid is not None:
+            try:
+                pid_alive = psutil.pid_exists(int(pid))
+            except (ValueError, OSError):
+                pid_alive = False
+        if not pid_alive:
+            return {
+                "state": "abandoned",
+                "error": "batch_abandoned",
+                "batch_id": batch_id,
+                "batch_state": "applying",
+                "nudge": (
+                    "The batch was mid-apply when its process died — the live "
+                    "model may have diverged. Inspect with optix_describe_node "
+                    "before re-authoring, and retry only the remaining ops."
+                ),
+            }
+
+    # Rule 2: only 'chunked' is resumable; all other states refuse.
+    if batch_state != "chunked":
+        out: dict = {
+            "state": "failed",
+            "error": "batch_not_resumable",
+            "batch_id": batch_id,
+            "batch_state": batch_state,
+        }
+        if batch_state == "partial":
+            out["nudge"] = (
+                "A partial batch is never auto-continued — the live model may "
+                "have diverged. Inspect with optix_describe_node before "
+                "re-authoring, and retry only the remaining ops."
+            )
+        return out
+
+    # State is 'chunked': load remaining ops and apply the next chunk.
+    ops: list[dict] = list(journal.get("remaining_ops") or [])
+    report: dict = dict(journal.get("report") or {})
+    chunk_index: int = int(journal.get("chunk_index", 0)) + 1
+    op_count: int = int(journal.get("op_count", 0))
+    prior_applied: int = int(journal.get("applied", 0))
+    started_at: str = str(journal.get("started_at", ""))
+
+    out = {
+        "batch_id": batch_id,
+        "op_count": op_count,
+        "applied": prior_applied,
+        "report": report,
+    }
+
+    if not ops:
+        # No remaining ops despite 'chunked' state — treat as succeeded.
+        out["state"] = "succeeded"
+        out["apply_ms"] = 0
+        out["op_timings"] = []
+        out["chunk_index"] = chunk_index - 1
+        return out
+
+    # Apply loop — same logic as bridge_edit's apply phase, without re-validation.
+    op_timings: list[dict] = []
+    _apply_t0 = time.monotonic()
+    _now_iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+
+    # B.1: write initial 'applying' state for this chunk before the first op.
+    try:
+        _write_batch_journal(cfg, {
+            "batch_id": batch_id,
+            "project": project,
+            "state": "applying",
+            "op_count": op_count,
+            "applied": prior_applied,
+            "started_at": started_at,
+            "updated_at": _now_iso,
+            "pid": os.getpid(),
+            "chunk_index": chunk_index,
+            "op_timings": op_timings,
+            "report": report,
+            "remaining_ops": ops,
+        })
+    except Exception:
+        pass
+
+    # B.2: chunk thresholds — same env vars as bridge_edit.
+    _chunk_seconds = float(os.environ.get("OPTIX_BATCH_CHUNK_SECONDS", "90"))
+    _chunk_ops = int(os.environ.get("OPTIX_BATCH_CHUNK_OPS", "40"))
+
+    for i, op in enumerate(ops):
+        _op_t0 = time.monotonic()
+        try:
+            _res = _apply_one_edit(cfg, project, op)
+            op_ms = int((time.monotonic() - _op_t0) * 1000)
+            op_timings.append(_op_timing(i, op, op_ms, _res))
+            out["applied"] = prior_applied + (i + 1)
+            _remaining_ops = ops[i + 1:]
+            _now_iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+            # B.1: rewrite journal after each successful op.
+            try:
+                _write_batch_journal(cfg, {
+                    "batch_id": batch_id,
+                    "project": project,
+                    "state": "applying",
+                    "op_count": op_count,
+                    "applied": out["applied"],
+                    "started_at": started_at,
+                    "updated_at": _now_iso,
+                    "pid": os.getpid(),
+                    "chunk_index": chunk_index,
+                    "op_timings": op_timings,
+                    "report": report,
+                    "remaining_ops": _remaining_ops,
+                })
+            except Exception:
+                pass
+            # B.2: check chunk boundary — only when ops remain.
+            if _remaining_ops:
+                _elapsed = time.monotonic() - _apply_t0
+                _chunk_reason: str | None = None
+                if _elapsed >= _chunk_seconds:
+                    _chunk_reason = "time"
+                elif (i + 1) >= _chunk_ops:
+                    _chunk_reason = "ops"
+                if _chunk_reason:
+                    out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+                    out["op_timings"] = op_timings
+                    out["state"] = "chunked"
+                    out["chunk_reason"] = _chunk_reason
+                    out["chunk_index"] = chunk_index
+                    out["remaining_ops"] = len(_remaining_ops)
+                    out["nudge"] = (
+                        f"Batch paused after {out['applied']} op(s) "
+                        f"(chunk_reason={_chunk_reason!r}); "
+                        f"{len(_remaining_ops)} op(s) remain. "
+                        f"Continue with: "
+                        f"optix_bridge_edit(action='continue', "
+                        f"batch_id={batch_id!r})"
+                    )
+                    try:
+                        _write_batch_journal(cfg, {
+                            "batch_id": batch_id,
+                            "project": project,
+                            "state": "chunked",
+                            "op_count": op_count,
+                            "applied": out["applied"],
+                            "started_at": started_at,
+                            "updated_at": _now_iso,
+                            "pid": os.getpid(),
+                            "chunk_index": chunk_index,
+                            "op_timings": op_timings,
+                            "report": report,
+                            "remaining_ops": _remaining_ops,
+                        })
+                    except Exception:
+                        pass
+                    return out
+        except Exception as exc:
+            op_ms = int((time.monotonic() - _op_t0) * 1000)
+            op_timings.append({"index": i, "op": op.get("op"), "ms": op_ms, "ok": False})
+            out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+            out["op_timings"] = op_timings
+            out["state"] = "partial"
+            out["failed_op"] = {
+                "index": i, "op": op.get("op"), "error": str(exc),
+            }
+            out["nudge"] = (
+                f"op {i} failed AFTER {out['applied']} op(s) had already been "
+                "applied. This path is not atomic — the live model now holds the "
+                "earlier ops. Inspect with optix_describe_node before retrying, "
+                "and retry only the remaining ops."
+            )
+            try:
+                _write_batch_journal(cfg, {
+                    "batch_id": batch_id,
+                    "project": project,
+                    "state": "partial",
+                    "op_count": op_count,
+                    "applied": out["applied"],
+                    "started_at": started_at,
+                    "updated_at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+                    "pid": os.getpid(),
+                    "chunk_index": chunk_index,
+                    "op_timings": op_timings,
+                    "failed_op": out["failed_op"],
+                    "report": report,
+                    "remaining_ops": ops[i:],
+                })
+            except Exception:
+                pass
+            return out
+
+    out["apply_ms"] = int((time.monotonic() - _apply_t0) * 1000)
+    out["op_timings"] = op_timings
+    out["state"] = "succeeded"
+    out["chunk_index"] = chunk_index
+    # B.1: write final succeeded state to the journal.
+    try:
+        _write_batch_journal(cfg, {
+            "batch_id": batch_id,
+            "project": project,
+            "state": "succeeded",
+            "op_count": op_count,
+            "applied": out["applied"],
+            "started_at": started_at,
+            "updated_at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "chunk_index": chunk_index,
+            "op_timings": op_timings,
+            "report": report,
+            "remaining_ops": [],
+        })
+    except Exception:
+        pass
+    return out
+
+
+def bridge_edit_status(
+    cfg: Config,
+    project: str,
+    batch_id: str | None = None,
+) -> dict:
+    """Return status for a batch edit or a recent-batch listing (B.4).
+
+    With ``batch_id``:
+        Return that journal document from ``<state_dir>/batches/<batch_id>.json``.
+        If the id is not found, return a structured dict::
+
+            {"state": "failed", "error": "unknown_batch",
+             "batch_id": <id>, "known": [<batch_id>, ...]}
+
+        where ``known`` lists the most-recent batch IDs for *project*
+        (newest-first).  This is a RETURN VALUE, never a raised exception —
+        ``_bridge_guarded`` (``service/mcp_app.py``) only converts
+        ``BridgeUnavailable`` / ``BridgeWriteFailed``, so a raised exception
+        would escape as a raw traceback.
+
+    Without ``batch_id``:
+        Return the most recent ``OPTIX_BATCH_JOURNAL_N`` (default 5) journals
+        for *project*, newest-first, as ``{"batches": [...], "project": ...}``.
+        A different project's batches are never included.
+
+    The no-id form is the load-bearing recovery path for a client that timed
+    out before seeing the batch_id.
+    """
+    batches_dir = cfg.state_dir / "batches"
+
+    def _journals_for_project(*, limit: int | None = None) -> list[dict]:
+        """Return journal dicts for *project*, sorted newest-first by mtime."""
+        if not batches_dir.is_dir():
+            return []
+        entries: list[tuple[float, dict]] = []
+        for p in batches_dir.iterdir():
+            if p.suffix != ".json":
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if data.get("project") == project:
+                    entries.append((p.stat().st_mtime, data))
+            except Exception:
+                pass
+        entries.sort(key=lambda t: t[0], reverse=True)
+        if limit is not None:
+            entries = entries[:limit]
+        return [data for _, data in entries]
+
+    if batch_id is not None:
+        if not _valid_batch_id(batch_id):
+            return {
+                "state": "failed",
+                "error": "invalid_batch_id",
+                "batch_id": batch_id,
+                "message": "batch_id must be letters, digits, '_' or '-' (max 64)",
+            }
+        journal_path = batches_dir / f"{batch_id}.json"
+        try:
+            if journal_path.exists():
+                return json.loads(journal_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        # Unknown or unreadable — return structured error, never raise.
+        known = [d.get("batch_id", "") for d in _journals_for_project()]
+        return {
+            "state": "failed",
+            "error": "unknown_batch",
+            "batch_id": batch_id,
+            "known": known,
+        }
+
+    # No batch_id: return the most-recent N journals for this project.
+    max_n = int(os.environ.get("OPTIX_BATCH_JOURNAL_N", "5"))
+    return {
+        "batches": _journals_for_project(limit=max_n),
+        "project": project,
+    }
 
 
 def ui_stats(cfg: Config) -> dict:
@@ -2725,6 +4577,39 @@ def _bridge_url_at(port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _bridge_registry_dir() -> "Path | None":
+    """The directory where the C# bridge writes per-port JSON registry files.
+
+    ``%LOCALAPPDATA%\\ftx-mcp\\bridges\\`` — the bridge writes ``<port>.json``
+    on successful bind and deletes it on stop or crash. Returns the Path when
+    it exists (the caller checks for *.json files), else None.
+    """
+    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    d = Path(local) / "ftx-mcp" / "bridges"
+    return d if d.is_dir() else None
+
+
+def _bridge_registry_entries() -> "list[tuple[int, Path]] | None":
+    """Ports listed in the bridge registry, paired with their JSON file paths.
+
+    Returns None when the registry directory is absent or contains no ``*.json``
+    files — the caller should fall through to the legacy port-range scan.
+    Each file is named ``<port>.json``; the port is parsed from the filename
+    (the file content is not read — the /bridge/health call is the authority).
+    """
+    d = _bridge_registry_dir()
+    if d is None:
+        return None
+    entries: list[tuple[int, Path]] = []
+    for f in sorted(d.glob("*.json")):
+        try:
+            port = int(f.stem)
+        except ValueError:
+            continue
+        entries.append((port, f))
+    return entries if entries else None
+
+
 def _is_connection_refused(exc: BaseException | None) -> bool:
     """True when `exc` (typically a caught BridgeUnavailable's __cause__) is,
     or wraps, a ConnectionRefusedError -- i.e. the OS gave a definitive "no
@@ -2768,7 +4653,8 @@ def _bridge_health_at(cfg: Config, port: int, force: bool = False) -> dict:
         return _bridge_cache[url]
     if not cfg.bridge_enabled:
         state = {"available": False, "responded": False, "project": None,
-                  "bridge_version": None, "port": port, "reason": "disabled"}
+                  "bridge_version": None, "port": port, "project_path": None,
+                  "pid": None, "reason": "disabled"}
     else:
         # a bare-connect/immediate-close TCP pre-check
         # used to run here before the HTTP health probe, to skip the slower
@@ -2794,7 +4680,8 @@ def _bridge_health_at(cfg: Config, port: int, force: bool = False) -> dict:
         # isn't cached as "down". A well-formed HTTP response (even model_loaded=False)
         # means the listener is up -> decide immediately, no retry.
         state = {"available": False, "responded": False, "project": None,
-                  "bridge_version": None, "port": port, "reason": "unreachable"}
+                  "bridge_version": None, "port": port, "project_path": None,
+                  "pid": None, "reason": "unreachable"}
         for i in range(3):
             try:
                 # retries=0: this loop already retries the transport-failure path.
@@ -2806,6 +4693,8 @@ def _bridge_health_at(cfg: Config, port: int, force: bool = False) -> dict:
                         "project": data.get("project"),
                         "bridge_version": data.get("bridge_version"),
                         "port": data.get("port", port),
+                        "project_path": data.get("project_path"),
+                        "pid": data.get("pid"),
                         "reason": "ok",
                     }
                 else:
@@ -2815,19 +4704,23 @@ def _bridge_health_at(cfg: Config, port: int, force: bool = False) -> dict:
                         "project": data.get("project"),
                         "bridge_version": data.get("bridge_version"),
                         "port": data.get("port", port),
+                        "project_path": data.get("project_path"),
+                        "pid": data.get("pid"),
                         "reason": f"health status={status} model_loaded={data.get('model_loaded')}",
                     }
                 break  # got a response -> listener is up, don't retry
             except BridgeUnavailable as e:
-                state = {"available": False, "responded": False, "project": None,
-                          "bridge_version": None, "port": port, "reason": str(e)}
+                refused = _is_connection_refused(e.__cause__)
+                state = {"available": False, "responded": False, "refused": refused,
+                          "project": None, "bridge_version": None, "port": port,
+                          "project_path": None, "pid": None, "reason": str(e)}
                 # connection *refused* means nothing is
                 # listening on this port at all -- a definitive answer, not a
                 # transient block, so retrying just adds latency scanning a
                 # range where most ports are typically unarmed. Only sleep
                 # and retry for other transport failures (e.g. a timeout),
                 # which is what the retry loop exists for.
-                if _is_connection_refused(e.__cause__):
+                if refused:
                     break
                 if i < 2:
                     time.sleep(0.4)
@@ -2841,31 +4734,53 @@ def _scan_bridge_ports(cfg: Config, force: bool = False) -> list[dict]:
     """Every configured port's health snapshot, in port order — armed AND
     unarmed alike (unlike list_bridges(), which filters to available=True).
 
-    (v1.0.9) factored out of list_bridges() so a caller that
+    Factored out of list_bridges() so a caller that
     wants the FULL picture (e.g. ui_stats()'s `sockets` field, so the /ui
     dashboard can show "4 configured, 1 armed" instead of just the 1) can get
     it from the SAME scan list_bridges() already does, instead of a second
     full range scan.
+
+    Registry + range: the C# bridge writes
+    ``%LOCALAPPDATA%\\ftx-mcp\\bridges\\<port>.json`` on successful bind. Every
+    registry port AND every configured range port is probed in ONE concurrent
+    pass (so the cost is one probe, not one per port), in port order. The
+    registry is NOT authoritative on its own: a bridge older than 1.0.8 writes
+    no registry file, and right after an upgrade most projects still run one,
+    so trusting the registry alone would hide them. What the registry adds is
+    ports outside the configured range and stale-entry cleanup: a registry
+    file whose port answers connection-refused is deleted. Each result dict
+    gains a ``source`` field: ``"registry"`` or ``"scan"``.
     """
-    ports = _bridge_ports(cfg)
-    if len(ports) <= 1:
-        return [_bridge_health_at(cfg, ports[0], force=force)] if ports else []
-    # scan the range CONCURRENTLY, not one port at
-    # a time. Each _bridge_health_at() call on an unarmed port costs a
-    # full real HTTP connection attempt now that the (buggy) raw-socket
-    # pre-check is gone -- on a box where a refused connection isn't
-    # near-instant (observed here: ~2s per refusal, likely endpoint
-    # security intercepting outbound TCP even on loopback), a sequential
-    # scan of an otherwise-empty 4-port range took 30+ seconds, and by
-    # the time it finished the FIRST port's 2s cache entry was already
-    # stale, so a second sequential caller (doctor() then ui_stats() in
-    # the same /ui/stats request) re-scanned the whole range again.
-    # ThreadPoolExecutor.map preserves input order in its results
-    # regardless of completion order, so callers that assume "port
-    # order" (bridge_state() takes results[0]) are unaffected.
     import concurrent.futures
+
+    registry = _bridge_registry_entries() or []
+    port_to_file: dict[int, Path] = {p: f for p, f in registry}
+    ports = sorted(set(_bridge_ports(cfg)) | set(port_to_file))
+    if not ports:
+        return []
+
+    def _probe(port: int) -> dict:
+        st = dict(_bridge_health_at(cfg, port, force=force))
+        f = port_to_file.get(port)
+        st["source"] = "registry" if f is not None else "scan"
+        # Only remove a registry file on a definitive connection-refused
+        # answer. A timeout (responded=False, refused=False) means Studio is
+        # alive but busy (e.g. loading a model); keep the entry.
+        if f is not None and st.get("refused"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return st
+
+    if len(ports) == 1:
+        return [_probe(ports[0])]
+    # Concurrent: a refused connection is not always near-instant (observed
+    # ~2s per refusal where endpoint security intercepts loopback TCP), so a
+    # sequential scan of an otherwise-empty range took 30+ s. map() keeps
+    # input (port) order, which bridge_state() relies on (results[0]).
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as ex:
-        return list(ex.map(lambda p: _bridge_health_at(cfg, p, force=force), ports))
+        return list(ex.map(_probe, ports))
 
 
 def list_bridges(cfg: Config, force: bool = False) -> list[dict]:
@@ -2895,14 +4810,16 @@ def bridge_state(cfg: Config, force: bool = False) -> dict:
         return bridges[0]
     if not cfg.bridge_enabled:
         return {"available": False, "project": None, "bridge_version": None,
-                "port": None, "reason": "disabled"}
+                "port": None, "project_path": None, "pid": None,
+                "reason": "disabled"}
     # Nothing in the range answered — report against the first candidate port
     # (or the pinned one) so the `reason` reflects a real probe, matching the
     # pre-multi-instance single-bridge behavior when bridge_url_pinned.
     ports = _bridge_ports(cfg)
     return _bridge_health_at(cfg, ports[0], force=force) if ports else {
         "available": False, "project": None, "bridge_version": None,
-        "port": None, "reason": "no ports configured",
+        "port": None, "project_path": None, "pid": None,
+        "reason": "no ports configured",
     }
 
 
@@ -3043,10 +4960,18 @@ def _require_bridge_for(cfg: Config, project: str) -> Config:
     the old `if not _use_bridge_for(cfg, project): raise ...` guard."""
     bcfg = _bridge_cfg_for(cfg, project)
     if bcfg is None:
-        st = bridge_state(cfg)
+        # Report exactly which ports were probed and what each one is serving,
+        # rather than the misleading bridge_state() view (which returns the
+        # first bridge in port order regardless of the requested project).
+        all_states = _scan_bridge_ports(cfg)
+        ports_info = ", ".join(
+            f"port={st['port']} serving={st.get('project')!r}"
+            f" source={st.get('source')!r} available={st.get('available')}"
+            for st in all_states
+        )
         raise BridgeUnavailable(
-            f"bridge not serving {project!r} (state: {st.get('reason')}, "
-            f"serving={st.get('project')!r})"
+            f"bridge not serving {project!r}; "
+            f"ports_probed=[{ports_info or 'none'}]"
         )
     return bcfg
 
@@ -3184,6 +5109,13 @@ def list_ui_types(cfg: Config, project: str) -> dict:
     pure token-size cut with no information loss: a missing `browse_name`
     means "same as `name`". It is kept only on the rare entry where the
     two genuinely differ. `count` still reflects the full catalog size.
+
+    When any entry has a field name that differs from its browse name (a
+    naming misalignment resolved by the bridge's browse-name walk), the
+    response also carries `misaligned:[{name, browse_name}]` listing those
+    entries, plus a `_hint` nudging callers to use the browse_name as the
+    type identifier for describe_type calls.
+
     Bridge-only (the catalog lives in Studio's type system, not on disk).
     """
     cfg = _require_bridge_for(cfg, project)
@@ -3192,12 +5124,25 @@ def list_ui_types(cfg: Config, project: str) -> dict:
         raise BridgeUnavailable(f"bridge /bridge/types/ui returned status={status}")
     data["source"] = "bridge"
     leaned = []
+    misaligned = []
     for t in data.get("types") or []:
         entry = dict(t)
-        if entry.get("browse_name") == entry.get("name"):
+        bn = entry.get("browse_name")
+        nm = entry.get("name")
+        if bn == nm:
             entry.pop("browse_name", None)
+        elif bn:
+            # browse_name differs from name — collect for the misaligned summary.
+            misaligned.append({"name": nm, "browse_name": bn})
         leaned.append(entry)
     data["types"] = leaned
+    if misaligned:
+        data["misaligned"] = misaligned
+        data["_hint"] = (
+            f"{len(misaligned)} type(s) have a catalog field name that differs from "
+            "their browse name (resolved_by:\"browse_name\"). Use the browse_name as "
+            "the identifier when calling describe_type for those types."
+        )
     return data
 
 
@@ -3207,6 +5152,13 @@ def describe_type(cfg: Config, project: str, type_name: str) -> dict:
     Returns {type, browse_name, properties:[{name, datatype}], truncated,
     source:"bridge"}. Bridge-only typed introspection — raises BridgeUnavailable
     when Studio/the bridge is down, NodeNotFound for an unknown type.
+
+    When the bridge resolved the type via a browse-name walk (the type's
+    catalog field name differs from its browse name), the response carries
+    `resolved_by:"browse_name"` (passed through from the bridge). When the
+    response browse_name differs from the requested type_name, the response
+    also carries `catalog_misaligned:True` as a signal that the caller used
+    a field-name alias rather than the canonical browse-name identifier.
     """
     from urllib.parse import quote
     cfg = _require_bridge_for(cfg, project)
@@ -3216,6 +5168,10 @@ def describe_type(cfg: Config, project: str, type_name: str) -> dict:
     if status != 200 or not data:
         raise BridgeUnavailable(f"bridge /bridge/types/schema returned status={status}")
     data["source"] = "bridge"
+    # Detect naming misalignment: response browse_name differs from what was requested.
+    # resolved_by is passed through as-is from the bridge (already in `data` if set).
+    if data.get("browse_name") and data["browse_name"] != type_name:
+        data["catalog_misaligned"] = True
     return data
 
 
@@ -3869,6 +5825,34 @@ def save(
         bp = _bridge_owner_pid(_bridge_cfg, runner)
         if bp:
             target_pid = bp
+    if not target_pid:
+        # (1.0.8) No bridge serves this project: identify its Studio by the
+        # project path on the process command line instead of guessing. On
+        # a six-Studio desktop the "first focus-able window" fallback sent
+        # Ctrl+S to the SAME unrelated instance for every project and
+        # reported saved:false each time (2026-09-05). When several
+        # Studios are open and none can be attributed, refuse — a guessed
+        # Ctrl+S silently saves someone else's project.
+        cp = _studio_pid_for_project(project_dir)
+        if cp:
+            target_pid = cp
+        else:
+            state = studio_guard.studio_state()
+            n_studio = len(state.get("studio", {}).get("pids", []) or [])
+            if n_studio > 1:
+                return {
+                    "saved": False, "reason": "ambiguous_studio",
+                    "mtime_before": before, "mtime_after": before,
+                    "focused": False, "elapsed_seconds": 0.0, "stdout": "",
+                    "studio_count": n_studio,
+                    "hint": (
+                        f"{n_studio} Studio instances are open and none names "
+                        f"{project!r} on its command line (Studio opened from the "
+                        "GUI carries no project there) and no bridge is armed "
+                        "for it. Arm the bridge (optix_bridge_arm) so the save "
+                        "can be targeted at the right instance, or save in Studio."
+                    ),
+                }
     proc = runner.run_powershell(
         _build_save_ps(target_pid, gentle=_gentle_focus()),
         timeout=30,
@@ -4105,13 +6089,49 @@ def bridge_arm(cfg: Config, project: str, action: str = "arm") -> dict:
     see service/studio_arm.py for the measured facts it encodes.
     """
     from . import studio_arm
-    project_dir = resolve_project(cfg, project)
+    info = resolve_project_info(cfg, project)
+    project_dir = info["dir"]
     method = "StartBridge" if action == "arm" else "StopBridge"
     audit(cfg, "bridge_arm", project=project, action=action)
     out = studio_arm.execute_method(
         project, str(project_dir), method=method,
         base_port=cfg.bridge_port_base, port_range=cfg.bridge_port_range,
         aliases=project_served_names(project_dir),
+    )
+    reset_bridge_cache()
+    if isinstance(out, dict):
+        # Which source resolved the name — "studio_process" means the project
+        # is OUTSIDE projects_root and was matched to a running Studio's
+        # command line, so the same call will stop resolving once that Studio
+        # closes. setdefault, not [], so execute_method stays free to report
+        # its own value.
+        out.setdefault("resolved_from", info["source"])
+    return out
+
+
+def execute_design_method(cfg: Config, project: str, node: str, method: str,
+                          timeout: float = 20.0) -> dict:
+    """Right-click -> Execute an ARBITRARY design-time [ExportMethod].
+
+    Same UI Automation gesture as bridge_arm, which is the only SAFE way to run
+    one: invoking a design-time method in-process on the bridge's HTTP thread
+    runs it off Studio's UI thread and CRASHES Studio (measured). The GUI
+    gesture does not.
+
+    `ok` here means the Execute item was clicked — NOT that the method did what
+    you wanted. Arbitrary methods expose no port signal to verify against
+    (unlike StartBridge/StopBridge), so confirm the effect with
+    optix_describe_node or a render, and read Studio's Output pane for the
+    method's own logging.
+    """
+    from . import studio_arm
+    project_dir = resolve_project(cfg, project)
+    audit(cfg, "execute_method", project=project, node=node, method=method)
+    out = studio_arm.execute_method(
+        project, str(project_dir), method=method, node_name=node,
+        base_port=cfg.bridge_port_base, port_range=cfg.bridge_port_range,
+        timeout=timeout, aliases=project_served_names(project_dir),
+        verify="none",
     )
     reset_bridge_cache()
     return out
@@ -4216,7 +6236,14 @@ def project_new(cfg: Config, name: str, template: str | None = None,
                 "nudge": "pick another name; this tool never writes into an existing directory"}
     args = ["new", name, str(cfg.projects_root)]
     if template:
+        # -u is REQUIRED alongside --template: without it Studio runs NewProject
+        # during IDEContext::Initialize with the USER template library not yet
+        # indexed, and the lookup fails `Cannot create a new project with invalid
+        # template: <name>` out of TemplateLibrary::GetModelNodeFromPath — for a
+        # template name the GUI resolves fine. Verified 2026-09-01: identical
+        # argv minus -u fails, with -u creates the project.
         args.append(f"--template={template}")
+        args.append("-u")
     args.append("--silent")
     audit(cfg, "project_new", project=name, template=template)
     launched = _studio_launch(cfg, args)
@@ -4281,6 +6308,31 @@ def run_emulator(
                 "the service won't send F5. Screenshot/verify against it directly."
             ),
         }
+    # MISMATCH GUARD: Before sending F5, confirm no OTHER project's emulator is
+    # already running on this host.  The cache-path component
+    # (\\Emulator\\Projects\\<Project>\\) uniquely identifies the owning project;
+    # acting on the wrong runtime — stopping Beta when the caller asked for Alpha —
+    # is silent data loss on a multi-Studio box.
+    _running_entries = _emulator_entries()          # all instances, no project filter
+    for _re in _running_entries:
+        _resolved = _re.get("project_resolved")
+        if _resolved and _resolved.casefold() != project.casefold():
+            audit(cfg, "emulator_run_refused_mismatch",
+                  project=project, resolved=_resolved)
+            return {
+                "ok": False,
+                "error": "runtime_project_mismatch",
+                "requested": project,
+                "resolved": _resolved,
+                "pid": _re["pid"],
+                "nudge": (
+                    f"The running emulator belongs to project '{_resolved}', not "
+                    f"'{project}'. Stop it first "
+                    f"(optix_emulator action='stop' project='{_resolved}'), then "
+                    "retry. The service will not send F5 while another project's "
+                    "runtime is running."
+                ),
+            }
     # Resolve the bridge-owner PID FIRST — the live UIA target read needs it, and
     # the F5 keystroke below aims at the SAME instance (with several Studio
     # windows open, "first window" can F5 the wrong project). Computed once,
@@ -4295,6 +6347,36 @@ def run_emulator(
         bp = _bridge_owner_pid(_bridge_cfg, runner)
         if bp:
             target_pid = bp
+    if not target_pid:
+        # (1.0.8) No bridge serves this project: identify its Studio by the
+        # project path on the process command line instead of guessing. On
+        # a six-Studio desktop the "first focus-able window" fallback sent
+        # F5 to the SAME unrelated instance for every project. When several
+        # Studios are open and none can be attributed, refuse — a guessed
+        # F5 silently launches someone else's project's emulator.
+        try:
+            _project_dir = resolve_project(cfg, project)
+        except ProjectNotFound:
+            _project_dir = None
+        if _project_dir is not None:
+            cp = _studio_pid_for_project(_project_dir)
+            if cp:
+                target_pid = cp
+            else:
+                _state = studio_guard.studio_state()
+                _n_studio = len(_state.get("studio", {}).get("pids", []) or [])
+                if _n_studio > 1:
+                    return {
+                        "ok": False, "error": "ambiguous_studio",
+                        "studio_count": _n_studio,
+                        "hint": (
+                            f"{_n_studio} Studio instances are open and none names "
+                            f"{project!r} on its command line (Studio opened from the "
+                            "GUI carries no project there) and no bridge is armed "
+                            "for it. Arm the bridge (optix_bridge_arm) so the F5 "
+                            "can be targeted at the right instance, or launch from Studio."
+                        ),
+                    }
     # F5 GUARD: F5 runs Studio's SELECTED deployment target, which is only the
     # emulator if the operator's dropdown says so. If the active target is a
     # non-emulator, sending F5 could ship to hardware — refuse instead. The
@@ -4355,15 +6437,30 @@ def run_emulator(
                          "receive F5. Restore/un-minimize that Studio and retry.")}
     focused = "FOCUSED=True" in out
     result = {"launched": focused, "focused": focused, "saved": saved, "stdout": out}
+    if focused:
+        # Invalidate the web-port cache for this project: a successful F5 may
+        # start a runtime on a port that differs from what was cached before the
+        # launch (e.g. project port was updated between calls).
+        _invalidate_web_port_cache(project)
     if focused and wait_ready:
         # F5 spins up FTOptixRuntime + its web engine asynchronously; a CDP screenshot
         # fired immediately hits nothing. Poll the runtime port until it's serving so
         # a caller can screenshot right after.
         import socket
-        port = runtime_probe_port(cfg)
+        port = _project_web_port(cfg, project)
         probe_host = runtime_probe_host(cfg)
         started = time.time()
         serving = False
+        # The NetLogic security warning is modal and EATS the F5 until it is
+        # answered, so a first run would otherwise burn the whole ready_timeout
+        # and report target_or_modal with nothing spawned. Clear it IN FLIGHT.
+        # Gate the focus-stealing click behind pending_dialog, which is a
+        # read-only walk that never takes the foreground — so a normal build,
+        # where no dialog is up, is never interrupted. Answering the dialog
+        # lets the ALREADY-SENT F5 continue: do NOT resend it (F5 toggles, and
+        # a resend would stop the emulator it just started).
+        consent_cleared = None
+        next_dialog_check = started + 2.0
         while time.time() - started < ready_timeout:
             sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sk.settimeout(0.5)
@@ -4375,6 +6472,20 @@ def run_emulator(
                 sk.close()
             if serving:
                 break
+            now = time.time()
+            if (consent_cleared is None and target_pid
+                    and now >= next_dialog_check and now - started < 25.0):
+                next_dialog_check = now + 3.0
+                try:
+                    dialogs = studio_uia.pending_dialog(target_pid)
+                except Exception:
+                    dialogs = []
+                if any("security warning" in (d.get("title") or "").casefold()
+                       for d in dialogs):
+                    from . import studio_arm
+                    cleared = studio_arm.clear_consent(project)
+                    consent_cleared = bool(cleared.get("consent_clicked"))
+                    result["consent_cleared"] = consent_cleared
             time.sleep(0.5)
         result["serving"] = serving
         result["ready_port"] = port
@@ -4388,7 +6499,7 @@ def run_emulator(
             try:
                 ident = emulator_status(cfg, runner=runner)
                 result["runtime_identity"] = ident.get("state")
-                if ident.get("state") == "not_running":
+                if ident.get("state") == "stopped":
                     result["warning"] = (
                         f"Port :{port} answers but NO emulator process exists — "
                         "F5 ran Studio's selected target and it was not the "
@@ -4413,7 +6524,7 @@ def run_emulator(
                     "The emulator process exists but its port isn't serving yet — "
                     "still building/loading. Poll optix_emulator(action='status') until "
                     "`running`; do NOT resend F5 (it TOGGLES and would stop it).")
-            elif st.get("state") == "not_running" and _bare_runtime_running(cfg, runner):
+            elif st.get("state") == "stopped" and _bare_runtime_running(cfg, runner):
                 # A FTOptixRuntime process DOES exist, but the strict
                 # --application-name=Emulator identity match / CIM timing can't
                 # confirm it yet and the port isn't serving: that's a slow START,
@@ -4424,7 +6535,7 @@ def run_emulator(
                     "and its emulator identity isn't confirmable yet — still starting. "
                     "Poll optix_emulator(action='status') until `running`; do NOT resend F5 "
                     "(it TOGGLES and would stop it).")
-            elif st.get("state") == "not_running":
+            elif st.get("state") in ("stopped", "demo_expired"):
                 tgt = studio_active_deployment_target(cfg)
                 file_claims_emu = tgt.get("known") and tgt.get("is_emulator")
                 result["probable_cause"] = "target_or_modal"
@@ -4510,16 +6621,33 @@ def _bare_runtime_running(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> bool
     return False
 
 
-def _emulator_pids() -> list[int]:
-    """PIDs of FTOptixRuntime.exe instances launched with
-    `--application-name=Emulator` — the command-line discriminator that
-    separates the emulator from an UpdateSvc-deployed runtime (same exe,
-    typically same port). In-process psutil scan; the previous
-    Get-CimInstance Win32_Process PowerShell spawn cost seconds per call and
-    ran up to four times per restart. Best-effort: unreadable processes are
-    skipped, any scan failure returns [].
+# Matches the emulator's per-project cache directory embedded in the runtime
+# command line, e.g. "…\Emulator\Projects\MyProject\…" (forward or back
+# slash; case-insensitive).  Group 1 = the project name component.
+_EMULATOR_PROJ_RE = re.compile(
+    r'[/\\]Emulator[/\\]Projects[/\\]([^/\\]+)[/\\]',
+    re.IGNORECASE,
+)
+
+
+def _emulator_entries(project: str | None = None) -> list[dict]:
+    """Rich scan of FTOptixRuntime.exe emulator instances.
+
+    Returns a list of ``{"pid": int, "project_resolved": str | None,
+    "matched_path": str | None}`` dicts for every FTOptixRuntime.exe that
+    carries ``--application-name=Emulator`` in its command line.
+
+    When *project* is given, only entries whose emulator cache-path component
+    (``\\Emulator\\Projects\\<Project>\\``) matches *project* exactly and
+    case-insensitively are returned.  A runtime whose path names a different
+    project is silently excluded — never attributed to the wrong caller.
+
+    Same process-scan discipline as ``_emulator_pids``: name-only toolhelp
+    snapshot first, then cmdline only for FTOptixRuntime.exe hits.  Best-effort:
+    unreadable processes are skipped, any scan failure returns [].
     """
-    pids: list[int] = []
+    entries: list[dict] = []
+    needle = project.casefold() if project is not None else None
     try:
         # Name-only iteration first (cheap toolhelp snapshot); read cmdline
         # ONLY for actual FTOptixRuntime processes. Asking process_iter for
@@ -4532,15 +6660,123 @@ def _emulator_pids() -> list[int]:
                 cmd = " ".join(p.cmdline())
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-            if "--application-name=Emulator" in cmd:
-                pids.append(p.info["pid"])
+            if "--application-name=Emulator" not in cmd:
+                continue
+            m = _EMULATOR_PROJ_RE.search(cmd)
+            project_resolved: str | None = m.group(1) if m else None
+            matched_path: str | None = m.group(0) if m else None
+            if needle is not None:
+                # Exact, case-insensitive match against the path component.
+                # A runtime for Line4_HMI must never be returned for Line4.
+                if project_resolved is None or project_resolved.casefold() != needle:
+                    continue
+            entries.append({
+                "pid": p.info["pid"],
+                "project_resolved": project_resolved,
+                "matched_path": matched_path,
+            })
     except psutil.Error:
         pass
-    return pids
+    return entries
 
 
-def emulator_status(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> dict:
-    """Emulator state: not_running / starting / running.
+def _emulator_pids(project: str | None = None) -> list[int]:
+    """PIDs of FTOptixRuntime.exe instances launched with
+    `--application-name=Emulator` — the command-line discriminator that
+    separates the emulator from an UpdateSvc-deployed runtime (same exe,
+    typically same port). In-process psutil scan; the previous
+    Get-CimInstance Win32_Process PowerShell spawn cost seconds per call and
+    ran up to four times per restart. Best-effort: unreadable processes are
+    skipped, any scan failure returns [].
+
+    When *project* is given, only PIDs whose emulator cache path names that
+    project (``\\Emulator\\Projects\\<Project>\\``, exact case-insensitive)
+    are returned — a runtime for a different project is never included.
+    """
+    return [e["pid"] for e in _emulator_entries(project)]
+
+
+_DEMO_EXPIRED_RE = re.compile(r"Demo mode expired", re.IGNORECASE)
+
+
+def _tail_last_lifecycle_line(project: str) -> str | None:
+    """Return the last non-empty line from the newest FTOptixRuntime.*.log for
+    *project*, or ``None`` when the log directory / file does not exist.
+
+    Reads only the last 64 KiB (brief, non-held open) so it never blocks the
+    runtime's own log writes.  Used by ``emulator_status`` to surface the
+    ``last_lifecycle_line`` field and derive the ``demo_expired`` state.
+    """
+    log_dir = _emulator_log_dir(project)
+    if not log_dir.is_dir():
+        return None
+    candidates = sorted(
+        (p for p in log_dir.glob("FTOptixRuntime.*.log") if p.is_file()),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    if not candidates:
+        return None
+    log = candidates[0]
+    try:
+        with open(log, "rb") as fh:
+            sz = log.stat().st_size
+            tail_bytes = min(sz, 65536)
+            if tail_bytes < sz:
+                fh.seek(sz - tail_bytes)
+            data = fh.read(tail_bytes)
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        for ln in reversed(lines):
+            stripped = ln.strip()
+            if stripped:
+                return stripped
+    except OSError:
+        pass
+    return None
+
+
+def _any_pid_has_window(pids: list[int]) -> bool:
+    """Return True if any of *pids* owns at least one visible top-level window.
+
+    Uses ``EnumWindows`` on Windows; always returns False on other platforms.
+    Best-effort: any ctypes / attribute error is swallowed and returns False.
+    """
+    if os.name != "nt" or not pids:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        pid_set = set(pids)
+        found: list[bool] = [False]
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
+
+        def _collect(hwnd, _lparam) -> bool:
+            if found[0]:
+                return False  # short-circuit once found
+            window_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if window_pid.value in pid_set and user32.IsWindowVisible(hwnd):
+                found[0] = True
+                return False
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_collect), 0)
+        return found[0]
+    except Exception:
+        return False
+
+
+def emulator_status(
+    cfg: Config,
+    runner: Runner = _DEFAULT_RUNNER,
+    *,
+    project: str | None = None,
+) -> dict:
+    """Emulator state: stopped / starting / running / zombie / demo_expired.
 
     F5 in Studio TOGGLES the emulator, so a caller needs the current state to
     avoid a blind start-that-actually-stops.
@@ -4548,37 +6784,96 @@ def emulator_status(cfg: Config, runner: Runner = _DEFAULT_RUNNER) -> dict:
     Discriminates the EMULATOR from other FTOptixRuntime.exe instances via
     _emulator_pids (see there); `runner` is kept for signature stability.
 
-    States:
-      not_running — no emulator process
-      starting    — emulator process up, runtime port not serving yet
-                    (still building, or hung mid-init)
-      running     — emulator process up AND port serving (safe to CDP-screenshot)
+    When *project* is given the scan is narrowed to that project's emulator
+    cache path (``\\Emulator\\Projects\\<Project>\\``, exact case-insensitive).
+    The result then includes ``project_resolved`` (the name extracted from the
+    path) and ``matched_path`` (the ``\\Emulator\\Projects\\<Project>\\``
+    segment) as attribution evidence.  A runtime for a different project is
+    never counted.
 
-    Returns {state, running, pids, port, port_reachable, checked_at}; `running`
-    is kept as a bool for back-compat and is True only in the `running` state.
-    Adds a `hint` when the port is served by something that is NOT the emulator.
+    States:
+      stopped      — no emulator process
+      starting     — emulator process up, runtime port not serving yet
+                     (still building, or hung mid-init)
+      running      — emulator process up AND port serving (safe to CDP-screenshot)
+      zombie       — process up with a visible UI window but no port listener
+                     (Windows only; reported as 'starting' on non-Windows)
+      demo_expired — the last lifecycle log line contains 'Demo mode expired';
+                     the FTOptix demo licence has lapsed
+
+    Returns {state, running, pids, port, port_reachable, last_lifecycle_line,
+    checked_at}; `running` is kept as a bool for back-compat and is True only
+    in the `running` state.  Adds a `hint` when the port is served by something
+    that is NOT the emulator.
     """
-    pids = _emulator_pids()
+    if project is not None:
+        entries = _emulator_entries(project)
+        pids = [e["pid"] for e in entries]
+        # Pick the attribution evidence from the first matching entry (all
+        # entries share the same project by construction of _emulator_entries).
+        first = entries[0] if entries else {}
+        project_resolved: str | None = first.get("project_resolved")
+        matched_path: str | None = first.get("matched_path")
+        # project_resolved is surfaced in the output when project= is given.
+        surface_project_resolved = True
+    else:
+        entries = _emulator_entries(None)
+        pids = [e["pid"] for e in entries]
+        # When project= is not given, try to infer project_resolved from the
+        # first entry so the log tail can still inform the state — but do NOT
+        # surface it in the output (callers that didn't filter by project see
+        # all emulators and a single project_resolved would be misleading).
+        first = entries[0] if entries else {}
+        project_resolved = first.get("project_resolved")
+        matched_path = None
+        surface_project_resolved = False
+
+    # Tail the last lifecycle line from the emulator log — used to detect
+    # demo_expired and to surface diagnostic context in the result.
+    log_project = project if project is not None else project_resolved
+    last_lifecycle_line: str | None = (
+        _tail_last_lifecycle_line(log_project) if log_project else None
+    )
+
     port = runtime_probe_port(cfg)
     reachable = _tcp_probe(runtime_probe_host(cfg), port)
-    if pids and reachable:
+
+    # State derivation — demo_expired wins over all other conditions so the
+    # caller understands WHY the emulator isn't serving, even after it exits.
+    if last_lifecycle_line and _DEMO_EXPIRED_RE.search(last_lifecycle_line):
+        state = "demo_expired"
+    elif pids and reachable:
         state = "running"
     elif pids:
-        state = "starting"
+        # Process is up but port not serving — distinguish a hung-with-window
+        # (zombie) from a still-initialising (starting) emulator.
+        state = "zombie" if _any_pid_has_window(pids) else "starting"
     else:
-        state = "not_running"
+        state = "stopped"
+
     out = {"state": state, "running": state == "running", "pids": pids,
-           "port": port, "port_reachable": reachable, "checked_at": _now_iso()}
+           "port": port, "port_reachable": reachable,
+           "last_lifecycle_line": last_lifecycle_line,
+           "checked_at": _now_iso()}
+    if surface_project_resolved and project_resolved is not None:
+        out["project_resolved"] = project_resolved
+    if matched_path is not None:
+        out["matched_path"] = matched_path
     if not pids and reachable:
         out["hint"] = (
             f"Port :{port} is serving, but NOT by the emulator — likely the "
             "UpdateSvc-deployed runtime (same exe). Check optix_runtime_status; "
             "starting the emulator now may hit a port conflict."
         )
-    elif state == "starting":
+    elif state in ("starting", "zombie"):
         out["hint"] = (
             f"Emulator process is up but :{port} isn't serving yet — still "
             "building, or hung. Wait/re-check before an optix_cdp_screenshot."
+        )
+    elif state == "demo_expired":
+        out["hint"] = (
+            "The FTOptix demo licence has expired — the emulator cannot run "
+            "until the licence is renewed or a full licence is applied."
         )
     return out
 
@@ -4594,6 +6889,51 @@ def _emulator_log_dir(project: str) -> Path:
         return Path(root) / project
     return (Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local")))
             / "Rockwell Automation" / "FactoryTalk Optix" / "Emulator" / "Log" / project)
+
+
+_BIND_FAIL_RE = re.compile(
+    r"(EADDRINUSE|[Aa]ddress already in use|[Ff]ailed to bind|"
+    r"[Cc]ould not bind|[Bb]ind.*[Ff]ailed|[Pp]ort.*(?:in use|already used)|"
+    r"[Ww]eb[Ss]erver.*(?:fail|error)|BindException|"
+    r"[Ss]ocket.*(?:bind|listen).*(?:fail|error))",
+    re.IGNORECASE,
+)
+_PORT_IN_LOG_RE = re.compile(r":(\d{2,5})\b")
+
+
+def _scan_bind_fail(project: str) -> dict | None:
+    """Scan the runtime log for a bind-fail signature.
+
+    Returns ``{"port": int|None, "holder": str}`` when a bind-failure line is
+    found in the most-recent FTOptixRuntime.*.log for ``project``, else
+    ``None``.  Only reads the last 64 KiB of the log (brief, non-held open).
+    """
+    log_dir = _emulator_log_dir(project)
+    if not log_dir.is_dir():
+        return None
+    candidates = sorted(
+        (p for p in log_dir.glob("FTOptixRuntime.*.log") if p.is_file()),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    if not candidates:
+        return None
+    log = candidates[0]
+    try:
+        with open(log, "rb") as fh:
+            sz = log.stat().st_size
+            tail_bytes = min(sz, 65536)
+            if tail_bytes < sz:
+                fh.seek(sz - tail_bytes)
+            data = fh.read(tail_bytes)
+        lines_text = data.decode("utf-8", errors="replace").splitlines()
+        for ln in reversed(lines_text):
+            if _BIND_FAIL_RE.search(ln):
+                m = _PORT_IN_LOG_RE.search(ln)
+                fail_port = int(m.group(1)) if m else None
+                return {"port": fail_port, "holder": ln.strip()}
+    except OSError:
+        pass
+    return None
 
 
 def runtime_log_tail(
@@ -4785,6 +7125,31 @@ def restart_emulator(
     A restart rebuilds; if that recompiled NetLogic it will have dropped the
     design-time bridge, so we attach a `bridge_note` recovery nudge when the
     bridge was working before but is unreachable after (see _bridge_drop_note)."""
+    # Invalidate the per-project web-port cache before the restart so the
+    # port is re-resolved from the live model / YAML after the bounce.
+    _invalidate_web_port_cache(project)
+    # MISMATCH GUARD: check BEFORE the stop action — stopping the wrong
+    # project's emulator is silent data loss on a multi-Studio box.
+    _running_entries = _emulator_entries()          # all instances, no project filter
+    for _re in _running_entries:
+        _resolved = _re.get("project_resolved")
+        if _resolved and _resolved.casefold() != project.casefold():
+            audit(cfg, "emulator_restart_refused_mismatch",
+                  project=project, resolved=_resolved)
+            return {
+                "ok": False,
+                "error": "runtime_project_mismatch",
+                "requested": project,
+                "resolved": _resolved,
+                "pid": _re["pid"],
+                "nudge": (
+                    f"The running emulator belongs to project '{_resolved}', not "
+                    f"'{project}'. Stop it first "
+                    f"(optix_emulator action='stop' project='{_resolved}'), then "
+                    "retry. The service will not stop or restart while another "
+                    "project's runtime is running."
+                ),
+            }
     st = emulator_status(cfg, runner)
     stopped = None
     if st.get("pids"):
@@ -4939,15 +7304,53 @@ def deploy_updatesvc(
 # original launcher lives in legacy/serve-deployed-bundle.ps1 + git history.
 
 
-def doctor(cfg: Config) -> dict:
+def _port_listener(port: int) -> dict | None:
+    """Return ``{"pid": int, "name": str}`` for the process listening on TCP
+    ``port``, or ``None`` when nothing is listening or on any access error.
+
+    Uses an in-process psutil scan (same approach as the bridge-PID helper).
+    """
+    try:
+        for c in psutil.net_connections(kind="tcp"):
+            if (c.status == psutil.CONN_LISTEN and c.laddr
+                    and c.laddr.port == port and c.pid):
+                try:
+                    name = psutil.Process(c.pid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    name = "?"
+                return {"pid": c.pid, "name": name}
+    except (psutil.Error, OSError):
+        pass
+    return None
+
+
+def doctor(cfg: Config, project: str | None = None) -> dict:
     """One-call dependency check for a layman: every prerequisite + a plain fix.
 
     Returns {ready, checks:[{name, ok, required, detail, fix}]}. `ready` is True
     when all REQUIRED checks pass (Studio + projects root); feature checks
     (bridge / cdp / deploy / session) are reported but gate only their own
     feature, with a plain-English fix for each red item.
+
+    (1.0.8) `project`, when given, adds one NON-required "project"
+    row reporting where that name resolved and WHICH source answered
+    (resolve_project_info's provenance: projects_root, or an out-of-root
+    directory proven open in Studio). This is the observable surface for the
+    fallback — "it resolved, but not from projects_root" is otherwise
+    invisible, and a failure here carries the resolved_from breadcrumb.
+
+    Also adds a NON-required "web_port" row (I28 rule 3)
+    with three structured fields: ``project_says`` (port the project's own
+    WebPresentationEngine is configured to use), ``service_expects`` (port
+    resolve_web_port() will actually use, including any OPTIX_RUNTIME_TEST_PORT
+    override), and ``listening`` (``{pid, name}`` of whatever process currently
+    holds that port, or ``None``).  ``ok`` is True when nothing unexpected
+    holds the port.  The ``fix`` text OFFERS (never acts) to unset a
+    conflicting OPTIX_RUNTIME_TEST_PORT.
+
+    A "web_engine_bind_failed" row is appended when the runtime log contains
+    a bind-failure signature; it carries ``port`` and ``holder`` fields.
     """
-    from urllib.parse import urlparse
     checks: list[dict] = []
 
     def add(name, ok, detail, fix, required=False):
@@ -4959,6 +7362,107 @@ def doctor(cfg: Config) -> dict:
         required=True)
     add("projects_root", cfg.projects_root.is_dir(), cfg.projects_root,
         "Create the projects folder, or set OPTIX_PROJECTS_ROOT.", required=True)
+
+    if project:
+        try:
+            _info = resolve_project_info(cfg, project)
+            add("project", True,
+                f"{_info['dir']} (resolved_from={_info['source']})",
+                "Nothing to fix. resolved_from=studio_process means this project "
+                "lives OUTSIDE the projects root and was matched to a directory a "
+                "running Studio has open — it resolves only while Studio holds it.")
+        except CoreError as _exc:
+            add("project", False, str(_exc),
+                "Put the project under the projects root, or open it in Studio "
+                "(optix_project action=\"open\") so it resolves from the running "
+                "Studio's command line.")
+
+        # ---- web_port three-way diagnosis (I28 rule 3) ----
+        # project_says: what the project's own WebPresentationEngine is configured
+        #               to use (bridge or file path only — no env/default fallback)
+        # service_expects: what resolve_web_port() will actually use (including
+        #                  OPTIX_RUNTIME_TEST_PORT override and default)
+        # listening: psutil scan of who currently holds the service_expects port
+        _wp_proj = _resolve_project_engine_port(cfg, project)
+        _wp_full = resolve_web_port(cfg, project)
+        _wp_expect_port = _wp_full["port"] if _wp_full["port"] is not None else 8081
+        _wp_listener = _port_listener(_wp_expect_port)
+
+        # ok = nothing holds the port, or the holder is the Optix runtime itself
+        _is_optix_proc = (
+            _wp_listener is not None
+            and "ftoptixruntime" in (_wp_listener.get("name") or "").lower()
+        )
+        _wp_ok = _wp_listener is None or _is_optix_proc
+
+        # Build fix — always OFFER (never act) to unset conflicting env override
+        _env_override = os.environ.get("OPTIX_RUNTIME_TEST_PORT")
+        _wp_fix_parts: list[str] = []
+        if _env_override and _wp_proj.get("source") == "project":
+            _wp_fix_parts.append(
+                f"OPTIX_RUNTIME_TEST_PORT={_env_override!r} is overriding the "
+                f"project's configured port {_wp_proj['port']}. "
+                "To let the project's port win, unset OPTIX_RUNTIME_TEST_PORT "
+                "(e.g. `Remove-Item Env:OPTIX_RUNTIME_TEST_PORT` in PowerShell "
+                "or `unset OPTIX_RUNTIME_TEST_PORT` in bash)."
+            )
+        if _wp_listener and not _is_optix_proc:
+            _wp_fix_parts.append(
+                f"Port :{_wp_expect_port} is held by "
+                f"{_wp_listener.get('name')} (pid {_wp_listener.get('pid')}) — "
+                "not the Optix runtime. Stop that process or change the project's "
+                "WebPresentationEngine Port property "
+                "(optix_bridge_ensure_web_engine) to a free port."
+            )
+        if not _wp_fix_parts:
+            _wp_fix_parts.append(
+                "Port is free or held by the Optix runtime. "
+                "If a squatter is suspected, check with optix_runtime_status."
+            )
+
+        checks.append({
+            "name": "web_port",
+            "ok": _wp_ok,
+            "required": False,
+            "detail": (
+                f"project_says={_wp_proj.get('port')!r} "
+                f"service_expects={_wp_expect_port!r} "
+                f"listening={_wp_listener!r}"
+            ),
+            "fix": " ".join(_wp_fix_parts),
+            "project_says": _wp_proj.get("port"),
+            "service_expects": _wp_expect_port,
+            "listening": _wp_listener,
+        })
+
+        # ---- web_engine_bind_failed: scan runtime log for bind errors -------
+        _bind_fail = _scan_bind_fail(project)
+        if _bind_fail is not None:
+            _bf_env = os.environ.get("OPTIX_RUNTIME_TEST_PORT")
+            _bf_fix = (
+                f"The runtime failed to bind port :{_bind_fail.get('port')}. "
+                "Stop the squatter process (see web_port.listening above) or "
+                "change the project's WebPresentationEngine port via "
+                "optix_bridge_ensure_web_engine."
+            )
+            if _bf_env:
+                _bf_fix += (
+                    f" OPTIX_RUNTIME_TEST_PORT={_bf_env!r} may be the source of "
+                    "the conflict — unset it to let the project's configured port "
+                    "take effect."
+                )
+            checks.append({
+                "name": "web_engine_bind_failed",
+                "ok": False,
+                "required": False,
+                "detail": (
+                    f"port={_bind_fail.get('port')!r} "
+                    f"holder={_bind_fail.get('holder')!r}"
+                ),
+                "fix": _bf_fix,
+                "port": _bind_fail.get("port"),
+                "holder": _bind_fail.get("holder"),
+            })
 
     # a single "bridge" row was ambiguous once
     # multi-instance support (v1.0.7) meant up to bridge_port_range ports
@@ -5042,7 +7546,12 @@ def doctor(cfg: Config) -> dict:
         "Run the service in an interactive logon session (session 1) so Studio/runtime "
         "launches and SendKeys save work.")
 
-    return {"ready": all(c["ok"] for c in checks if c["required"]), "checks": checks}
+    lifecycle = _read_service_lifecycle(cfg)
+    return {
+        "ready": all(c["ok"] for c in checks if c["required"]),
+        "checks": checks,
+        "service_lifecycle": lifecycle,
+    }
 
 
 def _tcp_probe(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -5331,7 +7840,7 @@ def runtime_start(
     bundled_exe = runtime_project_dir / "FTOptixApplication" / "FTOptixRuntime.exe"
     optix_path = runtime_project_dir / f"{project}.optix"
 
-    probe_port = int(port) if port is not None else cfg.runtime_test_port
+    probe_port = int(port) if port is not None else _project_web_port(cfg, project)
     timeout_seconds = float(timeout) if timeout is not None else 30.0
 
     if bundled_exe.is_file():
@@ -5492,6 +8001,7 @@ def ensure_chrome_cdp(
     a hint rather than looping.
     """
     from urllib.parse import urlparse
+
     from . import _cdp
     u = urlparse(cfg.cdp_url)
     host = u.hostname or "127.0.0.1"
@@ -5591,18 +8101,20 @@ def attach_mode(cfg: Config) -> bool:
     return bool(cfg.runtime_url)
 
 
-def runtime_base_url(cfg: Config) -> str:
+def runtime_base_url(cfg: Config, project: str | None = None) -> str:
     """The base URL of the Optix web runtime canvas CDP navigation points at.
 
     Attach mode (runtime_url set): that URL, trailing-slash normalized — may be
     https:// and/or non-loopback (chrome-cdp tolerates the self-signed runtime
     cert via --ignore-certificate-errors; see bootstrap/install-chrome-cdp.ps1).
-    Legacy: loopback on the runtime test port (byte-identical to the pre-U19
-    default)."""
+    Legacy: loopback on the project's WebPresentationEngine port when `project`
+    is given (resolved via ``_project_web_port``), else the global runtime test
+    port — byte-identical to the pre-I28 default when project is omitted."""
     if cfg.runtime_url:
         base = cfg.runtime_url
         return base if base.endswith("/") else base + "/"
-    return f"http://127.0.0.1:{cfg.runtime_test_port}/"
+    port = _project_web_port(cfg, project) if project else cfg.runtime_test_port
+    return f"http://127.0.0.1:{port}/"
 
 
 def runtime_probe_host(cfg: Config) -> str:
@@ -5627,16 +8139,396 @@ def runtime_probe_port(cfg: Config) -> int:
     return cfg.runtime_test_port
 
 
-def _runtime_verify_url(cfg: Config) -> str:
+def _runtime_verify_url(cfg: Config, project: str | None = None) -> str:
     """The URL the CDP runtime-verify tools point at by default: the Optix
-    runtime's web canvas. Loopback on the runtime test port in the legacy
-    (service-owned) case; the external runtime's URL in attach mode
-    (OPTIX_RUNTIME_URL set) — see runtime_base_url."""
-    return runtime_base_url(cfg)
+    runtime's web canvas. Loopback on the project's WebPresentationEngine port
+    when ``project`` is given; otherwise the global runtime test port (legacy).
+    The external runtime's URL in attach mode (OPTIX_RUNTIME_URL set) —
+    see runtime_base_url."""
+    return runtime_base_url(cfg, project)
+
+
+# ---------------------------------------------------------------------------
+# Per-project WebPresentationEngine port resolver (I28)
+# ---------------------------------------------------------------------------
+# Resolution order for resolve_web_port(cfg, project, explicit):
+#   1. explicit parameter                   → source="explicit"
+#   2. Project's WebPresentationEngine Port → source="project" | "no_engine"
+#      a. via armed bridge (describe_node "UI/WebPresentationEngine")
+#      b. offline parse of Nodes/UI/UI.yaml (no new YAML dependency)
+#   3. OPTIX_RUNTIME_TEST_PORT env var      → source="env_override"
+#   4. 8081 default                         → source="default"
+#
+# cfg.runtime_test_port is the env-override CARRIER (set by from_env) and is
+# NEVER mutated here (I28 rule 4). A project's Port property is NEVER edited
+# by this resolver (I28 rule 5).
+
+_WEB_PORT_CACHE: dict[str, tuple[float, dict]] = {}   # project → (cached_at, result)
+_WEB_PORT_CACHE_TTL: float = 30.0   # seconds
+
+_UNTRUSTED_VALUE_RE = re.compile(r'<untrusted[^>]*>(.*?)</untrusted>', re.DOTALL)
+_YAML_PORT_RE = re.compile(r"^\s*Port:\s*(\d+)\s*$")
+
+
+def _invalidate_web_port_cache(project: str) -> None:
+    """Drop the resolve_web_port TTL cache entry for `project`.
+
+    Called on run_emulator and restart_emulator so a port change made
+    between launches is re-read from the live model / YAML on the next
+    project-scoped call rather than being served from stale cache."""
+    _WEB_PORT_CACHE.pop(project, None)
+
+
+def reset_web_port_cache() -> None:
+    """Test hook: drop the entire resolve_web_port cache between cases."""
+    global _WEB_PORT_CACHE
+    _WEB_PORT_CACHE = {}
+
+
+def _engine_port_from_bridge_node(node: dict) -> int | None:
+    """Extract the integer Port from a describe_node response's properties list.
+
+    The bridge wraps property values in <untrusted source="bridge">…</untrusted>;
+    this helper unwraps that envelope before parsing the integer."""
+    for prop in node.get("properties", []):
+        if not isinstance(prop, dict) or prop.get("name") != "Port":
+            continue
+        raw = prop.get("value")
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        m = _UNTRUSTED_VALUE_RE.search(text)
+        if m:
+            text = m.group(1).strip()
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    return None
+
+
+def _engine_port_from_yaml_span(lines: list[str], span: Any) -> int | None:
+    """Scan lines within `span` (a NodeSpan from optix_model) for a Port: <int>
+    property.  Returns the port integer, or None if no readable Port is found."""
+    for i in range(span.start, span.end):
+        m = _YAML_PORT_RE.match(lines[i])
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+def _resolve_web_port_uncached(cfg: Config, project: str) -> dict:
+    """Uncached inner resolver — called by resolve_web_port after a cache miss.
+
+    Returns a {"port", "source", "detail"} dict.  Never raises; on any
+    unexpected error the function falls through to the env-override / default
+    levels rather than bubbling up an exception from port resolution."""
+    # ---- (2a) Bridge path ------------------------------------------------
+    _bridge_cfg = _bridge_cfg_for(cfg, project)
+    if _bridge_cfg is not None:
+        try:
+            node = describe_node(_bridge_cfg, project, "UI/WebPresentationEngine")
+            port = _engine_port_from_bridge_node(node)
+            if port is not None:
+                return {
+                    "port": port,
+                    "source": "project",
+                    "detail": f"bridge: UI/WebPresentationEngine Port={port}",
+                }
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": (
+                    "WebPresentationEngine found in live model but its Port "
+                    "property could not be read; use optix_bridge_ensure_web_engine"
+                ),
+            }
+        except NodeNotFound:
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": (
+                    "no WebPresentationEngine node under UI/ in live model; "
+                    "use optix_bridge_ensure_web_engine to add one"
+                ),
+            }
+        except Exception:
+            pass  # bridge error — fall through to file path
+
+    # ---- (2b) File path: offline parse of Nodes/UI/UI.yaml ---------------
+    try:
+        project_dir = resolve_project(cfg, project)
+        ui_yaml = project_dir / "Nodes" / "UI" / "UI.yaml"
+        if ui_yaml.is_file():
+            from . import optix_model as _om
+            lines = ui_yaml.read_bytes().decode("utf-8", errors="replace").splitlines()
+            for i, ln in enumerate(lines):
+                nm = _om._NAME_RE.match(ln)
+                if not nm:
+                    continue
+                span = _om._scan_node(lines, i, nm)
+                if span.node_type and "WebPresentation" in span.node_type:
+                    port = _engine_port_from_yaml_span(lines, span)
+                    if port is not None:
+                        return {
+                            "port": port,
+                            "source": "project",
+                            "detail": f"file: Nodes/UI/UI.yaml Port={port}",
+                        }
+                    return {
+                        "port": None,
+                        "source": "no_engine",
+                        "detail": (
+                            "WebPresentationEngine in Nodes/UI/UI.yaml has no "
+                            "readable Port property; use optix_bridge_ensure_web_engine"
+                        ),
+                    }
+            # UI.yaml exists but no engine node found
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": (
+                    "Nodes/UI/UI.yaml has no WebPresentationEngine node; "
+                    "use optix_bridge_ensure_web_engine to add one"
+                ),
+            }
+    except Exception:
+        pass  # can't read project — fall through to env/default
+
+    # ---- (3) OPTIX_RUNTIME_TEST_PORT env var (operator override) ----------
+    env_port = os.environ.get("OPTIX_RUNTIME_TEST_PORT")
+    if env_port:
+        try:
+            p = int(env_port)
+            return {
+                "port": p,
+                "source": "env_override",
+                "detail": f"OPTIX_RUNTIME_TEST_PORT={env_port}",
+            }
+        except ValueError:
+            pass
+
+    # ---- (4) Hard default -------------------------------------------------
+    return {
+        "port": 8081,
+        "source": "default",
+        "detail": "no project port configured and no env override; using default 8081",
+    }
+
+
+def _resolve_project_engine_port(cfg: Config, project: str) -> dict:
+    """Resolve the project's own WebPresentationEngine port (bridge/file path only).
+
+    Mirrors steps 2a and 2b of ``_resolve_web_port_uncached`` but does NOT
+    fall through to the env-override or default levels — the intent is to
+    report exactly what the PROJECT has configured, independent of any
+    operator overrides.
+
+    Returns ``{"port": int|None, "source": str, "detail": str}`` where
+    ``source`` is one of:
+
+    * ``"project"``   — a readable Port was found in the project tree
+    * ``"no_engine"`` — the project's UI tree has no WebPresentationEngine
+    * ``"unknown"``   — bridge is down AND the project file is unreadable;
+                        port resolution fell back to env/default silently
+    """
+    # (2a) Bridge path
+    _bridge_cfg = _bridge_cfg_for(cfg, project)
+    if _bridge_cfg is not None:
+        try:
+            node = describe_node(_bridge_cfg, project, "UI/WebPresentationEngine")
+            port = _engine_port_from_bridge_node(node)
+            if port is not None:
+                return {
+                    "port": port,
+                    "source": "project",
+                    "detail": f"bridge: UI/WebPresentationEngine Port={port}",
+                }
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": (
+                    "WebPresentationEngine found in live model but its Port "
+                    "property could not be read"
+                ),
+            }
+        except NodeNotFound:
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": "no WebPresentationEngine node under UI/ in live model",
+            }
+        except Exception:
+            pass  # bridge error — fall through to file path
+
+    # (2b) File path: offline parse of Nodes/UI/UI.yaml
+    try:
+        project_dir = resolve_project(cfg, project)
+        ui_yaml = project_dir / "Nodes" / "UI" / "UI.yaml"
+        if ui_yaml.is_file():
+            from . import optix_model as _om
+            lines = ui_yaml.read_bytes().decode("utf-8", errors="replace").splitlines()
+            for i, ln in enumerate(lines):
+                nm = _om._NAME_RE.match(ln)
+                if not nm:
+                    continue
+                span = _om._scan_node(lines, i, nm)
+                if span.node_type and "WebPresentation" in span.node_type:
+                    port = _engine_port_from_yaml_span(lines, span)
+                    if port is not None:
+                        return {
+                            "port": port,
+                            "source": "project",
+                            "detail": f"file: Nodes/UI/UI.yaml Port={port}",
+                        }
+                    return {
+                        "port": None,
+                        "source": "no_engine",
+                        "detail": (
+                            "WebPresentationEngine in Nodes/UI/UI.yaml has no "
+                            "readable Port property"
+                        ),
+                    }
+            return {
+                "port": None,
+                "source": "no_engine",
+                "detail": "Nodes/UI/UI.yaml has no WebPresentationEngine node",
+            }
+    except Exception:
+        pass
+
+    return {
+        "port": None,
+        "source": "unknown",
+        "detail": "bridge down and project file unreadable; port source is unknown",
+    }
+
+
+def resolve_web_port(
+    cfg: Config,
+    project: str,
+    explicit: int | None = None,
+) -> dict:
+    """Resolve the WebPresentationEngine TCP port for `project`.
+
+    Returns ``{"port": int | None, "source": str, "detail": str}``
+    where ``source`` is one of:
+
+    * ``"explicit"``     — caller supplied an explicit port (highest priority)
+    * ``"project"``      — read from the project's WebPresentationEngine node
+    * ``"no_engine"``    — project confirmed to have no engine; port is None
+    * ``"env_override"`` — OPTIX_RUNTIME_TEST_PORT env var is set
+    * ``"default"``      — fallback default 8081
+
+    Resolution order (first match wins):
+
+    1. ``explicit`` parameter.
+    2. Project's WebPresentationEngine Port — via the armed design-time bridge
+       (``describe_node("UI/WebPresentationEngine")``) when Studio is open,
+       or offline parse of ``Nodes/UI/UI.yaml`` using the existing
+       ``optix_model`` regex reader (no new YAML dependency).  A project
+       whose UI tree has no engine node returns ``port=None,
+       source="no_engine"`` with a ``detail`` nudge naming
+       ``optix_bridge_ensure_web_engine``.
+    3. ``OPTIX_RUNTIME_TEST_PORT`` env var — logged as an explicit operator
+       override (``source="env_override"``).
+    4. Hard default 8081 (``source="default"``).
+
+    Results for sources 2–4 are cached per project for ``_WEB_PORT_CACHE_TTL``
+    seconds.  The cache is invalidated by ``_invalidate_web_port_cache(project)``
+    on ``run_emulator`` and ``restart_emulator`` so a port change made between
+    launches is picked up.
+
+    ``cfg.runtime_test_port`` is the env-override carrier (populated by
+    ``Config.from_env``) and is NEVER mutated here (I28 rule 4).  A project's
+    Port property is NEVER edited by this resolver (I28 rule 5).
+    """
+    # (1) Explicit parameter — ephemeral; not cached
+    if explicit is not None:
+        return {
+            "port": int(explicit),
+            "source": "explicit",
+            "detail": f"caller-supplied port {int(explicit)}",
+        }
+
+    # (2)–(4) Check TTL cache
+    now = time.time()
+    cached = _WEB_PORT_CACHE.get(project)
+    if cached is not None and (now - cached[0]) < _WEB_PORT_CACHE_TTL:
+        return cached[1]
+
+    result = _resolve_web_port_uncached(cfg, project)
+    _WEB_PORT_CACHE[project] = (now, result)
+    return result
+
+
+def _project_web_port(cfg: Config, project: str) -> int:
+    """Convenience wrapper: resolve_web_port and return the integer port,
+    falling back to ``runtime_probe_port(cfg)`` when resolution yields
+    ``None`` (no_engine or unresolvable).  Use this instead of
+    ``cfg.runtime_test_port`` in project-scoped functions."""
+    resolved = resolve_web_port(cfg, project)
+    port = resolved.get("port")
+    return port if port is not None else runtime_probe_port(cfg)
+
+
+def _maybe_follow_port(cfg: Config, project: str | None) -> dict | None:
+    """Self-heal port-follow: if the expected project web-port is dead but the
+    emulator process is alive, re-resolve (bypassing the stale cache) and
+    redirect to the port the emulator is actually serving.
+
+    Returns ``{"expected": int, "actual": int, "project": str}`` when a
+    follow occurred, ``None`` otherwise.  Never raises; exceptions are
+    swallowed so the caller proceeds unchanged.
+
+    Algorithm (I28 rule 2):
+      1. Resolve the expected port (may come from TTL cache).
+      2. TCP-probe the expected port — if reachable, nothing to do.
+      3. Check ``_emulator_pids()`` — if the emulator is dead, don't follow.
+      4. Invalidate the TTL cache and re-resolve fresh.
+      5. TCP-probe the freshly resolved port.
+      6. If alive and different: emit a loud stderr log line and return info.
+    """
+    if project is None:
+        return None
+    if attach_mode(cfg):
+        # Attach mode points at an external runtime URL; emulator tracking
+        # doesn't apply.
+        return None
+    try:
+        host = runtime_probe_host(cfg)
+        expected_port = _project_web_port(cfg, project)
+        if _tcp_probe(host, expected_port):
+            return None  # expected port is live — nothing to do
+        if not _emulator_pids():
+            return None  # emulator is not running; can't follow
+        # Cache may be stale — bust it and re-resolve
+        _invalidate_web_port_cache(project)
+        fresh = resolve_web_port(cfg, project)
+        actual_port = fresh.get("port")
+        if actual_port is None or actual_port == expected_port:
+            return None  # re-resolver found the same (or no) port
+        if not _tcp_probe(host, actual_port):
+            return None  # newly resolved port is also dead
+        import sys
+        print(
+            f"[ftx-mcp] {project} serves :{actual_port}, "
+            f"expected :{expected_port} — following the project",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"expected": expected_port, "actual": actual_port,
+                "project": project}
+    except Exception:
+        return None  # never crash the caller
 
 
 def _point_screenshot_at_runtime(
-    cfg: Config, sess: Any, navigate_url: str | None, settle: float
+    cfg: Config, sess: Any, navigate_url: str | None, settle: float,
+    project: str | None = None,
 ) -> bool:
     """Point the CDP page for a screenshot and return whether we navigated.
 
@@ -5647,15 +8539,22 @@ def _point_screenshot_at_runtime(
         already on it — re-navigating would reload the Optix SPA and lose any
         prior click/nav state.
       - navigate_url == "": never navigate (screenshot the current tab as-is).
+
+    When ``project`` is supplied the URL is resolved via the project's
+    ``WebPresentationEngine`` port (``_runtime_verify_url`` → ``_project_web_port``).
+
+    Note: this helper does NOT sleep after navigation. The settle sleep is
+    applied unconditionally by the caller (cdp_screenshot_runtime) before
+    capture, so the total settle fires exactly once regardless of whether a
+    navigation occurred.
     """
     if navigate_url == "":
         return False
     if navigate_url:
         sess.navigate(navigate_url)
-        time.sleep(max(0.0, settle))
         return True
     # Auto-target the runtime; skip the reload if we're already there.
-    target = _runtime_verify_url(cfg)
+    target = _runtime_verify_url(cfg, project)
     origin = target.rstrip("/")
     try:
         current = sess.current_url()
@@ -5664,24 +8563,27 @@ def _point_screenshot_at_runtime(
     if current.startswith(origin):
         return False
     sess.navigate(target)
-    time.sleep(max(0.0, settle))
     return True
 
 
 def _navigate_if_given(sess: Any, navigate_url: str | None, settle: float) -> bool:
-    """Navigate ONLY when an explicit truthy URL is given, then settle; return
-    whether we navigated. Shared by cdp_click/type/key_runtime.
+    """Navigate ONLY when an explicit truthy URL is given; return whether we
+    navigated. Shared by cdp_click/type/key_runtime.
 
     Deliberately NOT `_point_screenshot_at_runtime`: that helper auto-navigates
     to the runtime URL when navigate_url is None, whereas click/type/key must do
     NOTHING without an explicit URL (they act on whatever the tab currently
     shows — re-navigating would wipe prior click/focus state). The regression
     guard is test_cdp.py::test_cdp_click_sends_trusted_mouse_sequence
-    (asserts navigated is False with no URL)."""
+    (asserts navigated is False with no URL).
+
+    Note: this helper does NOT sleep after navigation. The settle sleep is
+    applied unconditionally by the caller after the dispatch, so the total
+    settle fires exactly once regardless of whether a navigation occurred.
+    """
     if not navigate_url:
         return False
     sess.navigate(navigate_url)
-    time.sleep(max(0.0, settle))
     return True
 
 
@@ -5696,7 +8598,13 @@ def cdp_click_runtime(
     hit-tester. When navigate_url is given, the page is pointed there first and
     given settle_seconds to load the Optix canvas before the click (clicking
     mid-navigation fails). Otherwise it clicks whatever Chrome currently shows.
-    Returns {state, x, y, navigated, clicked_at}.
+
+    (x, y) may be normalized viewport fractions (both <= 1.0, resolved via
+    sess.viewport_size()) or absolute CSS pixels (either > 1.0, passed through
+    unchanged).  Out-of-frame points return state:"failed", error:"bad_point".
+
+    Returns {state, x, y, css_x, css_y, viewport:{w,h}, coords, navigated,
+    clicked_at} on success, or {state:"failed", error, ...} on failure.
     """
     audit(cfg, "cdp_click", x=x, y=y)
     from . import _cdp
@@ -5704,9 +8612,25 @@ def cdp_click_runtime(
     sess = _cdp_session(cfg)
     try:
         navigated = _navigate_if_given(sess, navigate_url, settle)
-        sess.click(float(x), float(y))
+        sess.set_viewport(cfg.cdp_viewport_width, cfg.cdp_viewport_height,
+                          cfg.cdp_viewport_scale)
+        px_point, perr = _resolve_point(sess, [x, y])
+        if perr is not None:
+            return {
+                "state": "failed", "error": "bad_point", "detail": perr,
+                "x": float(x), "y": float(y),
+                "navigated": navigated, "clicked_at": _now_iso(),
+            }
+        css_x, css_y = px_point
+        vp_w, vp_h = sess.viewport_size()
+        coords = "normalized" if (float(x) <= 1.0 and float(y) <= 1.0) else "absolute"
+        sess.click(css_x, css_y)
+        time.sleep(max(0.0, settle))
         return {
             "state": "succeeded", "x": float(x), "y": float(y),
+            "css_x": css_x, "css_y": css_y,
+            "viewport": {"w": vp_w, "h": vp_h},
+            "coords": coords,
             "navigated": navigated, "clicked_at": _now_iso(), "error": None,
         }
     except _cdp.CDPError as e:
@@ -5750,6 +8674,7 @@ def cdp_type_runtime(
                          "(its cursor/selection confirms focus), then type"),
             }
         sess.insert_text(text)
+        time.sleep(max(0.0, settle))
         return {
             "state": "succeeded", "typed_chars": len(text),
             "active_element": tag, "navigated": navigated,
@@ -5766,6 +8691,7 @@ def cdp_fill_runtime(
     cfg: Config, x: float, y: float, text: str,
     submit: str | None = "Enter", select_all: bool = True,
     navigate_url: str | None = None, settle_seconds: float | None = None,
+    project: str | None = None,
 ) -> dict:
     """One-call field update: click (x, y) -> focus guard -> (select-all) ->
     type -> commit. The composite for the click/type/Enter trio so a single
@@ -5777,8 +8703,14 @@ def cdp_fill_runtime(
     without committing. The focus guard fails loud (no_focused_input) with the
     per-step report, so a click that landed on a non-editable region names
     itself. Auto-targets the running HMI when navigate_url is omitted (pass
-    "" to act on the current tab as-is). Returns {state, steps: {clicked,
-    focused_element, typed_chars, committed}, x, y, filled_at}.
+    "" to act on the current tab as-is).
+
+    (x, y) may be normalized viewport fractions (both <= 1.0, resolved via
+    sess.viewport_size()) or absolute CSS pixels (either > 1.0, passed through
+    unchanged).  Out-of-frame points return state:"failed", error:"bad_point".
+
+    Returns {state, steps: {clicked, focused_element, typed_chars, committed},
+    x, y, css_x, css_y, viewport:{w,h}, coords, filled_at} on success.
     """
     audit(cfg, "cdp_fill", x=x, y=y, text=text)
     from . import _cdp
@@ -5786,6 +8718,7 @@ def cdp_fill_runtime(
         return {"state": "failed", "error": "invalid_key", "submit": submit,
                 "valid_keys": sorted(_cdp.KEY_MAP)}
     settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
+    port_follow = _maybe_follow_port(cfg, project)
     steps: dict = {"clicked": False, "focused_element": None,
                    "typed_chars": 0, "committed": None}
     sess = _cdp_session(cfg)
@@ -5793,8 +8726,20 @@ def cdp_fill_runtime(
         # Auto-target the runtime like optix_cdp_screenshot does — fill is
         # designed to be callable cold, and a fresh chrome-cdp tab sits on
         # about:blank where a click can never focus a field.
-        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle)
-        sess.click(float(x), float(y))
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle, project)
+        sess.set_viewport(cfg.cdp_viewport_width, cfg.cdp_viewport_height,
+                          cfg.cdp_viewport_scale)
+        px_point, perr = _resolve_point(sess, [x, y])
+        if perr is not None:
+            return {
+                "state": "failed", "error": "bad_point", "detail": perr,
+                "steps": steps, "x": float(x), "y": float(y),
+                "navigated": navigated,
+            }
+        css_x, css_y = px_point
+        vp_w, vp_h = sess.viewport_size()
+        coords = "normalized" if (float(x) <= 1.0 and float(y) <= 1.0) else "absolute"
+        sess.click(css_x, css_y)
         steps["clicked"] = True
         time.sleep(0.3)  # let the canvas move focus into its input overlay
         tag = sess.active_element_tag()
@@ -5803,9 +8748,9 @@ def cdp_fill_runtime(
             return {"state": "failed", "error": "no_focused_input",
                     "steps": steps, "x": float(x), "y": float(y),
                     "navigated": navigated,
-                    "hint": ("the click at ({}, {}) did not focus an editable "
+                    "hint": (f"the click at ({x}, {y}) did not focus an editable "
                              "field — check coordinates against a fresh "
-                             "screenshot".format(x, y))}
+                             "screenshot")}
         if select_all:
             sess.select_all()
         sess.insert_text(text)
@@ -5813,9 +8758,19 @@ def cdp_fill_runtime(
         if submit:
             sess.key(submit)
             steps["committed"] = submit
-        return {"state": "succeeded", "steps": steps, "x": float(x),
-                "y": float(y), "navigated": navigated,
-                "filled_at": _now_iso(), "error": None}
+        time.sleep(max(0.0, settle))
+        out: dict[str, Any] = {
+            "state": "succeeded", "steps": steps, "x": float(x),
+            "y": float(y), "css_x": css_x, "css_y": css_y,
+            "viewport": {"w": vp_w, "h": vp_h}, "coords": coords,
+            "navigated": navigated,
+            "filled_at": _now_iso(), "error": None,
+        }
+        if port_follow is not None:
+            out["port_followed"] = (
+                f":{port_follow['expected']}→:{port_follow['actual']}"
+            )
+        return out
     except _cdp.CDPError as e:
         return {"state": "failed", "error": str(e), "steps": steps,
                 "x": float(x), "y": float(y), "filled_at": _now_iso()}
@@ -5845,6 +8800,7 @@ def cdp_key_runtime(
     try:
         navigated = _navigate_if_given(sess, navigate_url, settle)
         sess.key(key)
+        time.sleep(max(0.0, settle))
         return {"state": "succeeded", "key": key, "navigated": navigated,
                 "pressed_at": _now_iso(), "error": None}
     except _cdp.CDPError as e:
@@ -5932,6 +8888,7 @@ def cdp_screenshot_runtime(
     cfg: Config, save_path: str | None = None, quality: int = 65,
     navigate_url: str | None = None, settle_seconds: float | None = None,
     fresh: bool = False, region: list[float] | None = None,
+    project: str | None = None,
 ) -> dict:
     """Capture the runtime canvas via CDP Page.captureScreenshot (JPEG).
 
@@ -5993,11 +8950,13 @@ def cdp_screenshot_runtime(
     None when no region was requested).
     """
     import base64
+
     from . import _cdp
     settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
+    port_follow = _maybe_follow_port(cfg, project)
     sess = _cdp_session(cfg)
     try:
-        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle)
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle, project)
         if fresh and not navigated:
             # force a reload so a stale frame can never masquerade as current
             # (the auto-target skips re-navigation when already on the runtime).
@@ -6007,6 +8966,11 @@ def cdp_screenshot_runtime(
             sess.reload(ignore_cache=True)
             time.sleep(max(0.0, settle))
             navigated = True
+        # Unconditional settle before capture — fires regardless of whether a
+        # navigation occurred (including the already-on-origin no-nav case).
+        # _point_screenshot_at_runtime no longer sleeps, so the total settle
+        # is applied exactly once here.
+        time.sleep(max(0.0, settle))
         # Deliberately AFTER navigate, BEFORE region resolution/capture: a
         # region resolved against the pre-override viewport would be wrong,
         # and a capture taken before the override is applied is the exact
@@ -6026,7 +8990,7 @@ def cdp_screenshot_runtime(
             if prev is not None and prev == digest:
                 sess.close()
                 sess = _cdp_session(cfg)
-                recover_target = navigate_url or _runtime_verify_url(cfg)
+                recover_target = navigate_url or _runtime_verify_url(cfg, project)
                 sess.navigate(recover_target)
                 sess.reload(ignore_cache=True)
                 time.sleep(max(0.0, settle))
@@ -6055,6 +9019,10 @@ def cdp_screenshot_runtime(
                     "(or is not repainting at all). Check optix_emulator(action='status') "
                     "for a wedged process before assuming the edit failed to apply."
                 )
+        if port_follow is not None:
+            result["port_followed"] = (
+                f":{port_follow['expected']}→:{port_follow['actual']}"
+            )
         if save_path:
             out = Path(save_path)
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -6161,6 +9129,7 @@ def _ocr_confidence_fields(cfg: Config, words: list[dict]) -> dict:
 def _ocr_capture(
     cfg: Config, *, navigate_url: str | None, settle_seconds: float | None,
     psm: int, runner: Runner, region: list[float] | None, include_region: bool,
+    project: str | None = None,
 ) -> dict:
     """Shared capture+OCR for cdp_ocr_runtime / cdp_read_text_runtime.
 
@@ -6182,7 +9151,7 @@ def _ocr_capture(
         img = Path(td) / "runtime.jpg"
         shot = cdp_screenshot_runtime(
             cfg, save_path=str(img), navigate_url=navigate_url,
-            settle_seconds=settle_seconds, region=region,
+            settle_seconds=settle_seconds, region=region, project=project,
         )
         if shot.get("state") != "succeeded":
             out = {
@@ -6230,7 +9199,7 @@ def _ocr_capture(
 def cdp_ocr_runtime(
     cfg: Config, navigate_url: str | None = None,
     settle_seconds: float | None = None, *, psm: int = 6,
-    runner: Runner = _DEFAULT_RUNNER,
+    runner: Runner = _DEFAULT_RUNNER, project: str | None = None,
 ) -> dict:
     """OCR the runtime canvas via tesseract — an OPT-IN, headless read-back fallback.
 
@@ -6252,14 +9221,14 @@ def cdp_ocr_runtime(
     """
     return _ocr_capture(
         cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
-        psm=psm, runner=runner, region=None, include_region=False,
+        psm=psm, runner=runner, region=None, include_region=False, project=project,
     )
 
 
 def cdp_read_text_runtime(
     cfg: Config, region: list[float] | None = None,
     navigate_url: str | None = None, settle_seconds: float | None = None,
-    *, psm: int = 6, runner: Runner = _DEFAULT_RUNNER,
+    *, psm: int = 6, runner: Runner = _DEFAULT_RUNNER, project: str | None = None,
 ) -> dict:
     """OCR a region (or the full frame) of the runtime canvas via tesseract —
     THE cheap check for "does the screen/widget say X", zero vision tokens.
@@ -6279,7 +9248,7 @@ def cdp_read_text_runtime(
     """
     return _ocr_capture(
         cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
-        psm=psm, runner=runner, region=region, include_region=True,
+        psm=psm, runner=runner, region=region, include_region=True, project=project,
     )
 
 
@@ -6301,7 +9270,7 @@ def _parse_tesseract_tsv(tsv: str) -> list[dict]:
         cols = line.split("\t")
         if len(cols) < len(header):
             continue
-        row = dict(zip(header, cols))
+        row = dict(zip(header, cols, strict=False))
         if row.get("level") != "5":
             continue
         text = row.get("text", "")
@@ -6348,7 +9317,7 @@ def _match_tsv_words(words: list[dict], query: str) -> list[dict]:
                 (a["block_num"], a["par_num"], a["line_num"]) ==
                 (b["block_num"], b["par_num"], b["line_num"])
                 and b["word_num"] == a["word_num"] + 1
-                for a, b in zip(window, window[1:])
+                for a, b in zip(window, window[1:], strict=False)
             )
             if not adjacent:
                 continue
@@ -6400,6 +9369,7 @@ def _ocr_css_scale(
 def cdp_find_text_runtime(
     cfg: Config, text: str, navigate_url: str | None = None,
     settle_seconds: float | None = None, runner: Runner = _DEFAULT_RUNNER,
+    project: str | None = None,
 ) -> dict:
     """Locate `text` on the runtime canvas via tesseract TSV word boxes — to
     click a labeled control (center_px feeds cdp_click_runtime directly) or
@@ -6434,9 +9404,10 @@ def cdp_find_text_runtime(
         }
     audit(cfg, "cdp_find_text", text=text)
     settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
+    port_follow = _maybe_follow_port(cfg, project)
     sess = _cdp_session(cfg)
     try:
-        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle)
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle, project)
         vp_w, vp_h = sess.viewport_size()
         jpeg = sess.screenshot_jpeg()
     except _cdp.CDPError as e:
@@ -6483,11 +9454,16 @@ def cdp_find_text_runtime(
             "bbox_px": [x, y, w, h], "bbox_norm": bbox_norm,
             "center_px": [x + w / 2, y + h / 2],
         })
-    return {
+    out = {
         "state": "succeeded", "found": bool(result_matches),
         "matches": result_matches, "viewport": {"w": vp_w, "h": vp_h},
         "navigated": navigated, "captured_at": _now_iso(),
     }
+    if port_follow is not None:
+        out["port_followed"] = (
+            f":{port_follow['expected']}→:{port_follow['actual']}"
+        )
+    return out
 
 
 # ---- cdp_navigate: blind navigation to a banked route (S5) ------------
@@ -6815,6 +9791,7 @@ def _run_route_steps(
 def cdp_navigate_runtime(
     cfg: Config, route: str, routes_path: str, expect: bool = True,
     navigate_url: str | None = None, runner: Runner = _DEFAULT_RUNNER,
+    project: str | None = None,
 ) -> dict:
     """Blind-navigate the runtime canvas through a banked sequence of clicks
     from a routes JSON file — zero screenshots to get to a known screen.
@@ -6884,10 +9861,11 @@ def cdp_navigate_runtime(
         if tesseract is None:
             ocr_unavailable = True
 
+    port_follow = _maybe_follow_port(cfg, project)
     sess = _cdp_session(cfg)
     progress = {"steps_run": 0, "verified_steps": 0}
     try:
-        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default)
+        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default, project)
         steps_run, verified_steps, run_err = _run_route_steps(
             sess, steps, expect=expect, settle_default=settle_default,
             tesseract=tesseract, ocr_unavailable=ocr_unavailable, runner=runner,
@@ -6904,6 +9882,10 @@ def cdp_navigate_runtime(
         if ocr_unavailable:
             result["ocr_unavailable"] = True
             result["hint"] = _tesseract_missing_hint()
+        if port_follow is not None:
+            result["port_followed"] = (
+                f":{port_follow['expected']}→:{port_follow['actual']}"
+            )
         return result
     except _cdp.CDPError as e:
         return {"state": "failed", "error": str(e), "route": route,
@@ -6927,7 +9909,7 @@ def _sanitize_route_filename(route: str) -> str:
 def cdp_sweep_runtime(
     cfg: Config, routes_path: str, out_dir: str, routes: list[str] | None = None,
     warmup: bool = True, navigate_url: str | None = None,
-    runner: Runner = _DEFAULT_RUNNER,
+    runner: Runner = _DEFAULT_RUNNER, project: str | None = None,
 ) -> dict:
     """Capture a full-frame screenshot (+ OCR text, if tesseract is
     installed) of every route in a banked routes file, in ONE CDP session —
@@ -6990,7 +9972,7 @@ def cdp_sweep_runtime(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     settle_default = cfg.cdp_settle_seconds
-    target = navigate_url if navigate_url else _runtime_verify_url(cfg)
+    target = navigate_url if navigate_url else _runtime_verify_url(cfg, project)
     reload_between = navigate_url != ""
     tesseract = _find_tesseract()
 
@@ -7000,7 +9982,7 @@ def cdp_sweep_runtime(
 
     sess = _cdp_session(cfg)
     try:
-        _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default)
+        _point_screenshot_at_runtime(cfg, sess, navigate_url, settle_default, project)
         vp_w, vp_h = sess.viewport_size()
         for idx, route in enumerate(selected):
             route_def = all_routes[route]
@@ -7503,19 +10485,35 @@ def verify_export_mtime(cfg: Config, runtime_project_dir: Path, deploy_started_a
     return _poll_until(cfg, deploy_started_at, "export_mtime", _probe)
 
 
-def verify_runtime_probe(cfg: Config, _runtime_project_dir: Path, deploy_started_at: float) -> dict:
+def verify_runtime_probe(
+    cfg: Config,
+    _runtime_project_dir: Path,
+    deploy_started_at: float,
+    *,
+    project: str | None = None,
+) -> dict:
     """Verify the runtime port comes back up after a bounce.
 
-    Polls cfg.runtime_test_port for tcp_reachable. The runtime was stopped
+    Polls the project's WebPresentationEngine port (via ``_project_web_port``
+    when ``project`` is supplied) for tcp_reachable. The runtime was stopped
     before the swap and (re)started after, so a successful connect is the
     end-to-end signal the deploy actually landed and the runtime is happy.
 
-    `_runtime_project_dir` is unused but REQUIRED for signature parity with
-    verify_export_mtime — deploy() selects between the two by function
-    reference and calls positionally (cfg, runtime_project_dir, started_at).
+    ``project`` is bound by ``deploy()`` via ``functools.partial`` so the
+    project-specific port is used rather than the global ``cfg.runtime_test_port``
+    default.
+
+    ``_runtime_project_dir`` is REQUIRED for signature parity with
+    ``verify_export_mtime`` — ``deploy()`` calls positionally
+    ``(cfg, runtime_project_dir, started_at)`` after the partial bind.
     """
     def _probe() -> tuple[bool, str | None]:
-        if _tcp_probe(runtime_probe_host(cfg), runtime_probe_port(cfg), timeout=0.5):
+        port = (
+            _project_web_port(cfg, project)
+            if project is not None
+            else runtime_probe_port(cfg)
+        )
+        if _tcp_probe(runtime_probe_host(cfg), port, timeout=0.5):
             return True, _now_iso()
         return False, None
     return _poll_until(cfg, deploy_started_at, "runtime_probe", _probe)
@@ -7659,7 +10657,9 @@ def deploy_preflight(
             checks["git"] = {"is_repo": None}
 
     # 7. Runtime port — TCP probe (informational; absence is normal pre-bounce)
-    runtime_port = runtime_probe_port(cfg)
+    # Use the project's own WebPresentationEngine port (via resolver) rather
+    # than the global runtime_probe_port so a per-project port shows up here.
+    runtime_port = _project_web_port(cfg, project)
     reachable = _tcp_probe(runtime_probe_host(cfg), runtime_port, timeout=1.0)
     checks["runtime"] = {
         "port": runtime_port,
@@ -7888,7 +10888,11 @@ def deploy(
     if runtime is None:
         runtime = RuntimeController(runner=runner)
     if verify is None:
-        verify = verify_runtime_probe if req.run_after_deploy else verify_export_mtime
+        if req.run_after_deploy:
+            import functools
+            verify = functools.partial(verify_runtime_probe, project=project)
+        else:
+            verify = verify_export_mtime
 
     started_at = time.time()
     started_iso = _now_iso(started_at)

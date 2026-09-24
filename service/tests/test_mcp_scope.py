@@ -124,3 +124,24 @@ def test_unauthenticated_dispatch_is_not_scope_gated(cfg: core.Config) -> None:
     out = _call(mcp, "optix_list_skills", {})
     # call_tool returns content/tuple; the point is it did NOT raise.
     assert out is not None
+
+
+# ---- optix_bridge_edit scope pin ---------------------------
+
+def test_bridge_edit_scope_is_author() -> None:
+    """optix_bridge_edit must stay in the 'author' tier of auth.TOOL_SCOPES.
+
+    It dispatches the same bridge writes as the individual per-noun tools
+    (set_property, bind, create_widget, ...), so it must not widen to 'deploy'
+    (which would block live-authoring tokens from using it) and must not narrow
+    to 'read' (which would let read-only tokens drive model mutations).
+
+    Static pin — a change to this scope must pass a conscious review, not
+    slip through as a side-effect of table reordering.
+    """
+    assert auth.TOOL_SCOPES["optix_bridge_edit"] == "author", (
+        f"optix_bridge_edit scope changed from 'author' to "
+        f"{auth.TOOL_SCOPES.get('optix_bridge_edit')!r}; "
+        "update auth.TOOL_SCOPES only after reviewing the impact on "
+        "live-authoring tokens"
+    )

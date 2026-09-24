@@ -148,6 +148,18 @@ def make_app(cfg: core.Config) -> FastAPI:
             cfg, project, path, start_line=start_line, end_line=end_line
         )
 
+    @app.get("/projects/{project}/netlogic/{cls}")
+    def read_netlogic_endpoint(
+        project: str,
+        cls: str,
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> dict:
+        """Read a NetLogic .cs file from ProjectFiles/NetSolution/<cls>.cs."""
+        return core.read_netlogic(
+            cfg, project, cls, start_line=start_line, end_line=end_line
+        )
+
     @app.get("/projects/{project}/find")
     def find_endpoint(
         project: str,
@@ -249,8 +261,12 @@ def make_app(cfg: core.Config) -> FastAPI:
     # --- v1.0 capabilities: doctor / save / UpdateSvc deploy / serve / bridge ---
 
     @app.get("/doctor")
-    def doctor_endpoint() -> dict:
-        return core.doctor(cfg)
+    def doctor_endpoint(project: str | None = None) -> dict:
+        # `project` is optional: with it, doctor adds a row saying where the
+        # name resolved and which source answered (projects_root, or a
+        # directory proven open in Studio) — the observable surface for the
+        # out-of-root fallback.
+        return core.doctor(cfg, project=project)
 
     # Tool catalog for the console — built from the live MCP registry so the
     # UI can never drift from the real tool surface (names, one-line summary

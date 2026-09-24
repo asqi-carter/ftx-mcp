@@ -87,6 +87,68 @@ class TestGitLogEndpoint:
         assert any("-n5" in c for c in log_calls)
 
 
+class TestReadNetlogicEndpoint:
+    """HTTP surface for GET /projects/{project}/netlogic/{cls}."""
+
+    def _make_netlogic(self, projects_root: Path, project: str, cls: str, content: bytes) -> Path:
+        """Create a minimal Optix project with a NetSolution .cs file."""
+        from service.tests.conftest import make_project
+        p = make_project(projects_root, project)
+        net_dir = p / "ProjectFiles" / "NetSolution"
+        net_dir.mkdir(parents=True, exist_ok=True)
+        cs_file = net_dir / f"{cls}.cs"
+        cs_file.write_bytes(content)
+        return cs_file
+
+    def test_returns_content_and_shape(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        self._make_netlogic(projects_root, "Alpha", "MyLogic", b"// hello\nclass MyLogic {}\n")
+        client = TestClient(make_app(cfg))
+        r = client.get("/projects/Alpha/netlogic/MyLogic")
+        assert r.status_code == 200
+        body = r.json()
+        assert "content" in body
+        assert "sha256" in body
+        assert "total_lines" in body
+        assert body["total_lines"] == 2
+
+    def test_start_end_line_params_passed_through(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        lines = "line1\nline2\nline3\nline4\n"
+        self._make_netlogic(projects_root, "Alpha", "MyLogic", lines.encode())
+        client = TestClient(make_app(cfg))
+        r = client.get("/projects/Alpha/netlogic/MyLogic?start_line=2&end_line=3")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["start_line"] == 2
+        assert body["end_line"] == 3
+
+    def test_unknown_project_returns_404(self, cfg: core.Config) -> None:
+        client = TestClient(make_app(cfg))
+        r = client.get("/projects/Nonexistent/netlogic/MyLogic")
+        assert r.status_code == 404
+        assert r.json()["code"] == "project_not_found"
+
+    def test_invalid_cls_returns_422_or_400(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        make_project(projects_root, "Alpha")
+        client = TestClient(make_app(cfg))
+        # Class name with .cs extension is InvalidNetLogicClass → 422
+        r = client.get("/projects/Alpha/netlogic/MyLogic.cs")
+        assert r.status_code in (400, 422)
+
+    def test_missing_cs_file_returns_404(
+        self, cfg: core.Config, projects_root: Path
+    ) -> None:
+        make_project(projects_root, "Alpha")
+        client = TestClient(make_app(cfg))
+        r = client.get("/projects/Alpha/netlogic/NoSuchClass")
+        assert r.status_code == 404
+
+
 class TestLastDeployTailEndpoint:
     def test_returns_null_when_buffer_empty(self, cfg: core.Config) -> None:
         client = TestClient(make_app(cfg))

@@ -22,9 +22,31 @@ def test_restart_emulator_stops_then_runs(cfg: core.Config, monkeypatch) -> None
     assert out["serving"] is True
 
 
+def test_restart_emulator_refuses_when_foreign_emulator_running(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """If an emulator for a DIFFERENT project is running, restart_emulator must
+    return a mismatch error BEFORE issuing the stop action — stopping the wrong
+    project's runtime is silent data loss on a multi-Studio box."""
+    monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
+        {"pid": 7777, "project_resolved": "Beta",
+         "matched_path": r"\Emulator\Projects\Beta\ApplicationFiles"},
+    ])
+    stop_called = []
+    monkeypatch.setattr(core, "stop_emulator",
+                        lambda c, r=None, status=None: stop_called.append(True) or {})
+    out = core.restart_emulator(cfg, "Alpha")
+    assert out["ok"] is False
+    assert out["error"] == "runtime_project_mismatch"
+    assert out["requested"] == "Alpha"
+    assert out["resolved"] == "Beta"
+    assert out["pid"] == 7777
+    assert stop_called == []  # stop must NOT have been called
+
+
 def test_restart_emulator_skips_stop_when_idle(cfg: core.Config, monkeypatch) -> None:
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, r=None: {"pids": [], "state": "not_running"})
+                        lambda c, r=None: {"pids": [], "state": "stopped"})
     monkeypatch.setattr(core, "stop_emulator",
                         lambda c, r=None, status=None: (_ for _ in ()).throw(AssertionError("no stop when idle")))
     monkeypatch.setattr(core, "run_emulator",

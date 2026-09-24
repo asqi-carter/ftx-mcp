@@ -38,11 +38,16 @@ optix_bridge_edit(project=<p>, ops=[
 
 Why this wins beyond just "fewer calls": `bridge_edit` validates the WHOLE
 batch first against a hypothetical model that accumulates the batch's own
-creates — "create Gauge1 then set Gauge1.Width" validates clean even though
-Gauge1 doesn't exist yet at validation time — and only applies if that
-report is clean. One round trip, one validation pass, one shot at getting
-the ordering right, instead of discovering an ordering mistake three calls
-deep into a fan-out.
+creates and follows its moves and renames — "create Gauge1 then set
+Gauge1.Width" validates clean even though Gauge1 doesn't exist yet, and a
+"move Gauge1 to Panel/Gauge1 then set Panel/Gauge1.Width" validates clean
+without splitting the batch — and only applies if that report is clean. A
+`create_widget` routed into a placeholder collection reports its actual
+landed path in the `routed_into_collection` warning (`routed_path`); use
+it for subsequent `set_property`/`bind`/`reorder` ops in the same batch.
+One round trip, one validation pass, no ordering constraint between creates
+and moves, instead of discovering a constraint three calls deep into a
+fan-out.
 
 ## Batch SIZE: by component, not by screen
 
@@ -53,7 +58,10 @@ spends real time *generating* the giant JSON (output tokens are the slow,
 expensive ones), it applies as one multi-minute blocking call with no
 progress, and a single failed op strands the entire screen at `state=partial`.
 A dozen ~10-op component batches beat one 120-op batch on both token cost and
-wall-clock, and each is independently debuggable.
+wall-clock, and each is independently debuggable. If a batch does exceed the
+chunk threshold it returns `state="chunked"` instead of dying — recover with
+`optix_bridge_edit(action="status", project=...)` to see what landed, then
+`action="continue"` with the returned `batch_id` to apply the remainder.
 
 ## Call it once — do NOT dry_run first
 

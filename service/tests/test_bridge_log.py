@@ -4,6 +4,7 @@ rotation, last-seen tracking, and _bridge_http instrumentation + retry.
 These are the forensic + resilience additions that make the design-time bridge
 diagnosable over long-running sessions (a rebuild silently drops the :8768
 listener; the log must show WHEN and WHY)."""
+import http.client
 import urllib.error
 
 import pytest
@@ -145,3 +146,71 @@ def test_drop_note_fires_when_bridge_dropped(cfg, monkeypatch):
     monkeypatch.setattr(core, "bridge_state", lambda c, force=False: {"available": False})
     note = core._bridge_drop_note(cfg)
     assert note and "StartBridge" in note
+
+
+# --- IncompleteRead / RemoteDisconnected retry and classification ------------
+
+def test_incomplete_read_retries_and_succeeds(cfg, monkeypatch):
+    """IncompleteRead on the first attempt retries and returns the success body."""
+    monkeypatch.setattr(core.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    class _Resp:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.IncompleteRead(b"partial")
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    status, body = core._bridge_http(cfg, "/bridge/thing", retries=1)
+    assert status == 200 and calls["n"] == 2
+    evs = _events(cfg)
+    assert any(e["ok"] is False for e in evs)   # the failed first attempt
+    assert any(e["ok"] is True for e in evs)     # the successful retry
+
+
+def test_incomplete_read_exhausted_raises_bridge_loading(cfg, monkeypatch):
+    """When all retries are exhausted on IncompleteRead, BridgeLoading is raised."""
+    monkeypatch.setattr(core.time, "sleep", lambda *_: None)
+
+    def fake_urlopen(req, timeout=None):
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(core.BridgeLoading) as exc_info:
+        core._bridge_http(cfg, "/bridge/thing", retries=1)
+    assert exc_info.value.code == "bridge_loading"
+    assert any(e["ok"] is False for e in _events(cfg))
+
+
+def test_remote_disconnected_exhausted_raises_bridge_loading(cfg, monkeypatch):
+    """When all retries are exhausted on RemoteDisconnected, BridgeLoading is raised."""
+    monkeypatch.setattr(core.time, "sleep", lambda *_: None)
+
+    def fake_urlopen(req, timeout=None):
+        raise http.client.RemoteDisconnected("bridge dropped the connection")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(core.BridgeLoading) as exc_info:
+        core._bridge_http(cfg, "/bridge/thing", retries=1)
+    assert exc_info.value.code == "bridge_loading"
+
+
+def test_incomplete_read_no_retry_by_default_raises_bridge_loading(cfg, monkeypatch):
+    """With retries=0 (default), IncompleteRead immediately raises BridgeLoading."""
+    def fake_urlopen(req, timeout=None):
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(core.BridgeLoading):
+        core._bridge_http(cfg, "/bridge/thing")  # retries=0 default
+    assert any(e["ok"] is False for e in _events(cfg))

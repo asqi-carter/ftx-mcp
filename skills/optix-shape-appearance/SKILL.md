@@ -47,7 +47,20 @@ appends (last = on top):
   ops, one batch: `{"op": "create_widget", ...}` then `{"op": "reorder",
   "path": "UI/Screens/<S>/<Panel>/<Rect>", "position": "back"}`. (Reorder
   only bites on graphic objects inside a TYPE — the normal screen case;
-  reload the runtime page to see it.)
+  reload the runtime page to see it.) If the parent screen auto-routes the
+  new widget into a placeholder collection, the actual created path comes
+  from the `routed_into_collection` warning in the batch report
+  (`routed_path`); use that path in the `reorder` op rather than the one
+  you specified.
+- **Grid layout position (GridLayoutProperties):** bridge-authored
+  `GridLayoutProperties` now carries the `FTOptix.UI` browse-name qualifier —
+  the only one the engine honours, and what Studio itself writes
+  (`Name: ns=<FTOptix.UI>;GridLayoutProperties`) — so `RowStart`/`ColumnStart`
+  take effect directly. Set them via `set_property` on the
+  `GridLayoutProperties` child; `reorder` is no longer needed as a
+  grid-position workaround. The create result carries
+  `namespace: "FTOptix.UI"`; a `wrong_namespace` error means the qualifier did
+  not take and the named `created_path` should be deleted.
 
 ## Status indicator (color reacts to state)
 

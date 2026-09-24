@@ -64,7 +64,36 @@ function Set-ServiceConsoleMode {
     $want = if ($Hide) { "-m service --hide-console" } else { "-m service" }
     if ($t.Actions[0].Arguments -eq $want) { return $false }   # already correct
     $a = New-ScheduledTaskAction -Execute $exe -Argument $want -WorkingDirectory $wd
-    Set-ScheduledTask -TaskName $Script:FtxTaskName -Action $a | Out-Null
+    try {
+        Set-ScheduledTask -TaskName $Script:FtxTaskName -Action $a | Out-Null
+    } catch {
+        # I27: if setup.ps1 was run elevated, the task is Admins-owned and this
+        # rewrite dies here with a raw CIM "Access is denied" (0x80070005) --
+        # while plain `start` (no console-mode change) works fine, so the
+        # failure reads as "-Silent is broken" instead of "wrong shell".
+        # Under PS 5.1, Set-ScheduledTask surfaces this as a
+        # Microsoft.Management.Infrastructure.CimException (sometimes wrapped
+        # in UnauthorizedAccessException); match by HRESULT first, message as
+        # a fallback, so we don't misclassify an unrelated failure.
+        $ex = $_.Exception
+        $hr = $ex.HResult
+        $innerHr = if ($ex.InnerException) { $ex.InnerException.HResult } else { $null }
+        $isAccessDenied = ($hr -eq -2147024891) -or ($innerHr -eq -2147024891) -or
+            ($ex -is [System.UnauthorizedAccessException]) -or
+            ($ex.Message -match "Access is denied") -or
+            ($ex.Message -match "0x80070005")
+        if (-not $isAccessDenied) { throw }
+        Write-Host ""
+        Write-Host "The ftx-mcp scheduled task was registered from an elevated shell," -ForegroundColor Yellow
+        Write-Host "so console-mode changes need elevation too." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Fix with ONE of:" -ForegroundColor Yellow
+        Write-Host "    Run 'services.ps1 start -Silent' once from an elevated shell" -ForegroundColor Cyan
+        Write-Host "    Uninstall (elevated), then re-run setup.ps1 from a regular shell" -ForegroundColor Cyan
+        Write-Host "    to re-register the task non-elevated" -ForegroundColor Cyan
+        Write-Host ""
+        Fail "cannot change console mode -- Access is denied (0x80070005)."
+    }
     Write-Host ("  mode  {0,-28} {1}" -f $Script:FtxTaskName,
         $(if ($Hide) { "console hidden" } else { "console visible" })) -ForegroundColor DarkCyan
     return $true
@@ -153,6 +182,8 @@ function Do-Stop($name, $port) {
     }
 }
 
+$hasFault = $false
+
 foreach ($t in $tasks) {
     $name = $t.Name
     $task = Get-TaskOrNull $name
@@ -214,6 +245,34 @@ foreach ($t in $tasks) {
             $line = "  {0,-28} state={1,-8} last={2} result={3} port:{4,-5} {5}" -f `
                 $name, $state, $lastRun, $result, $port, $portMark
             Write-Host $line
+            # Running-but-port-dead: process is live but its port is not
+            # listening -- the one observable signature of a crash-loop.
+            # Emit a prominent FAULT line and arrange a non-zero exit.
+            if ($state -eq "Running" -and $port -gt 0 -and -not $listening) {
+                $logPath = Join-Path $env:LOCALAPPDATA "ftx-mcp\logs\service.jsonl"
+                $lastEvtSummary = "(service.jsonl not found)"
+                if (Test-Path $logPath) {
+                    $lastLine = (Get-Content $logPath -ErrorAction SilentlyContinue |
+                                 Where-Object { $_.Trim() } | Select-Object -Last 1)
+                    if ($lastLine) {
+                        try {
+                            $evt = $lastLine | ConvertFrom-Json
+                            $lastEvtSummary = "event={0} ts={1} pid={2}" -f $evt.event, $evt.ts, $evt.pid
+                            if ($evt.error) {
+                                $errFirst = ($evt.error -split "`n")[0]
+                                $lastEvtSummary += " error=$errFirst"
+                            }
+                        } catch {
+                            $lastEvtSummary = "(parse error)"
+                        }
+                    } else {
+                        $lastEvtSummary = "(service.jsonl empty)"
+                    }
+                }
+                Write-Host ("  FAULT {0,-28} state=Running port:{1} not listening -- {2}" -f `
+                    $name, $port, $lastEvtSummary) -ForegroundColor Red
+                $hasFault = $true
+            }
         }
     }
 }
@@ -240,4 +299,5 @@ if ($Action -eq "status") {
             Write-Host ("  /health err ({0})" -f $first) -ForegroundColor Red
         }
     }
+    if ($hasFault) { exit 1 }
 }

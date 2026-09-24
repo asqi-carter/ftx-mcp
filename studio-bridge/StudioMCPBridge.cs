@@ -1,4 +1,5 @@
-using System;
+﻿using System;
+using System.Globalization;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -11,6 +12,11 @@ using OpcUa = UAManagedCore.OpcUa;
 using FTOptix.HMIProject;
 using FTOptix.NetLogic;
 using FTOptix.CoreBase;
+// Studio injects `using FTOptix.RAEtherNetIP;` into every NetLogic when an
+// EtherNet/IP driver is added, and that namespace has its own Encoding type.
+// Alias so all four System.Text.Encoding call sites stay unambiguous.
+using Encoding = System.Text.Encoding;
+using FTOptix.WebUI;
 
 // StudioMCPBridge - a design-time NetLogic that hosts a loopback HTTP bridge into
 // the live Optix model (read + author) for the ftx-mcp service.
@@ -32,9 +38,11 @@ public class StudioMCPBridge : BaseNetLogic
     // behavior; leave it alone for service/dashboard-only releases that never
     // touch StudioMCPBridge.cs, since those genuinely don't change what the
     // bridge does (a mismatch there is cosmetic - the string is just stale, not
-    // wrong about behavior). Last bumped for the StopBridge port-sweep + bind
-    // retry fix, which IS a real behavior change to this file.
-    private const string BridgeVersion = "1.0.7";
+    // wrong about behavior). Last bumped for the 1.0.8 batch: the I31 crash-proof
+    // dispatch + enum coercion, the NetLogic move refusal, I35's dotnet_type,
+    // relative dynamic links inside an ObjectType, and OpenKeyboard - all real
+    // behavior changes to this file.
+    private const string BridgeVersion = "1.0.8";
     // multi-instance support (v1.0.7). Port is no longer a single
     // fixed const - each Studio instance self-assigns the first free port in
     // BasePort..BasePort+PortRangeSize-1, so up to PortRangeSize projects can
@@ -279,6 +287,123 @@ public class StudioMCPBridge : BaseNetLogic
         MutateBoundPorts(ports => ports.Remove(port));
     }
 
+    // ---- registry file helpers ---------------------------------------------
+    // Each armed bridge writes %LOCALAPPDATA%\ftx-mcp\bridges\<port>.json on
+    // successful bind and deletes it on stop / listener exit. The Python
+    // service reads the directory first (one /bridge/health confirm per file)
+    // instead of probing the whole port range, making multi-instance discovery
+    // faster and adding pid + project_path that the range scan cannot provide.
+
+    private static string RegistryDir()
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return System.IO.Path.Combine(localAppData, "ftx-mcp", "bridges");
+    }
+
+    private static string RegistryEntryPath(int port)
+    {
+        return System.IO.Path.Combine(RegistryDir(), port.ToString() + ".json");
+    }
+
+    // Returns the best available project_path string, or null.
+    // Tries Project.Current first (no FilePath property is exposed in the
+    // current SDK version - BrowseName is the only name-like field used
+    // throughout this file), so falls back to Environment.CurrentDirectory
+    // (the directory Studio was launched from / opened the .optix file from).
+    private static string GetProjectPath()
+    {
+        try
+        {
+            // Attempt 1: reflection probe for a FilePath or StorePath
+            // property that may exist in newer SDK drops without needing
+            // a compile-time reference to the property name.
+            var p = Project.Current;
+            if (p != null)
+            {
+                foreach (var name in new[] { "FilePath", "StorePath", "ProjectFilePath" })
+                {
+                    try
+                    {
+                        var pi = p.GetType().GetProperty(name,
+                            BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                        if (pi != null)
+                        {
+                            var val = pi.GetValue(p) as string;
+                            if (!string.IsNullOrEmpty(val)) return val;
+                        }
+                    }
+                    catch { /* property not present in this SDK version */ }
+                }
+            }
+        }
+        catch { /* Project.Current unavailable */ }
+        // Attempt 2: Studio's working directory at launch - typically the
+        // directory containing the .optix file that was opened.
+        try
+        {
+            var cwd = Environment.CurrentDirectory;
+            if (!string.IsNullOrEmpty(cwd)) return cwd;
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// Writes the registry entry JSON for <paramref name="port"/> to
+    /// %LOCALAPPDATA%\ftx-mcp\bridges\&lt;port&gt;.json. Best-effort:
+    /// any I/O failure is logged as a warning and swallowed so a missing
+    /// LOCALAPPDATA or a permissions error never prevents the bridge starting.
+    /// </summary>
+    private static void WriteRegistryEntry(int port)
+    {
+        try
+        {
+            string dir = RegistryDir();
+            System.IO.Directory.CreateDirectory(dir);
+            string project = "unknown";
+            string projectPath = null;
+            try
+            {
+                var p = Project.Current;
+                if (p != null) project = p.BrowseName;
+            }
+            catch { }
+            projectPath = GetProjectPath();
+            int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+            string startedAt = DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+            // Build JSON without taking a dependency on Newtonsoft / System.Text.Json
+            // (neither is guaranteed in the Studio NetLogic sandbox).
+            string projectPathJson = projectPath == null ? "null" : "\"" + JsonEscape(projectPath) + "\"";
+            string json =
+                "{\"port\":" + port +
+                ",\"project\":\"" + JsonEscape(project) + "\"" +
+                ",\"project_path\":" + projectPathJson +
+                ",\"pid\":" + pid +
+                ",\"bridge_version\":\"" + BridgeVersion + "\"" +
+                ",\"started_at\":\"" + JsonEscape(startedAt) + "\"}";
+            System.IO.File.WriteAllText(RegistryEntryPath(port), json, Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning("StudioBridge", "registry write failed for port " + port + ": " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Deletes the registry entry for <paramref name="port"/> if it exists.
+    /// Best-effort: any I/O failure is silently swallowed so a missing file
+    /// or permissions error never prevents the bridge stopping cleanly.
+    /// </summary>
+    private static void DeleteRegistryEntry(int port)
+    {
+        try
+        {
+            string path = RegistryEntryPath(port);
+            if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+        }
+        catch { /* ignore */ }
+    }
+
     // tries each port in BasePort..BasePort+PortRangeSize-1 in turn
     // and binds the first free one, instead of exclusively owning a single fixed
     // port. This is what lets PortRangeSize Studio instances each run their own
@@ -353,6 +478,7 @@ public class StudioMCPBridge : BaseNetLogic
             // signals it to exit and it removes itself), instead of being silently
             // forgotten the moment this new port gets recorded.
             AddBoundPort(port);
+            WriteRegistryEntry(port);
             _running = true;
             new Thread(() => Loop(port)) { IsBackground = true, Name = "StudioBridge" }.Start();
             Log.Info("StudioBridge", "listening on http://127.0.0.1:" + port +
@@ -394,6 +520,12 @@ public class StudioMCPBridge : BaseNetLogic
                 // running loop, whichever ALC generation it belongs to).
                 try { using (var ev = OpenStopEvent(port)) ev.Set(); }
                 catch (Exception ex) { Log.Warning("StudioBridge", "stop-signal failed for port " + port + ": " + ex.Message); }
+                // Best-effort registry cleanup - delete eagerly here so the file
+                // disappears as soon as StopBridge is clicked, even before the
+                // Loop() thread has noticed the stop event and exited. Loop's
+                // finally calls DeleteRegistryEntry too (belt-and-suspenders) in
+                // case the process dies before this path runs.
+                DeleteRegistryEntry(port);
             }
             if (!quiet) Log.Info("StudioBridge", "stop signalled (port(s) " + string.Join(", ", ports) + " releasing)");
         }
@@ -445,9 +577,20 @@ public class StudioMCPBridge : BaseNetLogic
                 catch { break; }                                  // listener disposed
                 if (!pending) { Thread.Sleep(50); continue; }
                 TcpClient client = null;
-                try { client = lst.AcceptTcpClient(); HandleClient(client); }
-                catch (SocketException) { break; }
-                catch (Exception ex) { Log.Warning("StudioBridge", "request error: " + ex.Message); }
+                // I31: ACCEPT and HANDLE are separate try blocks. They used to
+                // share one, so a SocketException raised while ANSWERING a request
+                // (a client that hung up mid-write) hit the `break` meant for a
+                // disposed listener and took the whole bridge down with it. No
+                // handler fault may end the accept loop - that is half of I31.
+                try { client = lst.AcceptTcpClient(); }
+                catch (SocketException) { break; }                 // listener disposed
+                catch (Exception ex)
+                {
+                    Log.Warning("StudioBridge", "accept error: " + ExcMsg(ex));
+                    continue;
+                }
+                try { HandleClient(client); }
+                catch (Exception ex) { Log.Warning("StudioBridge", "request error: " + ExcMsg(ex)); }
                 finally { try { client?.Close(); } catch { /* ignore */ } }
             }
         }
@@ -463,6 +606,10 @@ public class StudioMCPBridge : BaseNetLogic
             // on, which is exactly the bug this release fixes. See BoundPortEnvVar's
             // comment and RemoveBoundPort.
             try { RemoveBoundPort(port); } catch { /* ignore */ }
+            // Delete the registry file for this port. StopListener already
+            // deletes it eagerly on a normal stop; this covers the crash /
+            // abnormal-exit case where StopListener never ran.
+            DeleteRegistryEntry(port);
             try { stopEv?.Dispose(); } catch { /* ignore */ }
             Log.Info("StudioBridge", "listener loop exited; port " + port + " released");
         }
@@ -579,6 +726,21 @@ public class StudioMCPBridge : BaseNetLogic
                 else if (firstLine.StartsWith("POST /bridge/node/attach-expression"))
                 {
                     body = AttachExpressionInline(firstLine);
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/node/attach-string-formatter"))
+                {
+                    body = AttachStringFormatterInline(firstLine);
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/node/attach-formatter"))
+                {
+                    body = AttachFormatterInline(firstLine);
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/node/retype"))
+                {
+                    body = RetypeVariableInline(firstLine);
                     status = "200 OK";
                 }
                 else if (firstLine.StartsWith("GET /bridge/node/varmembers"))
@@ -712,16 +874,25 @@ public class StudioMCPBridge : BaseNetLogic
                     status = "404 Not Found";
                 }
             }
+            // I31: the dispatch-wide net. ANY exception out of ANY route becomes
+            // one rejected request (500 + the standard error body), never a lost
+            // Studio session. ExcMsg carries the exception TYPE as well as the
+            // message - "__probe__ is not a valid value" says much less than
+            // "ArgumentException: __probe__ is not a valid value". What a managed
+            // catch CANNOT stop is a corrupted-state/native abort (the
+            // StringFormatter.Format setter, the array-write class, the enum
+            // string-assign assert): each of those has its own up-front guard,
+            // because by the time one fires there is no handler to return from.
             catch (Exception ex)
             {
-                body = ErrorJson("internal", ex.Message);
+                body = ErrorJson("internal", ExcMsg(ex));
                 status = "500 Internal Server Error";
             }
 
-            // U21: one Output line per MUTATION (never for reads — they burst).
+            // U21: one Output line per MUTATION (never for reads -- they burst).
             // Sited here, after the dispatch chain and the catch, because this
             // is the single point where every route's FINAL body passes on its
-            // way to the one WriteResponse — including the internal-error path.
+            // way to the one WriteResponse -- including the internal-error path.
             MaybeLogMutation(firstLine, body);
 
             WriteResponse(stream, status, body);
@@ -730,11 +901,11 @@ public class StudioMCPBridge : BaseNetLogic
 
     // ---- U21: per-mutation Output logging -----------------------------------
 
-    // Routes that MUTATE the model — the only ones that log. Keep in sync with
+    // Routes that MUTATE the model -- the only ones that log. Keep in sync with
     // the POST branches in the dispatcher (model/*, ui/widget, i18n/translation,
     // setup/web-engine, and node/{property,bind,alias,move,convert-to-type,
     // reorder,delete,event,attach-expression}). Read routes are deliberately
-    // absent, and so is POST /bridge/expr/validate — a POST by shape but a pure
+    // absent, and so is POST /bridge/expr/validate -- a POST by shape but a pure
     // read (it validates, mutates nothing).
     private static readonly string[] _MutationRoutes = {
         "POST /bridge/model/", "POST /bridge/ui/widget",
@@ -744,6 +915,9 @@ public class StudioMCPBridge : BaseNetLogic
         "POST /bridge/node/convert-to-type", "POST /bridge/node/reorder",
         "POST /bridge/node/delete", "POST /bridge/node/event",
         "POST /bridge/node/attach-expression",
+        "POST /bridge/node/attach-formatter",
+        "POST /bridge/node/attach-string-formatter",
+        "POST /bridge/node/retype",
         // added for the generic invoke endpoint below.
         "POST /bridge/node/invoke",
     };
@@ -767,7 +941,7 @@ public class StudioMCPBridge : BaseNetLogic
 
     private string OpLabel(string firstLine)
     {
-        // "<VERB> <route>" + path=/name= query params. NEVER the `value` param —
+        // "<VERB> <route>" + path=/name= query params. NEVER the `value` param --
         // it can be large and is untrusted content.
         var parts = firstLine.Split(' ');
         string route = parts.Length >= 2 ? parts[0] + " " + parts[1].Split('?')[0]
@@ -795,14 +969,27 @@ public class StudioMCPBridge : BaseNetLogic
         {
             Log.Warning("StudioBridge", "Project.Current unavailable: " + ex.Message);
         }
+        string projectPath = GetProjectPath();
+        int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
         // "port" lets the Python service, which now probes a whole
         // port RANGE (see StartListener), confirm which port answered rather
         // than assuming the well-known 8768 - and is handy for a human reading
         // the raw JSON while debugging which Studio instance is which.
+        // "project_path" and "pid" are the two new fields added for the
+        // registry-file feature (1.0.8) so the Python service can resolve
+        // project paths and pids without a second OS process scan.
+        string projectPathJson = projectPath == null ? "null" : "\"" + JsonEscape(projectPath) + "\"";
         return "{\"bridge_version\":\"" + BridgeVersion +
                "\",\"project\":\"" + JsonEscape(project) +
                "\",\"model_loaded\":" + Bool(modelLoaded) +
-               ",\"port\":" + _boundPort + "}";
+               ",\"port\":" + _boundPort +
+               ",\"project_path\":" + projectPathJson +
+               ",\"pid\":" + pid +
+               // invoke_session tells the service this build runs /bridge/node/invoke
+               // under a root session (see InvokeMethodInline). Builds without it
+               // run ExecuteMethod session-less, which kills Studio; the service
+               // refuses invoke against them.
+               ",\"invoke_session\":\"root\"}";
     }
 
     private string NodeJson(string path, IUANode node)
@@ -828,17 +1015,59 @@ public class StudioMCPBridge : BaseNetLogic
                 if (childCount++ > 0) children.Append(",");
                 children.Append("{\"browse_name\":\"" + JsonEscape(child.BrowseName) +
                                 "\",\"node_class\":\"" + child.NodeClass +
-                                "\",\"dotnet_type\":\"" + JsonEscape(child.GetType().Name) + "\"}");
+                                "\",\"dotnet_type\":\"" + JsonEscape(DotNetTypeName(child)) + "\"}");
             }
         }
 
         return "{\"path\":\"" + JsonEscape(path) +
                "\",\"browse_name\":\"" + JsonEscape(node.BrowseName) +
                "\",\"node_class\":\"" + node.NodeClass +
-               "\",\"dotnet_type\":\"" + JsonEscape(node.GetType().Name) +
+               "\",\"dotnet_type\":\"" + JsonEscape(DotNetTypeName(node)) +
                "\",\"children\":[" + children + "]" +
                ",\"properties\":[" + props + "]" +
                ",\"truncated\":" + Bool(childTrunc || propTrunc) + "}";
+    }
+
+    // I35 (2026-09-04, PopupApp2). node.GetType().Name is the generated CLR PROXY
+    // name, and for a project ObjectType with no UI base the proxy is NOT that
+    // node's kind: `create_type` with no base makes a plain BaseObjectType (the
+    // bridge says so - CreateTypeInline's baseLabel), yet describe_node reported
+    // dotnet_type "ScreenType" on the type and "Screen" on its instance. Not a
+    // cosmetic mislabel - it steered a diagnosis the wrong way for several turns
+    // while the REAL fault was that a bare-typed instance inside a Screen makes the
+    // WEB presentation throw "Object type: 8/93 is not an UI object type" and render
+    // a blank page.
+    //
+    // So corroborate the proxy name against the node's REAL type chain - the
+    // SuperType chain for a type, the ObjectType chain for an instance - and keep
+    // the proxy name only when the chain agrees with it. A real Screen/Panel type
+    // is corroborated ("Screen" in the chain vs proxy "ScreenType") and its output
+    // is unchanged; a bare type is not, and reports what the chain actually says:
+    // BaseObjectType for the type, BaseObject for its instance.
+    //
+    // Deliberately NOT applied to the map walkers (MapNodeJson/MapSearch): they
+    // emit a proxy name per node over hundreds of nodes, where the chain walk is
+    // real cost and the label is a coarse filter, not a diagnosis.
+    private static string DotNetTypeName(IUANode node)
+    {
+        string clr = node.GetType().Name;
+        try
+        {
+            bool isType = node is IUAObjectType;
+            IUAObjectType cur = isType ? ((IUAObjectType)node).SuperType
+                                       : (node as UAObject)?.ObjectType;
+            var chain = new List<string>();
+            for (int i = 0; cur != null && i < 20; i++, cur = cur.SuperType)
+                chain.Add(cur.BrowseName);
+            if (chain.Count == 0) return clr;      // variables, roots - nothing to check against
+            foreach (var b in chain)
+                if (b == clr || b + "Type" == clr || b == clr + "Type") return clr;
+            string root = chain[chain.Count - 1];
+            if (!isType && root.EndsWith("Type", StringComparison.Ordinal) && root.Length > 4)
+                root = root.Substring(0, root.Length - 4);   // BaseObjectType -> BaseObject
+            return root;
+        }
+        catch { return clr; }
     }
 
     // Parity with the file-path list_screens (optix_model.SCREEN_TYPES) plus the
@@ -899,9 +1128,28 @@ public class StudioMCPBridge : BaseNetLogic
         {
             if (count >= MaxItems) { trunc = true; break; }
             string browse = f.Name;
+            bool viaBrowseName = false;
             try
             {
-                if (f.GetValue(null) is NodeId nid)
+                // Route through the SAME resolver create_widget/describe_type use, so
+                // an entry whose compiled NodeId constant points at another node is
+                // CORRECTED here rather than reported as another type's browse name
+                // (the VirtualKeyboard* block: 8/1398 resolves to the DataType
+                // VirtualKeyboardTypeEnum in the loaded FTOptix.UI module). Only a
+                // name the browse-name walk cannot find at all keeps the stale
+                // constant's browse name - and then WITHOUT resolved_by, which is
+                // the honest signal that nothing was reconciled.
+                var nid = ResolveUiTypeId(f.Name, out viaBrowseName);
+                if (nid == null)
+                {
+                    viaBrowseName = false;
+                    if (f.GetValue(null) is NodeId stale)
+                    {
+                        var st = InformationModel.Get(stale);
+                        if (st != null) browse = st.BrowseName;
+                    }
+                }
+                else
                 {
                     var t = InformationModel.Get(nid);
                     if (t != null) browse = t.BrowseName;
@@ -910,7 +1158,8 @@ public class StudioMCPBridge : BaseNetLogic
             catch { /* unresolved type id - fall back to the field name */ }
             if (count++ > 0) sb.Append(",");
             sb.Append("{\"name\":\"" + JsonEscape(f.Name) +
-                      "\",\"browse_name\":\"" + JsonEscape(browse) + "\"}");
+                      "\",\"browse_name\":\"" + JsonEscape(browse) + "\"" +
+                      (viaBrowseName ? ",\"resolved_by\":\"browse_name\"" : "") + "}");
         }
         return "{\"types\":[" + sb + "],\"count\":" + count +
                ",\"truncated\":" + Bool(trunc) + "}";
@@ -957,7 +1206,20 @@ public class StudioMCPBridge : BaseNetLogic
             try
             {
                 string browse = f.Name;
-                if (f.GetValue(null) is NodeId nid)
+                bool viaBrowseName = false;
+                // Same resolver as TypesUiJson/TypeSchemaJson so the dump can never
+                // disagree with describe_type about a type's browse name.
+                var nid = ResolveUiTypeId(f.Name, out viaBrowseName);
+                if (nid == null)
+                {
+                    viaBrowseName = false;
+                    if (f.GetValue(null) is NodeId stale)
+                    {
+                        var st = InformationModel.Get(stale);
+                        if (st != null) browse = st.BrowseName;
+                    }
+                }
+                else
                 {
                     var t = InformationModel.Get(nid);
                     if (t != null) browse = t.BrowseName;
@@ -982,7 +1244,9 @@ public class StudioMCPBridge : BaseNetLogic
 
                 if (typeCount++ > 0) types.Append(",");
                 types.Append("\"" + JsonEscape(f.Name) + "\":{\"browse_name\":\"" +
-                             JsonEscape(browse) + "\",\"properties\":[" + props + "]}");
+                             JsonEscape(browse) + "\"" +
+                             (viaBrowseName ? ",\"resolved_by\":\"browse_name\"" : "") +
+                             ",\"properties\":[" + props + "]}");
             }
             catch { /* skip this type, keep dumping the rest */ }
         }
@@ -1002,11 +1266,10 @@ public class StudioMCPBridge : BaseNetLogic
     // to the type node's direct IUAVariable children if the CLR type can't resolve.
     private string TypeSchemaJson(string typeName)
     {
-        var field = typeof(FTOptix.UI.ObjectTypes)
-            .GetField(typeName, BindingFlags.Public | BindingFlags.Static);
-        if (field == null) return null;
-        var nid = field.GetValue(null) as NodeId;
-        var t = nid != null ? InformationModel.Get(nid) : null;
+        bool viaBrowseName;
+        var nid = ResolveUiTypeId(typeName, out viaBrowseName);
+        if (nid == null) return null;
+        var t = InformationModel.Get(nid);
         if (t == null) return null;
 
         var props = new StringBuilder();
@@ -1052,8 +1315,9 @@ public class StudioMCPBridge : BaseNetLogic
             }
         }
         return "{\"type\":\"" + JsonEscape(typeName) +
-               "\",\"browse_name\":\"" + JsonEscape(t.BrowseName) +
-               "\",\"properties\":[" + props + "]" +
+               "\",\"browse_name\":\"" + JsonEscape(t.BrowseName) + "\"" +
+               (viaBrowseName ? ",\"resolved_by\":\"browse_name\"" : "") +
+               ",\"properties\":[" + props + "]" +
                ",\"truncated\":" + Bool(trunc) + "}";
     }
 
@@ -1154,6 +1418,10 @@ public class StudioMCPBridge : BaseNetLogic
             ee.Expression = expr;
             int i = 0;
             var added = new StringBuilder();
+            // Kept so the Source links can be re-pointed AFTER SetConverter parents
+            // the evaluator - see RelinkRelativeWithinType.
+            var srcHolders = new List<IUAVariable>();
+            var srcTargets = new List<IUANode>();
             if (!string.IsNullOrEmpty(sources))
             {
                 foreach (var sp in sources.Split(','))
@@ -1165,14 +1433,31 @@ public class StudioMCPBridge : BaseNetLogic
                     var srcN = InformationModel.MakeVariable("Source" + i, OpcUa.DataTypes.BaseDataType);
                     srcN.SetDynamicLink(srcVar);
                     ee.Refs.AddReference(FTOptix.CoreBase.ReferenceTypes.HasSource, srcN);
+                    srcHolders.Add(srcN);
+                    srcTargets.Add(srcVar);
                     if (i > 0) added.Append(",");
                     added.Append("\"" + JsonEscape(s) + "\"");
                     i++;
                 }
             }
             propVar.SetConverter(ee);
+            // ONLY NOW is each Source variable in the tree (SetConverter parents the
+            // evaluator), so only now can the SDK's absolute link be re-pointed at
+            // the relative form. Detached, there was nothing to be relative to -
+            // and an absolute source inside an ObjectType makes every instance read
+            // the TYPE's variable, silently static (field finding 2026-09-04).
+            var relSrc = new StringBuilder();
+            int relCount = 0;
+            for (int r = 0; r < srcHolders.Count; r++)
+            {
+                var rel = RelinkRelativeWithinType(srcHolders[r], srcTargets[r]);
+                if (rel == null) continue;
+                if (relCount++ > 0) relSrc.Append(",");
+                relSrc.Append("\"" + JsonEscape(rel) + "\"");
+            }
             return "{\"ok\":true,\"path\":\"" + JsonEscape(path) + "\",\"name\":\"" + JsonEscape(name) +
                    "\",\"expression\":\"" + JsonEscape(expr) + "\",\"sources\":[" + added +
+                   "],\"relative_sources\":[" + relSrc +
                    "],\"via\":\"expression-converter\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
         }
         catch (Exception ex)
@@ -1181,13 +1466,373 @@ public class StudioMCPBridge : BaseNetLogic
         }
     }
 
+    // POST /bridge/node/attach-string-formatter?path=<node>&name=<prop>&format=<fmt>&sources=<a,b,..>[&raw=1][&mode=Read]
+    // Attach a StringFormatter as a converter ON THE PROPERTY itself (HasConverter
+    // on the property, exactly where attach-expression puts its ExpressionEvaluator)
+    // -- NOT on the DynamicLink. This is the shape that FORMATS A DISPLAY VALUE:
+    //
+    //   <prop>
+    //     StringFormatter1          (StringFormatter)   <- HasConverter on the property
+    //       Format = "{0:F1}"       (LocalizedText)     <- HasParameter
+    //       Source0                 (BaseDataType)      <- HasSource
+    //         DynamicLink -> <driver variable>
+    //
+    // attach-formatter (BuildFormattedLink) builds a DIFFERENT thing -- a formatted
+    // dynamic LINK, where the StringFormatter hangs off the DynamicLink and formats
+    // a NodePath. Used as a value formatter on Label.Text it renders EMPTY (field
+    // finding 2026-09-01, re-confirmed 2026-09-16 on two bench projects).
+    // The reference value-formatting shape was proven by hand in Studio (Label.Text
+    // <- StringFormatter "{0:f1}" <- Float 12.222 rendered "12.2").
+    //
+    // Sources are POSITIONAL (Source0..N), so Format uses {0},{1},.. like an
+    // expression. `raw=1` treats each source as a LITERAL NodePath (materialise a
+    // Source holder with a raw DynamicLink value) so an alias/template path such as
+    // "{data}/value" attaches on the TYPE and resolves per instance -- attach on a
+    // resolvable variable otherwise. NEVER call StringFormatter.Format's property
+    // SETTER: its generated setter reads Context.Sessions.CurrentSessionInfo, which
+    // is null on this HTTP thread, so the native call AVs and kills Studio with
+    // nothing logged (decompiled FTOptix.CoreBase.Net 2.1.0.89, 2026-09-16). Write
+    // the Format HasParameter child directly, same as BuildFormattedLink does.
+    // Highest positional placeholder index in a .NET composite format
+    // ("{0:F2}", "{1,8:N1}"), or -1 when there is none. "{{" / "}}" are literal.
+    private static int MaxPositionalPlaceholder(string format)
+    {
+        if (string.IsNullOrEmpty(format)) return -1;
+        var stripped = format.Replace("{{", "").Replace("}}", "");
+        int max = -1;
+        foreach (System.Text.RegularExpressions.Match m in
+                 System.Text.RegularExpressions.Regex.Matches(stripped, @"\{(\d+)\s*(?:,[^{}:]*)?(?::[^{}]*)?\}"))
+        {
+            int n;
+            if (int.TryParse(m.Groups[1].Value, out n) && n > max) max = n;
+        }
+        return max;
+    }
+
+    private string AttachStringFormatterInline(string firstLine)
+    {
+        string path = QueryParam(firstLine, "path");
+        string name = QueryParam(firstLine, "name");
+        string format = QueryParam(firstLine, "format");
+        string sources = QueryParam(firstLine, "sources");
+        string rawStr = QueryParam(firstLine, "raw");
+        bool raw = rawStr == "1" || string.Equals(rawStr, "true", StringComparison.OrdinalIgnoreCase);
+        string modeStr = QueryParam(firstLine, "mode") ?? "Read";
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(format))
+            return ErrorJson("bad_query",
+                "required: path, name, format (+ sources=a,b for {0},{1}; raw=1 for literal NodePaths; mode=Read|ReadWrite|Write)");
+        // Every {N} in format needs Source<N>. Without this a missing/misspelled
+        // sources attached a formatter with no Source0 and answered ok:true; the
+        // label rendered the bare format text (2026-09-24 live check).
+        int boundCount = string.IsNullOrEmpty(sources) ? 0
+            : sources.Split(',').Count(x => x.Trim().Length > 0);
+        int maxPlaceholder = MaxPositionalPlaceholder(format);
+        if (maxPlaceholder >= boundCount)
+            return ErrorJson("unbound_placeholder",
+                "format uses {" + maxPlaceholder + "} but only " + boundCount +
+                " source(s) are bound - pass sources=<path>[,<path>..] (positional)");
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
+            IUAVariable propVar = node.GetVariable(name);
+            if (propVar == null)
+            {
+                var gate = DeclaredPropertyGuard(node, name);
+                if (gate != null) return gate;
+                var arrGate = DeclaredArrayGuard(node, name);
+                if (arrGate != null) return arrGate;
+                if (node is IUAObject obj) propVar = obj.GetOrCreateVariable(name);
+                else if (node is IUAObjectType objT) propVar = objT.GetOrCreateVariable(name);
+            }
+            if (propVar == null) return ErrorJson("property_not_found", "no property " + name + " on " + path);
+
+            DynamicLinkMode mode;
+            switch (modeStr)
+            {
+                case "Write": mode = DynamicLinkMode.Write; break;
+                case "ReadWrite": mode = DynamicLinkMode.ReadWrite; break;
+                default: mode = DynamicLinkMode.Read; break;
+            }
+
+            // Build the StringFormatter DETACHED, wire Format + Source<i>, then
+            // attach as the property converter LAST -- same order as attach-formatter.
+            var sf = InformationModel.MakeObject<StringFormatter>(
+                "StringFormatter1", FTOptix.CoreBase.ObjectTypes.StringFormatter);
+            // The .Format SETTER kills Studio from this thread (session-affine);
+            // write the underlying HasParameter child. Arg order is (text, localeId).
+            var fmtVar = InformationModel.MakeVariable(
+                "Format", OpcUa.DataTypes.LocalizedText);
+            fmtVar.Value = new UAValue(new LocalizedText(format, "en-US"));
+            sf.Refs.AddReference(FTOptix.CoreBase.ReferenceTypes.HasParameter, fmtVar);
+
+            var added = new StringBuilder();
+            var srcHolders = new List<IUAVariable>();
+            var srcTargets = new List<IUANode>();
+            int i = 0;
+            if (!string.IsNullOrEmpty(sources))
+            {
+                foreach (var sp in sources.Split(','))
+                {
+                    var s = sp.Trim();
+                    if (s.Length == 0) continue;
+                    var srcN = InformationModel.MakeVariable("Source" + i, OpcUa.DataTypes.BaseDataType);
+                    if (raw)
+                    {
+                        // Literal NodePath: materialise a DynamicLink and set its value
+                        // directly (resolves per instance at runtime), like bind raw=.
+                        srcN.SetDynamicLink(null, DynamicLinkMode.Read);
+                        var dl = srcN.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                        if (dl == null) return ErrorJson("link_materialize_failed",
+                            "could not materialise a DynamicLink on Source" + i);
+                        dl.Value = s;
+                    }
+                    else
+                    {
+                        var srcVar = ResolveNode(s) as IUAVariable;
+                        if (srcVar == null) return ErrorJson("source_not_variable",
+                            "source is not a variable: " + s + " - pass raw=1 to attach an alias/template path literally");
+                        srcN.SetDynamicLink(srcVar);
+                        srcTargets.Add(srcVar);
+                    }
+                    sf.Refs.AddReference(FTOptix.CoreBase.ReferenceTypes.HasSource, srcN);
+                    srcHolders.Add(srcN);
+                    if (i > 0) added.Append(",");
+                    added.Append("\"" + JsonEscape(s) + "\"");
+                    i++;
+                }
+            }
+
+            propVar.SetConverter(sf);
+            sf.SetModellingRuleRecursive();
+            // Re-point resolvable sources to their SAME-TYPE relative form, so an
+            // instance reads its own value not the type's (field finding 2026-09-04).
+            // Raw sources are already relative literals, so they are skipped.
+            int relCount = 0;
+            if (!raw)
+            {
+                int t = 0;
+                for (int r = 0; r < srcHolders.Count; r++)
+                {
+                    if (t >= srcTargets.Count) break;
+                    if (RelinkRelativeWithinType(srcHolders[r], srcTargets[t]) != null) relCount++;
+                    t++;
+                }
+            }
+            Log.Info("StudioBridge", "SFMT: OK \"" + format + "\" sources=" + i +
+                     " raw=" + raw + " relative=" + relCount + " mode=" + mode +
+                     " - SAVE, then render-verify");
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) + "\",\"name\":\"" + JsonEscape(name) +
+                   "\",\"format\":\"" + JsonEscape(format) + "\",\"sources\":[" + added +
+                   "],\"placeholders\":" + (maxPlaceholder + 1) + ",\"bound\":" + i +
+                   ",\"raw\":" + (raw ? "true" : "false") +
+                   ",\"via\":\"string-formatter-converter\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // POST /bridge/node/attach-formatter?path=<node>&name=<prop>&format=<fmt>&sources=<n=path;..>[&mode=Read]
+    // Attach a FORMATTED DYNAMIC LINK: a DynamicLink whose path is produced by a
+    // StringFormatter from NAMED sources.
+    //
+    //   <prop>
+    //     DynamicLink                  (NodePath)
+    //       DynamicLinkFormatter       (StringFormatter)        <- HasConverter
+    //         Format = "../NavPanel{#idx}@NodeId"               <- HasParameter
+    //         Source<idx>              (BaseDataType)           <- HasSource
+    //           DynamicLink -> <driver variable>
+    //
+    // In Studio this is ONE control: type {#token} into a dynamic link's path and
+    // it becomes a "Formatted dynamic link" with a child link per token. The
+    // StringFormatter is how it serializes, not a thing you assemble by hand.
+    //
+    // TWO THINGS MAKE OR BREAK THIS - both cost a long debugging session on
+    // 2026-09-01, and both are invisible in describe_node:
+    //
+    //  1. NEVER touch StringFormatter.Format's PROPERTY SETTER from here. It
+    //     takes Studio down outright - a corrupted-state exception .NET Core
+    //     cannot catch, so the process vanishes with NOTHING logged. Write the
+    //     underlying HasParameter child directly instead (below); same result,
+    //     safe on this thread. Step-traced: MakeObject succeeded, the very next
+    //     Format assignment killed it, detached AND attached alike.
+    //  2. SetModellingRuleRecursive() is MANDATORY, not decoration. Without it
+    //     every node serializes ModellingRule: None, and a None member is NOT
+    //     instantiated into instances of its owning ObjectType. On a ScreenType
+    //     that means the link exists at DESIGN time (looks perfect in Studio and
+    //     in describe_node) and is simply absent at RUNTIME. That is the exact
+    //     signature of "looks right, renders nothing".
+    //
+    // Everything else runs fine on the bridge's HTTP thread - no marshaling is
+    // needed. DelayedTask(LogicObject) was tried and does NOT work here: a
+    // design-time NetLogic's behaviour context is not running, so scheduled
+    // work never fires.
+    //
+    // Converters no-op SILENTLY when mis-wired: ok:true means attached, never
+    // correct. Render-verify - and check the owning type instantiates it.
+    private string AttachFormatterInline(string firstLine)
+    {
+        string path = QueryParam(firstLine, "path");
+        string name = QueryParam(firstLine, "name");
+        string format = QueryParam(firstLine, "format");
+        string sources = QueryParam(firstLine, "sources");
+        string modeStr = QueryParam(firstLine, "mode") ?? "Read";
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(format))
+            return ErrorJson("bad_query",
+                "required: path, name, format (+ sources=name=path;name=path, mode=Read|ReadWrite|Write)");
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
+
+            IUAVariable propVar = node.GetVariable(name);
+            if (propVar == null)
+            {
+                var gate = DeclaredPropertyGuard(node, name);
+                if (gate != null) return gate;
+                var arrGate = DeclaredArrayGuard(node, name);
+                if (arrGate != null) return arrGate;
+                if (node is IUAObject obj) propVar = obj.GetOrCreateVariable(name);
+                else if (node is IUAObjectType objT) propVar = objT.GetOrCreateVariable(name);
+            }
+            if (propVar == null) return ErrorJson("property_not_found", "no property " + name + " on " + path);
+
+            // Resolve EVERY source before scheduling, so a typo is reported
+            // synchronously and leaves the model untouched.
+            var srcNames = new List<string>();
+            var srcVars = new List<IUAVariable>();
+            if (!string.IsNullOrEmpty(sources))
+            {
+                foreach (var part in sources.Split(';'))
+                {
+                    var s = part.Trim();
+                    if (s.Length == 0) continue;
+                    int eq = s.IndexOf('=');
+                    if (eq <= 0) return ErrorJson("bad_source", "want name=path, got: " + s);
+                    string sn = s.Substring(0, eq).Trim();
+                    string sp = s.Substring(eq + 1).Trim();
+                    if (sn.Length == 0 || sp.Length == 0)
+                        return ErrorJson("bad_source", "want name=path, got: " + s);
+                    var sv = ResolveNode(sp) as IUAVariable;
+                    if (sv == null) return ErrorJson("source_not_variable", "source is not a variable: " + sp);
+                    srcNames.Add(sn);
+                    srcVars.Add(sv);
+                }
+            }
+
+            DynamicLinkMode mode;
+            switch (modeStr)
+            {
+                case "Write": mode = DynamicLinkMode.Write; break;
+                case "ReadWrite": mode = DynamicLinkMode.ReadWrite; break;
+                default: mode = DynamicLinkMode.Read; break;
+            }
+
+            // DelayedTask(LogicObject) never fires at design time - a design-time
+            // NetLogic's behaviour context is not running (its Start() does not
+            // auto-fire either), so scheduled work just queues. Run inline.
+            var err = BuildFormattedLink(propVar, format, srcNames, srcVars, mode);
+            if (err != null) return ErrorJson("build_failed", err);
+
+            var added = new StringBuilder();
+            for (int i2 = 0; i2 < srcNames.Count; i2++)
+            {
+                if (i2 > 0) added.Append(",");
+                added.Append("\"" + JsonEscape(srcNames[i2]) + "\"");
+            }
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path + "/" + name) +
+                   "\",\"format\":\"" + JsonEscape(format) + "\",\"sources\":[" + added +
+                   "],\"mode\":\"" + JsonEscape(modeStr) +
+                   "\",\"via\":\"formatted-dynamic-link\",\"applied\":true" +
+                   ",\"note\":\"check the Output pane" +
+                   " for FMT(task), then SAVE and render-verify\"}";
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // The NetLogic_CheatSheet "formatted dynamic link" recipe, followed exactly
+    // except for the Format write (see 1. above - the setter is fatal here).
+    //
+    // DO NOT "simplify" these calls. Substituting SetConverter for
+    // AddReference(HasConverter), SetDynamicLink(null) for ResetDynamicLink, or
+    // dropping SetModellingRuleRecursive each produced a structure that read
+    // correctly in describe_node and resolved to NOTHING at runtime. The
+    // documented sequence is the contract; deviate only with a render test.
+    private string BuildFormattedLink(IUAVariable targetVariable, string format,
+                                    List<string> srcNames, List<IUAVariable> srcVars,
+                                    DynamicLinkMode mode)
+    {
+        try
+        {
+            Log.Info("StudioBridge", "FMT: begin " + targetVariable.BrowseName);
+            targetVariable.ResetDynamicLink();
+            var newDynamicLink = InformationModel.MakeVariable<DynamicLink>(
+                "DynamicLink", FTOptix.Core.DataTypes.NodePath);
+            newDynamicLink.Value = "";
+            var newStringFormatter = InformationModel.MakeObject<StringFormatter>(
+                "DynamicLinkFormatter", FTOptix.CoreBase.ObjectTypes.StringFormatter);
+            // The .Format SETTER kills Studio from this thread (step-traced).
+            // Write the underlying HasParameter child instead - same result,
+            // and safe here. Arg order is (text, localeId).
+            var fmtVar = InformationModel.MakeVariable(
+                "Format", OpcUa.DataTypes.LocalizedText);
+            fmtVar.Value = new UAValue(new LocalizedText(format, ""));
+            newStringFormatter.Refs.AddReference(
+                FTOptix.CoreBase.ReferenceTypes.HasParameter, fmtVar);
+            var srcHolders = new List<IUAVariable>();
+            for (int i = 0; i < srcNames.Count; i++)
+            {
+                var src = InformationModel.MakeVariable(
+                    "Source" + srcNames[i], OpcUa.DataTypes.BaseDataType);
+                src.SetDynamicLink(srcVars[i]);
+                newStringFormatter.Refs.AddReference(
+                    FTOptix.CoreBase.ReferenceTypes.HasSource, src);
+                srcHolders.Add(src);
+            }
+            newDynamicLink.Mode = mode;
+            newDynamicLink.Refs.AddReference(
+                FTOptix.CoreBase.ReferenceTypes.HasConverter, newStringFormatter);
+            newStringFormatter.SetModellingRuleRecursive();
+            targetVariable.Refs.AddReference(
+                FTOptix.CoreBase.ReferenceTypes.HasDynamicLink, newDynamicLink);
+            newDynamicLink.SetModellingRuleRecursive();
+            // ONLY NOW is each Source variable in the tree (formatter -> link ->
+            // target), so only now can its absolute link be re-pointed at the
+            // relative form. Same reason as attach_expression: an absolute source
+            // inside an ObjectType is read by every instance from the TYPE
+            // (field finding 2026-09-04). Value writes only - no new nodes, so the
+            // SetModellingRuleRecursive calls above still cover everything.
+            int relCount = 0;
+            for (int i = 0; i < srcHolders.Count; i++)
+                if (RelinkRelativeWithinType(srcHolders[i], srcVars[i]) != null) relCount++;
+            Log.Info("StudioBridge", "FMT: OK \"" + format + "\" sources=" +
+                     srcNames.Count + " relative=" + relCount +
+                     " mode=" + mode + " - SAVE, then render-verify");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("StudioBridge", "FMT FAILED: " + ExcMsg(ex));
+            return ExcMsg(ex);
+        }
+    }
+
     // POST /bridge/node/reorder?path=X&position=front|back  (or &index=N) - change a
     // node's z-order among its siblings. In Optix render order = child order (a
     // HasOrderedComponent list): last child renders on TOP (front), first renders at
     // the BACK. This is Studio's "bring to front / send to back" (drag up/down), and
     // the enabler for a Panel background Rectangle behind existing children (the
-    // panelbg gap). Rebuilds the parent's Children in the new order using only
-    // node-model Add/Remove (off-thread-safe class). SCRATCH-TEST before trusting.
+    // panelbg gap).
+    //
+    // Index space is GRAPHIC CHILDREN: IUAVariable children (node properties) are
+    // excluded from the count. index=0 means the first graphic object (rendered at
+    // the back); index=N-1 means the last (rendered in front). Use GraphicChildren()
+    // and GraphicIndexOf() to work in this space.
     private string ReorderInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
@@ -1201,33 +1846,103 @@ public class StudioMCPBridge : BaseNetLogic
             if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
             var parent = node.Owner;
             if (parent == null) return ErrorJson("no_parent", "node has no parent: " + path);
-            var kids = parent.Children.ToList();
-            int cur = kids.IndexOf(node);
-            if (cur < 0) return ErrorJson("not_a_child", "node is not in its parent's Children: " + path);
+            // Verify the node is reachable in its parent's Children (any kind).
+            // This preserves the existing not_a_child guard before we narrow to graphic space.
+            bool foundInChildren = false;
+            foreach (var c in parent.Children) { if (c == node) { foundInChildren = true; break; } }
+            if (!foundInChildren)
+                return ErrorJson("not_a_child", "node is not in its parent's Children: " + path);
+            // Work in graphic-children index space (IUAVariable children are excluded).
+            var gkids = GraphicChildren(parent);
+            int from = GraphicIndexOf(parent, node);
+            if (from < 0)
+                return ErrorJson("not_a_graphic_child",
+                    "node is not a graphic child of its parent (it may be an IUAVariable/property): " + path);
             int target;
-            if (pos == "front") target = kids.Count - 1;   // last in list = rendered in FRONT
-            else if (pos == "back") target = 0;            // first in list = rendered BEHIND
+            if (pos == "front") target = gkids.Count - 1;   // last graphic child = rendered in FRONT
+            else if (pos == "back") target = 0;              // first graphic child = rendered BEHIND
             else if (!int.TryParse(idxStr, out target))
                 return ErrorJson("bad_query", "need position=front|back or index=<int>");
+            // Clamp target into valid graphic-children range.
             if (target < 0) target = 0;
-            if (target > kids.Count - 1) target = kids.Count - 1;
-            if (target == cur)
-                return "{\"ok\":true,\"path\":\"" + JsonEscape(path) + "\",\"index\":" + cur + ",\"noop\":true}";
+            if (target > gkids.Count - 1) target = gkids.Count - 1;
+            // Noop short-circuit.
+            if (target == from)
+                return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
+                       "\",\"from\":" + from + ",\"requested\":" + target +
+                       ",\"achieved\":" + from + ",\"space\":\"graphic_children\"" +
+                       ",\"moves\":0,\"noop\":true}";
             // Non-destructive in-place reorder via MoveUp()/MoveDown() (Sort-project-nodes:
             // the sanctioned API). MoveUp -> earlier in the child list = toward the BACK;
             // MoveDown -> later = toward the FRONT. NOTE: only effective on graphic objects
             // that live inside a TYPE (ScreenType/PanelType) - a plain instance's children
             // won't move. Reload the runtime page to see the visual effect.
-            int moved = 0;
-            while (cur > target) { node.MoveUp(); cur--; moved++; }
-            while (cur < target) { node.MoveDown(); cur++; moved++; }
-            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) + "\",\"to\":" + target +
-                   ",\"moves\":" + moved + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+            //
+            // Re-reading loop: re-read GraphicIndexOf after every move so we track actual
+            // model state rather than counting assumed steps. Bounded by 2*count+4 to
+            // tolerate a stuck model; the no-progress check exits immediately if MoveUp/
+            // MoveDown fails to shift the node (already at a boundary).
+            int count = gkids.Count;
+            int guard = 2 * count + 4;
+            int moves = 0;
+            for (int step = 0; step < guard; step++)
+            {
+                int cur = GraphicIndexOf(parent, node);
+                if (cur == target) break;           // reached target -- done
+                int prev = cur;
+                if (cur > target) node.MoveUp();
+                else               node.MoveDown();
+                moves++;
+                if (GraphicIndexOf(parent, node) == prev) break;  // no-progress: boundary
+            }
+            int achieved = GraphicIndexOf(parent, node);
+            if (achieved != target)
+                return "{\"ok\":false,\"error\":\"reorder_index_unreached\"" +
+                       ",\"requested\":" + target + ",\"achieved\":" + achieved +
+                       ",\"from\":" + from + ",\"space\":\"graphic_children\"" +
+                       ",\"moves\":" + moves + "}";
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
+                   "\",\"from\":" + from + ",\"requested\":" + target +
+                   ",\"achieved\":" + achieved + ",\"space\":\"graphic_children\"" +
+                   ",\"moves\":" + moves + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
         }
         catch (Exception ex)
         {
             return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
         }
+    }
+
+    /// <summary>
+    /// Returns the graphic-object children of <paramref name="parent"/>, filtering
+    /// out IUAVariable children (which are node properties, not visual elements).
+    /// This is the index space used by ReorderInline.
+    /// </summary>
+    private static List<IUANode> GraphicChildren(IUANode parent)
+    {
+        var result = new List<IUANode>();
+        foreach (var child in parent.Children)
+        {
+            if (!(child is IUAVariable))
+                result.Add(child);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Returns the zero-based index of <paramref name="node"/> within the graphic
+    /// children of <paramref name="parent"/> (IUAVariable children excluded), or
+    /// -1 if <paramref name="node"/> is not a graphic child.
+    /// </summary>
+    private static int GraphicIndexOf(IUANode parent, IUANode node)
+    {
+        int idx = 0;
+        foreach (var child in parent.Children)
+        {
+            if (child is IUAVariable) continue;
+            if (child == node) return idx;
+            idx++;
+        }
+        return -1;
     }
 
     // GET /bridge/node/typeinfo?path=X - diagnose a node's KIND. Is it an ObjectType
@@ -1344,7 +2059,23 @@ public class StudioMCPBridge : BaseNetLogic
                 .Any(p => p.Name == name && p.DeclaringType != null
                        && p.DeclaringType.Namespace != null
                        && p.DeclaringType.Namespace.StartsWith("FTOptix")))
-            return null;                                   // FTOptix-declared -> safe
+        {
+            // The proxy can declare a property the loaded UA type does not:
+            // SpinBox.ValueChangeBehaviour (Studio 1.7.4.32) passes the CLR check,
+            // then GetOrCreateVariable AccessViolates inside Studio's own
+            // OptionalInstanceDeclarationExtensions - with any value, valid or not
+            // (1.0.8 battle test, twice; WER: coreclr c0000005 at
+            // GetOrCreateVariable <- SetPropertyInline). Materialize only what an
+            // ObjectType in the instance's UA supertype chain actually declares.
+            if (!(node is UAObject inst) || inst.ObjectType == null) return null;
+            IUAObjectType cur = inst.ObjectType;
+            for (int i = 0; cur != null && i < 20; i++, cur = cur.SuperType)
+                if (cur.GetVariable(name) != null) return null;
+            return "{\"error\":{\"code\":\"proxy_only_property\",\"message\":\"" +
+                   JsonEscape(node.GetType().Name + "." + name + " is declared by the .NET " +
+                       "proxy but by no ObjectType in this node's UA type chain; creating it " +
+                       "crashes Studio. Set it in Studio, or leave it at its default.") + "\"}}";
+        }
         // Mirror the wire_event reject-with-valid-list: hand back the authoritative
         // set + a best-effort suggestion, baked into the message so it survives the
         // Python-side message/code flattening (a sibling did_you_mean field alone is
@@ -1375,8 +2106,11 @@ public class StudioMCPBridge : BaseNetLogic
     {
         switch (name)
         {
-            case "DisplayName": case "BrowseName": case "Description":
-            case "NodeId": case "NodeClass":
+            case "DisplayName":
+            case "BrowseName":
+            case "Description":
+            case "NodeId":
+            case "NodeClass":
                 return true;
             default:
                 return false;
@@ -1413,6 +2147,210 @@ public class StudioMCPBridge : BaseNetLogic
         {
             return "{\"ok\":false,\"mode\":\"inline\",\"error\":\"" +
                    JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // POST /bridge/node/retype?path=<node>&datatype=String[&dims=10|scalar]
+    // Change a VARIABLE's DataType in place - optionally its array shape too -
+    // while KEEPING the node: its NodeId, its children (DynamicLink, converters,
+    // Mode) and every inbound reference survive, which delete+create cannot
+    // offer (and create_variable cannot make an array at all).
+    //
+    // The current value is converted ELEMENT-WISE so design-time defaults carry
+    // over, and the float->text arm goes through ToString("R"): 22.3f becomes
+    // "22.3", never the widened 22.299999237060547. Text->number parses
+    // invariant; anything unparsable lands on the type's default rather than
+    // failing the whole op.
+    //
+    // Why it exists: a common fix for Float->text precision noise on recipe
+    // values is to STORE them as String and let the PLC driver cast String<->REAL
+    // at the link. That means retyping the model arrays plus every StoreColumn
+    // behind them, a change Studio's property grid makes one node at a time and
+    // the bridge could not express at all.
+    //
+    // dims: omitted keeps the current shape; "scalar" (or "0") collapses to a
+    // scalar; "N" (or "N,M") sets the array dimensions.
+    private string RetypeVariableInline(string firstLine)
+    {
+        string path = QueryParam(firstLine, "path");
+        string dtName = QueryParam(firstLine, "datatype");
+        string dimsRaw = QueryParam(firstLine, "dims");
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(dtName))
+            return ErrorJson("bad_query", "required query params: path, datatype");
+        if (RetypeClrType(dtName) == null)
+            return ErrorJson("bad_datatype", "unsupported datatype '" + dtName +
+                "' - one of Boolean, Int16, Int32, Int64, UInt16, UInt32, UInt64, " +
+                "Float, Double, String, DateTime");
+        try
+        {
+            var node = ResolveNodeLoose(path);
+            if (node == null)
+                return ErrorJson("node_not_found", "no node at: " + path);
+            var v = node as IUAVariable;
+            if (v == null)
+                return ErrorJson("not_a_variable", "'" + path + "' is a " +
+                    node.GetType().Name + ", not a variable - only variables have a DataType");
+
+            uint[] oldDims = null;
+            try { oldDims = v.ArrayDimensions; } catch { }
+            bool wasArray = oldDims != null && oldDims.Length > 0;
+            uint[] newDims = oldDims;
+            if (!string.IsNullOrEmpty(dimsRaw))
+            {
+                if (dimsRaw == "scalar" || dimsRaw == "0") newDims = null;
+                else
+                {
+                    var parts = dimsRaw.Split(',');
+                    newDims = new uint[parts.Length];
+                    for (int i = 0; i < parts.Length; i++)
+                    {
+                        uint d;
+                        if (!uint.TryParse(parts[i].Trim(), out d) || d == 0)
+                            return ErrorJson("bad_dims", "dims must be 'scalar' or positive integers, got '" + dimsRaw + "'");
+                        newDims[i] = d;
+                    }
+                }
+            }
+            bool toArray = newDims != null && newDims.Length > 0;
+            if (toArray && newDims.Length != 1)
+                return ErrorJson("bad_dims", "only one-dimensional arrays are supported (got " + newDims.Length + " dims)");
+
+            string oldDt = "?";
+            try { oldDt = v.Context.GetDataType(v.DataType).BrowseName; } catch { }
+
+            object oldVal = null;
+            try { var uv = v.Value; oldVal = uv == null ? null : uv.Value; } catch { }
+
+            Type clr = RetypeClrType(dtName);
+            object newVal;
+            int converted = 0;
+            if (toArray)
+            {
+                int n = (int)newDims[0];
+                var arr = Array.CreateInstance(clr, n);
+                var src = oldVal as Array;
+                for (int i = 0; i < n; i++)
+                {
+                    object e = (src != null && i < src.Length) ? src.GetValue(i) : null;
+                    if (e != null) converted++;
+                    arr.SetValue(RetypeScalar(e, dtName, clr), i);
+                }
+                newVal = arr;
+            }
+            else
+            {
+                object e = oldVal;
+                var src = oldVal as Array;
+                if (src != null) e = src.Length > 0 ? src.GetValue(0) : null;
+                if (e != null) converted++;
+                newVal = RetypeScalar(e, dtName, clr);
+            }
+
+            // Shape first, then type, then value - the value assignment is what
+            // Studio checks against the declared shape/type.
+            v.ArrayDimensions = toArray ? newDims : new uint[0];
+            v.ValueRank = toArray ? ValueRank.OneDimension : ValueRank.Scalar;
+            v.DataType = ResolveDataType(dtName);
+            v.Value = new UAValue(newVal);
+
+            var sb = new StringBuilder();
+            sb.Append("{\"ok\":true,\"path\":\"").Append(JsonEscape(path)).Append("\"");
+            sb.Append(",\"from\":{\"datatype\":\"").Append(JsonEscape(oldDt)).Append("\",\"dims\":");
+            sb.Append(wasArray ? "[" + string.Join(",", oldDims) + "]" : "null").Append("}");
+            sb.Append(",\"to\":{\"datatype\":\"").Append(JsonEscape(dtName)).Append("\",\"dims\":");
+            sb.Append(toArray ? "[" + string.Join(",", newDims) + "]" : "null").Append("}");
+            sb.Append(",\"values_converted\":").Append(converted);
+            sb.Append(",\"sample\":[");
+            var sample = newVal as Array;
+            int shown = 0;
+            if (sample != null)
+            {
+                for (int i = 0; i < sample.Length && i < 3; i++)
+                {
+                    if (i > 0) sb.Append(",");
+                    sb.Append("\"").Append(JsonEscape(Convert.ToString(sample.GetValue(i), CultureInfo.InvariantCulture))).Append("\"");
+                    shown++;
+                }
+            }
+            else
+                sb.Append("\"").Append(JsonEscape(Convert.ToString(newVal, CultureInfo.InvariantCulture))).Append("\"");
+            sb.Append("],\"mode\":\"inline\",\"thread\":\"http-bg\"");
+            sb.Append(",\"nudge\":\"DataType changed on the LIVE node; children and inbound links kept. ");
+            sb.Append("A StoreColumn retype changes what the table is CREATED with - an existing ");
+            sb.Append("database file keeps its old column affinity until the table is recreated. ");
+            sb.Append("Save (optix_save) and restart the emulator to see it.\"}");
+            return sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"mode\":\"inline\",\"error\":\"" +
+                   JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    private static Type RetypeClrType(string name)
+    {
+        switch (name)
+        {
+            case "Boolean": return typeof(bool);
+            case "Int16": return typeof(short);
+            case "Int32": return typeof(int);
+            case "Int64": return typeof(long);
+            case "UInt16": return typeof(ushort);
+            case "UInt32": return typeof(uint);
+            case "UInt64": return typeof(ulong);
+            case "Float": return typeof(float);
+            case "Double": return typeof(double);
+            case "String": return typeof(string);
+            case "DateTime": return typeof(DateTime);
+            default: return null;
+        }
+    }
+
+    // One element, old type -> new type. Float/double to text go through "R"
+    // (shortest round-trip) so the text is what a human typed, never the
+    // widened double. Text to number parses invariant; junk -> default.
+    private static object RetypeScalar(object e, string dtName, Type clr)
+    {
+        var inv = CultureInfo.InvariantCulture;
+        if (e is UAValue uav) e = uav.Value;
+        if (dtName == "String")
+        {
+            if (e == null) return "";
+            if (e is float f) return float.IsNaN(f) || float.IsInfinity(f) ? "0" : f.ToString("R", inv);
+            if (e is double d) return double.IsNaN(d) || double.IsInfinity(d) ? "0" : d.ToString("R", inv);
+            if (e is bool b) return b ? "true" : "false";
+            if (e is DateTime dt) return dt.ToString("o", inv);
+            return Convert.ToString(e, inv) ?? "";
+        }
+        if (e == null) return clr == typeof(DateTime) ? (object)DateTime.MinValue : Activator.CreateInstance(clr);
+        try
+        {
+            if (e is string s)
+            {
+                s = s.Trim();
+                if (dtName == "Boolean")
+                    return s == "1" || string.Equals(s, "true", StringComparison.OrdinalIgnoreCase);
+                if (dtName == "DateTime")
+                {
+                    DateTime parsed;
+                    return DateTime.TryParse(s, inv, System.Globalization.DateTimeStyles.RoundtripKind, out parsed) ? parsed : DateTime.MinValue;
+                }
+                // Integers typed as "22.0" should still land: parse as double, then narrow.
+                double dv;
+                if (!double.TryParse(s, System.Globalization.NumberStyles.Float, inv, out dv))
+                    return Activator.CreateInstance(clr);
+                if (clr == typeof(float)) return (float)dv;
+                if (clr == typeof(double)) return dv;
+                return Convert.ChangeType(Math.Round(dv), clr, inv);
+            }
+            if (dtName == "Boolean") return Convert.ToBoolean(e, inv);
+            if (dtName == "DateTime") return e is DateTime ? e : DateTime.MinValue;
+            return Convert.ChangeType(e, clr, inv);
+        }
+        catch
+        {
+            return clr == typeof(DateTime) ? (object)DateTime.MinValue : Activator.CreateInstance(clr);
         }
     }
 
@@ -1513,13 +2451,32 @@ public class StudioMCPBridge : BaseNetLogic
                 return ErrorJson("node_not_found", "no parent node at: " + parent);
             var dup = DupNameGuard(parentNode, name, parent);
             if (dup != null) return dup;
+            // GridLayoutProperties must land in the FTOptix.UI namespace; a generic
+            // MakeObject would qualify the browse name with the project namespace and
+            // the engine silently ignores RowStart/ColumnStart on it (bridge >= 1.0.8).
+            if (name == "GridLayoutProperties")
+                return TryCreateUiNamespaceChild(parentNode, name, parent);
             NodeId typeId = OpcUa.ObjectTypes.BaseObjectType;
             string typeLabel = "BaseObjectType";
             if (!string.IsNullOrEmpty(typePath))
             {
-                var typeNode = ResolveNode(typePath);
+                IUANode typeNode = null;
+                // A bare or Module.Type name is a BUILTIN catalog type first
+                // (DigitalAlarm, DataLogger, User, ...; see ResolveUiTypeId
+                // step (a2)); anything with a slash is a project type path.
+                if (typePath.IndexOf('/') < 0)
+                {
+                    bool _viaBrowseNameObj;
+                    var builtinId = ResolveUiTypeId(typePath, out _viaBrowseNameObj);
+                    if (builtinId != null)
+                    {
+                        try { typeNode = InformationModel.Get(builtinId); } catch { typeNode = null; }
+                    }
+                }
+                if (typeNode == null) typeNode = ResolveNode(typePath);
                 if (typeNode == null)
-                    return ErrorJson("type_not_found", "no node at type path: " + typePath);
+                    return ErrorJson("type_not_found", "no node at type path: " + typePath +
+                        " (not a builtin catalog type either - pass Module.Type, e.g. FTOptix.Alarm.DigitalAlarm)");
                 if (typeNode.NodeClass != NodeClass.ObjectType)
                     return ErrorJson("not_a_type",
                         typePath + " is " + typeNode.NodeClass +
@@ -1609,11 +2566,8 @@ public class StudioMCPBridge : BaseNetLogic
             }
             else
             {
-                NodeId baseId = null;
-                var typeField = typeof(FTOptix.UI.ObjectTypes)
-                    .GetField(baseName, BindingFlags.Public | BindingFlags.Static);
-                if (typeField != null && typeField.GetValue(null) is NodeId nid)
-                    baseId = nid;
+                bool _viaBrowseNameBase;
+                var baseId = ResolveUiTypeId(baseName, out _viaBrowseNameBase);
                 if (baseId == null)
                 {
                     var baseNode = ResolveNode(baseName);
@@ -1748,6 +2702,8 @@ public class StudioMCPBridge : BaseNetLogic
     // the original. Consequence reported honestly: the node's identity
     // (NodeId) CHANGES - outbound links are re-created, but INBOUND references
     // from elsewhere in the project to the moved subtree are NOT rewritten.
+    //
+    // ONE NODE KIND IS REFUSED OUTRIGHT: a NetLogic. See IsNetLogicNode.
     private string MoveNodeInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
@@ -1760,6 +2716,10 @@ public class StudioMCPBridge : BaseNetLogic
         {
             var node = ResolveNode(path);
             if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
+            // BEFORE ANY MUTATION - a NetLogic move is not a slow failure, it is
+            // an instant lost session. See IsNetLogicNode / NetLogicMoveMessage.
+            if (IsNetLogicNode(node))
+                return ErrorJson("refused_netlogic_move", NetLogicMoveMessage(path));
             if (!(node is IUAObject) || node.NodeClass != NodeClass.Object)
                 return ErrorJson("not_an_object",
                     path + " is " + node.NodeClass + " - move handles Object instances" +
@@ -1821,6 +2781,44 @@ public class StudioMCPBridge : BaseNetLogic
                    "\",\"nudge\":\"move stopped mid-way - inspect " + JsonEscape(path) +
                    " and " + JsonEscape(newParent) + " with describe_node before retrying\"}";
         }
+    }
+
+    // FIELD FINDING 2026-09-04: moving a NetLogicObject CLOSED THE PROJECT in
+    // Studio outright - the bridge went with it, every unsaved edit was lost, and
+    // there was no exception, no error body, nothing in the log. move works by
+    // RE-AUTHORING a copy and deleting the original (see the header above), and a
+    // NetLogic node carries no proxy and no code-reference property to re-author
+    // (that is exactly what CreateNetLogicInline documents), so the copy is a
+    // half-formed logic node and the delete takes the real one with it.
+    //
+    // Identified two ways, because either one alone can miss: the generated CLR
+    // proxy for a NetLogic node is FTOptix.NetLogic.NetLogicObject, and its type
+    // chain reaches FTOptix.NetLogic.ObjectTypes.NetLogic - the very NodeId
+    // CreateNetLogicInline makes these nodes from.
+    private static bool IsNetLogicNode(IUANode node)
+    {
+        try
+        {
+            for (var t = node.GetType(); t != null; t = t.BaseType)
+                if (t.Name == "NetLogicObject") return true;
+            IUAObjectType ot = (node as UAObject)?.ObjectType;
+            for (int i = 0; ot != null && i < 20; i++, ot = ot.SuperType)
+                if (ot.NodeId.Equals(FTOptix.NetLogic.ObjectTypes.NetLogic)) return true;
+        }
+        catch { /* a node we cannot classify is not refused */ }
+        return false;
+    }
+
+    // One message for both the refusal and the dry-run report, so validate_ops
+    // and the write path can never disagree about why a move was refused.
+    private static string NetLogicMoveMessage(string path)
+    {
+        return path + " is a NetLogic node - move is refused. Moving one closed the " +
+               "project in Studio outright (2026-09-04: bridge gone, unsaved edits " +
+               "lost, no exception raised). move re-authors a copy and deletes the " +
+               "original, and a NetLogic node has neither a proxy nor a code " +
+               "reference to re-author. Move it in Studio's Project view (drag the " +
+               "node to its new parent), save, then re-arm the bridge.";
     }
 
     // A DynamicLink found during a subtree copy, applied AFTER the whole copy
@@ -2051,15 +3049,15 @@ public class StudioMCPBridge : BaseNetLogic
             return ErrorJson("bad_query", "missing required query param: name");
         try
         {
-            var typeField = typeof(FTOptix.UI.ObjectTypes)
-                .GetField(typeName, BindingFlags.Public | BindingFlags.Static);
-            if (typeField == null || !(typeField.GetValue(null) is NodeId typeId))
+            bool _viaBrowseName;
+            var typeId = ResolveUiTypeId(typeName, out _viaBrowseName);
+            if (typeId == null)
                 return ErrorJson("type_not_found", "no builtin UI type: " + typeName);
             // The ObjectTypes catalog also carries the ABSTRACT layout bases in the
             // Item -> Container -> Panel chain. `Item`/`Container` are not concrete
             // renderable widgets: a bare instance is "not a UI object type" to the
             // WebPresentationEngine and CRASHES the render tree, killing every
-            // sibling after it (found live 2026-07-25 — an agent picked "Container"
+            // sibling after it (found live 2026-07-25 -- an agent picked "Container"
             // as a layout widget and lost the screen). Refuse loud and redirect.
             // (A full reflect-the-runtime-proxy renderability filter is a follow-up;
             // these two are the only bases an author realistically mistakes for a
@@ -2067,7 +3065,7 @@ public class StudioMCPBridge : BaseNetLogic
             if (typeName == "Item" || typeName == "Container")
                 return ErrorJson("not_renderable",
                     "'" + typeName + "' is an abstract layout base, not a renderable "
-                    + "widget — a bare instance crashes the render tree. Use 'Panel' "
+                    + "widget -- a bare instance crashes the render tree. Use 'Panel' "
                     + "(invisible layout container; add a Rectangle child for a "
                     + "background) or 'Rectangle' (a filled/bordered box) instead.");
             var screenNode = ResolveNode(screen);
@@ -2133,6 +3131,11 @@ public class StudioMCPBridge : BaseNetLogic
                         "collection(s) on '" + screen + "': " + string.Join(", ", roHits) +
                         " - these cannot be authored into");
             }
+            // GridLayoutProperties must land in the FTOptix.UI namespace; a generic
+            // MakeObject would qualify the browse name with the project namespace and
+            // the engine silently ignores RowStart/ColumnStart on it (bridge >= 1.0.8).
+            if (name == "GridLayoutProperties")
+                return TryCreateUiNamespaceChild(screenNode, name, screen);
             var widget = InformationModel.MakeObject(name, typeId);
             if (routes.Count == 1)
             {
@@ -2205,7 +3208,7 @@ public class StudioMCPBridge : BaseNetLogic
     {
         string path = QueryParam(firstLine, "path");
         string name = QueryParam(firstLine, "name");
-        string raw  = QueryParam(firstLine, "value") ?? "";
+        string raw = QueryParam(firstLine, "value") ?? "";
         if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name))
             return ErrorJson("bad_query", "required query params: path, name");
         // DisplayName rides the set_property surface for caller convenience but
@@ -2274,9 +3277,16 @@ public class StudioMCPBridge : BaseNetLogic
             // marshaling (HANGS at design time - Studio has no task pump; both confirmed
             // live). Safe here ONLY because the gate above proved the
             // property is type-declared.
+            // ObjectTypes materialize too (same branch as attach-conditional and
+            // bind-property). Without it, a static on a fresh ObjectType member fell
+            // through to property_not_found and the only route was the bind_property
+            // (junk raw link) -> delete DynamicLink -> set_property dance
+            // (confirmed live 2026-08-31, ToggleSwitch authoring).
             IUAVariable mvar = null;
             if (node is IUAObject asObject)
                 mvar = asObject.GetOrCreateVariable(name);
+            else if (node is IUAObjectType asType)
+                mvar = asType.GetOrCreateVariable(name);
             if (mvar == null)
                 return ErrorJson("property_not_found",
                     "node " + path + " has no variable or materializable property " + name);
@@ -2322,6 +3332,27 @@ public class StudioMCPBridge : BaseNetLogic
         return ArrayWriteError(name, node.GetType().Name, pi.PropertyType.GetElementType().Name);
     }
 
+    // The .NET ENUM type a property really has, read off its owner's generated
+    // CLR proxy rather than off the UA datatype's browse NAME. Null when the
+    // owner declares no such property, or declares it non-enum. Companion to
+    // DeclaredArrayGuard (same reflection, same reason: the declaration knows
+    // things the live variable does not), and the I31 backstop for
+    // ResolveEnumType, which can only match a datatype whose browse name IS a
+    // loaded enum type name.
+    private static Type DeclaredEnumType(IUAVariable v)
+    {
+        try
+        {
+            var owner = v.Owner;
+            if (owner == null) return null;
+            var pi = owner.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                          .FirstOrDefault(p => p.Name == v.BrowseName);
+            if (pi == null) return null;
+            return pi.PropertyType.IsEnum ? pi.PropertyType : null;
+        }
+        catch { return null; }
+    }
+
     private static string ArrayWriteError(string name, string owner, string elemType)
     {
         return "{\"error\":{\"code\":\"unsupported_array_write\",\"message\":\"" +
@@ -2347,19 +3378,26 @@ public class StudioMCPBridge : BaseNetLogic
         {
             case "Boolean":
                 v.Value = (raw == "true" || raw == "1" || raw == "True"); break;
-            case "Int16": case "Int32": case "Int64":
-            case "UInt16": case "UInt32": case "UInt64": case "Byte": case "SByte":
+            case "Int16":
+            case "Int32":
+            case "Int64":
+            case "UInt16":
+            case "UInt32":
+            case "UInt64":
+            case "Byte":
+            case "SByte":
                 {
-                    // TryParse (not Convert.ToInt32) so a non-numeric value returns a
-                    // clean bad_value instead of leaking a raw FormatException.
-                    long iv;
-                    if (!long.TryParse(raw, System.Globalization.NumberStyles.Integer,
-                                       System.Globalization.CultureInfo.InvariantCulture, out iv))
-                        return "value must be an integer for " + dt + ": " + raw;
-                    v.Value = (int)iv;   // (int) truncates rather than throwing on range
+                    // Parse to the declared width. A blanket (int) cast silently wrapped
+                    // Int64/UInt64 mod 2^32 (123456789012345 stored as -2045911175).
+                    UAValue iv;
+                    string err = ParseInteger(dt, raw, out iv);
+                    if (err != null) return err;
+                    v.Value = iv;
                 }
                 break;
-            case "Float": case "Double": case "Size":
+            case "Float":
+            case "Double":
+            case "Size":
                 {
                     double dv;
                     if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
@@ -2382,6 +3420,12 @@ public class StudioMCPBridge : BaseNetLogic
                 // ensure_web_engine's StartWindow set. This is what lets a content loader
                 // point at a screen (the nav "empty content" root cause).
                 {
+                    // "" / "null" CLEARS the pointer. A NodePointer driven by
+                    // a dynamic link keeps its old static Value forever
+                    // otherwise - invisible on screen (the link wins) but
+                    // misleading in the property grid, and the fallback if
+                    // the link ever resolves to nothing.
+                    if (IsNodeIdClearToken(raw)) { v.Value = NodeId.Empty; break; }
                     var target = ResolveNode(raw);
                     if (target == null)
                         return "NodeId value must be a resolvable node path: " + raw;
@@ -2437,7 +3481,7 @@ public class StudioMCPBridge : BaseNetLogic
     // Three tiers:
     //   1 per-op validity  - node resolves, property is declared, value coerces
     //   2 batch coherence  - ops are checked against a HYPOTHETICAL model that
-    //                        accumulates this batch's creates/deletes, so
+    //                        accumulates this batch's creates/deletes/moves, so
     //                        "create X then set X.Prop" validates clean and the
     //                        reverse order does not
     //   3 lint             - warnings only; `strict` promotes them to errors
@@ -2445,6 +3489,88 @@ public class StudioMCPBridge : BaseNetLogic
     // Body: {"ops":[{"op":"...", ...}], "strict":false}
     // Reply: {"ok":bool, "op_count":N, "errors":[{op_index,code,message,...}],
     //         "warnings":[{op_index,code,message}]}
+    //
+    // Hypothetical tree state (Tier 2):
+    //
+    //   BEFORE (U16 original):
+    //     created : Dictionary<string, string>   path -> declared-type-name
+    //     (no move tracking)
+    //
+    //   AFTER (this revision):
+    //     created  : Dictionary<string, HypoNode>  path -> {Verb, Type}
+    //                records the op verb that created the node (create_widget,
+    //                create_node, ...) in addition to its declared type, so
+    //                downstream logic can distinguish widget-created nodes.
+    //     relocated: Dictionary<string, string>   oldPath -> newPath
+    //                set by every successful move op; used to rewrite prefix
+    //                lookups for subsequent ops so "move X then set X.Prop"
+    //                is treated as "set newX.Prop" rather than unresolved.
+    //
+    //   Resolution order (HypoResolve):
+    //     1. Apply any relocated-prefix rewrite (longest-prefix match).
+    //     2. Check the created dict under the (possibly rewritten) path.
+    //     3. Try ResolveNode (the live model).
+    //     4. Return null -> unresolved.
+    //
+    //   Why every op case calls HypoResolve instead of raw ResolveNode:
+    //     A move op earlier in the batch changes the effective address of the
+    //     moved node AND every descendant.  Raw ResolveNode still finds the
+    //     pre-move address (the live model is not mutated during validation),
+    //     so any subsequent op on the moved path would falsely resolve --
+    //     passing validation but failing on apply.  HypoResolve applies the
+    //     relocated rewrite first, so the post-move address is used.
+
+    // Hypothetical node entry: tracks both the op verb that created the node
+    // and its declared type name.  The verb distinguishes create_widget nodes
+    // (which may have been routed into a child collection) from other creates.
+    private class HypoNode
+    {
+        public string Verb;
+        public string Type;
+    }
+
+    // Resolve a path against the hypothetical tree: apply any relocated-prefix
+    // rewrite, then check the created set, then fall back to the live model.
+    // Returns the resolved (post-rewrite) path when the node exists in any of
+    // those layers, or null when nothing resolves it.
+    private string HypoResolve(
+        string path,
+        Dictionary<string, HypoNode> created,
+        Dictionary<string, string> relocated)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+
+        // 1. Apply the longest matching relocated-prefix rewrite.
+        string rewritten = path;
+        int bestLen = -1;
+        foreach (var kv in relocated)
+        {
+            string old = kv.Key;
+            if (string.Equals(path, old, StringComparison.OrdinalIgnoreCase))
+            {
+                // Exact match -- the path itself was moved; further ops on it
+                // must use the NEW address.  Return the new path (non-null)
+                // to confirm the node still exists; callers that want to flag
+                // "moved away" inspect relocated directly.
+                if (old.Length > bestLen) { bestLen = old.Length; rewritten = kv.Value; }
+            }
+            else if (path.StartsWith(old + "/", StringComparison.OrdinalIgnoreCase) &&
+                     old.Length > bestLen)
+            {
+                bestLen = old.Length;
+                rewritten = kv.Value + path.Substring(old.Length);
+            }
+        }
+
+        // 2. Check the hypothetical created set.
+        if (created.ContainsKey(rewritten)) return rewritten;
+
+        // 3. Fall back to the live model.
+        if (ResolveNode(rewritten) != null) return rewritten;
+
+        return null;
+    }
+
     private string ValidateOpsJson(string body)
     {
         var errors = new StringBuilder();
@@ -2484,8 +3610,10 @@ public class StudioMCPBridge : BaseNetLogic
                     strictEl.ValueKind == System.Text.Json.JsonValueKind.True) strict = true;
 
                 // Tier 2 state: the hypothetical model this batch would build.
-                var created = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                var deleted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var created  = new Dictionary<string, HypoNode>(StringComparer.OrdinalIgnoreCase);
+                var deleted  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // relocated: old absolute path -> new absolute path, filled by move ops.
+                var relocated = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 // PRE-PASS: every path this batch creates, regardless of position.
                 // The sequential `created` set above is what decides validity (a
@@ -2493,6 +3621,9 @@ public class StudioMCPBridge : BaseNetLogic
                 // error ACTIONABLE: the reversed-order mistake is by definition a
                 // forward reference, so at the point it is caught the sequential
                 // set is still empty and could not name the culprit.
+                // For create_widget we compute the routed path the same way the
+                // sequential pass does (WillCreatePath helper) so NearestHint
+                // names the actual path the node will land at.
                 var willCreate = new List<string>();
                 foreach (var pre in opsEl.EnumerateArray())
                 {
@@ -2501,7 +3632,26 @@ public class StudioMCPBridge : BaseNetLogic
                     string pn = JsonStr(pre, "name");
                     if (string.IsNullOrEmpty(pn)) continue;
                     string pp = ParentKey(pre);
-                    willCreate.Add(string.IsNullOrEmpty(pp) ? pn : pp.TrimEnd('/') + "/" + pn);
+                    string basePath = string.IsNullOrEmpty(pp) ? pn : pp.TrimEnd('/') + "/" + pn;
+                    if (pv == "create_widget" && !string.IsNullOrEmpty(pp))
+                    {
+                        // Best-effort: resolve the screen node and check routing.
+                        // If it resolves we can name the actual collection path;
+                        // if not (forward-ref screen) we fall back to the flat path.
+                        var screenNode = ResolveNode(pp);
+                        string tn = TypeKey(pre);
+                        if (screenNode != null && !string.IsNullOrEmpty(tn))
+                        {
+                            var clr = ResolveWidgetClrType(tn);
+                            if (clr != null)
+                            {
+                                var routes = MatchingPlaceholderColls(screenNode, clr, readOnly: false);
+                                if (routes.Count == 1)
+                                    basePath = pp.TrimEnd('/') + "/" + routes[0] + "/" + pn;
+                            }
+                        }
+                    }
+                    willCreate.Add(basePath);
                 }
 
                 int idx = -1;
@@ -2524,8 +3674,19 @@ public class StudioMCPBridge : BaseNetLogic
                         case "set_property":
                         case "bind":
                         case "attach_expression":
+                        case "attach_formatter":
+                        case "attach_string_formatter":
+                            // moved_earlier_in_batch: a path that was moved away in
+                            // this batch is no longer valid at the old address.
+                            if (!string.IsNullOrEmpty(path) && relocated.ContainsKey(path))
+                            {
+                                addErr(idx, "moved_earlier_in_batch",
+                                       verb + " targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')",
+                                       null);
+                                break;
+                            }
                             ValidateOnNode(idx, verb, path, name, value, created, deleted,
-                                           willCreate, addErr, addWarn);
+                                           relocated, willCreate, addErr, addWarn);
                             break;
 
                         case "delete":
@@ -2534,7 +3695,10 @@ public class StudioMCPBridge : BaseNetLogic
                                 { addErr(idx, "bad_op", verb + " requires \"path\"", null); break; }
                                 if (deleted.Contains(path))
                                 { addErr(idx, "already_deleted", "op deletes '" + path + "' twice in this batch", null); break; }
-                                if (ResolveNode(path) == null && !created.ContainsKey(path))
+                                if (relocated.ContainsKey(path))
+                                { addErr(idx, "moved_earlier_in_batch",
+                                         "delete targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+                                if (HypoResolve(path, created, relocated) == null)
                                     addErr(idx, "unresolved_reference",
                                            "no node at '" + path + "'" + NearestHint(path, willCreate), null);
                                 deleted.Add(path);
@@ -2542,7 +3706,22 @@ public class StudioMCPBridge : BaseNetLogic
                             }
                             break;
 
-                        case "move":
+                        case "retype":
+                            {
+                                if (string.IsNullOrEmpty(path))
+                                { addErr(idx, "bad_op", "retype requires \"path\"", null); break; }
+                                if (deleted.Contains(path))
+                                { addErr(idx, "modifies_deleted_node", "retype targets '" + path + "', deleted earlier in this batch", null); break; }
+                                if (relocated.ContainsKey(path))
+                                { addErr(idx, "moved_earlier_in_batch",
+                                         "retype targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+                                // retype allows loose resolution (slash-in-BrowseName)
+                                if (ResolveNodeLoose(path) == null && HypoResolve(path, created, relocated) == null)
+                                    addErr(idx, "unresolved_reference",
+                                           "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                            }
+                            break;
+
                         case "reorder":
                         case "wire_event":
                             {
@@ -2550,14 +3729,109 @@ public class StudioMCPBridge : BaseNetLogic
                                 { addErr(idx, "bad_op", verb + " requires \"path\"", null); break; }
                                 if (deleted.Contains(path))
                                 { addErr(idx, "modifies_deleted_node", verb + " targets '" + path + "', deleted earlier in this batch", null); break; }
-                                if (ResolveNode(path) == null && !created.ContainsKey(path))
+                                if (relocated.ContainsKey(path))
+                                { addErr(idx, "moved_earlier_in_batch",
+                                         verb + " targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+                                if (HypoResolve(path, created, relocated) == null)
                                     addErr(idx, "unresolved_reference",
                                            "no node at '" + path + "'" + NearestHint(path, willCreate), null);
                             }
                             break;
 
+                        case "move":
+                            {
+                                if (string.IsNullOrEmpty(path))
+                                { addErr(idx, "bad_op", "move requires \"path\"", null); break; }
+                                if (deleted.Contains(path))
+                                { addErr(idx, "modifies_deleted_node", "move targets '" + path + "', deleted earlier in this batch", null); break; }
+                                if (relocated.ContainsKey(path))
+                                { addErr(idx, "moved_earlier_in_batch",
+                                         "move targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+
+                                // Resolve the source node (hypothetical or live).
+                                var live = ResolveNode(path);
+                                if (HypoResolve(path, created, relocated) == null)
+                                {
+                                    addErr(idx, "unresolved_reference",
+                                           "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                                    break;
+                                }
+                                // Reuse the write path's own refusal (see
+                                // MoveNodeInline): a batch must fail the NetLogic
+                                // move in the DRY RUN, not discover it by losing
+                                // the Studio session mid-apply.
+                                if (live != null && IsNetLogicNode(live))
+                                {
+                                    addErr(idx, "refused_netlogic_move", NetLogicMoveMessage(path), null);
+                                    break;
+                                }
+
+                                // Determine the destination.
+                                string newParent = JsonStr(op, "new_parent");
+                                string newNameField = JsonStr(op, "new_name");
+                                string effectiveName = string.IsNullOrEmpty(newNameField)
+                                    ? (path.LastIndexOf('/') >= 0
+                                        ? path.Substring(path.LastIndexOf('/') + 1)
+                                        : path)
+                                    : newNameField;
+
+                                if (string.IsNullOrEmpty(newParent))
+                                {
+                                    // new_parent is required for the hypothetical state
+                                    // to track the destination; without it we cannot
+                                    // record relocated and the moved-earlier guard would
+                                    // miss subsequent ops on the old path.
+                                    addErr(idx, "bad_op",
+                                           "move requires \"new_parent\" so the batch validator " +
+                                           "can track the node's new address", null);
+                                    break;
+                                }
+
+                                // Validate that the destination parent exists.
+                                if (HypoResolve(newParent, created, relocated) == null)
+                                {
+                                    addErr(idx, "unresolved_parent",
+                                           "no parent node at '" + newParent + "'" +
+                                           NearestHint(newParent, willCreate), null);
+                                    break;
+                                }
+
+                                string newPath = newParent.TrimEnd('/') + "/" + effectiveName;
+
+                                // Warn if the destination path is already occupied and
+                                // the batch has not deleted it (delete-then-move credit).
+                                if (HypoResolve(newPath, created, relocated) != null &&
+                                    !deleted.Contains(newPath))
+                                    addWarn(idx, "already_exists",
+                                            "'" + newPath + "' already exists; the move may collide");
+
+                                // Record the move so subsequent ops that reference the
+                                // old path get moved_earlier_in_batch and ops that use
+                                // the new path resolve correctly.
+                                relocated[path] = newPath;
+
+                                // Re-key any hypothetical nodes that were created under
+                                // the old prefix so their new addresses are reachable.
+                                var toRekey = new List<KeyValuePair<string, HypoNode>>();
+                                foreach (var kv in created)
+                                {
+                                    if (kv.Key.StartsWith(path + "/",
+                                            StringComparison.OrdinalIgnoreCase) ||
+                                        string.Equals(kv.Key, path,
+                                            StringComparison.OrdinalIgnoreCase))
+                                        toRekey.Add(kv);
+                                }
+                                foreach (var kv in toRekey)
+                                {
+                                    created.Remove(kv.Key);
+                                    string suffix = kv.Key.Length > path.Length
+                                        ? kv.Key.Substring(path.Length) : "";
+                                    created[newPath + suffix] = kv.Value;
+                                }
+                            }
+                            break;
+
                         case "create_node":
-                        case "create_widget":
                         case "create_variable":
                         case "create_folder":
                         case "create_object":
@@ -2577,7 +3851,7 @@ public class StudioMCPBridge : BaseNetLogic
                                     if (deleted.Contains(parentPath))
                                         addErr(idx, "modifies_deleted_node",
                                                "parent '" + parentPath + "' is deleted earlier in this batch", null);
-                                    else if (ResolveNode(parentPath) == null && !created.ContainsKey(parentPath))
+                                    else if (HypoResolve(parentPath, created, relocated) == null)
                                         addErr(idx, "unresolved_parent",
                                                "no parent node at '" + parentPath + "'" + NearestHint(parentPath, willCreate), null);
                                 }
@@ -2591,8 +3865,103 @@ public class StudioMCPBridge : BaseNetLogic
                                 if (ResolveNode(newPath) != null && !deleted.Contains(newPath))
                                     addWarn(idx, "already_exists",
                                             "'" + newPath + "' already exists in the live model; the create may collide");
-                                created[newPath] = typeName ?? "";
+                                created[newPath] = new HypoNode { Verb = verb, Type = typeName ?? "" };
                                 deleted.Remove(newPath);
+                            }
+                            break;
+
+                        case "create_widget":
+                            {
+                                if (string.IsNullOrEmpty(name))
+                                { addErr(idx, "bad_op", "create_widget requires \"name\"", null); break; }
+                                string parentPath = ParentKey(op);
+                                string basePath = string.IsNullOrEmpty(parentPath)
+                                    ? name : parentPath.TrimEnd('/') + "/" + name;
+
+                                if (created.ContainsKey(basePath))
+                                { addErr(idx, "duplicate_create", "'" + basePath + "' is created twice in this batch", null); break; }
+                                if (!string.IsNullOrEmpty(parentPath))
+                                {
+                                    if (deleted.Contains(parentPath))
+                                    { addErr(idx, "modifies_deleted_node",
+                                             "parent '" + parentPath + "' is deleted earlier in this batch", null); break; }
+                                    if (HypoResolve(parentPath, created, relocated) == null)
+                                    { addErr(idx, "unresolved_parent",
+                                             "no parent node at '" + parentPath + "'" + NearestHint(parentPath, willCreate), null); break; }
+                                }
+
+                                // Mirror WriteWidgetInline's Item/Container guard:
+                                // bare instances of abstract layout bases crash the
+                                // render tree (found live 2026-07-25).
+                                if (typeName == "Item" || typeName == "Container")
+                                {
+                                    addErr(idx, "not_renderable",
+                                           "'" + typeName + "' is an abstract layout base, not a renderable "
+                                           + "widget -- a bare instance crashes the render tree. Use 'Panel' "
+                                           + "(invisible layout container; add a Rectangle child for a "
+                                           + "background) or 'Rectangle' (a filled/bordered box) instead.", null);
+                                    break;
+                                }
+
+                                // Attempt collection routing: resolve the screen node
+                                // and check for matching placeholder collections.
+                                // If the screen is a forward reference (not yet created)
+                                // we skip routing and record the flat path.
+                                string recordedPath = basePath;
+                                var screenNode = string.IsNullOrEmpty(parentPath)
+                                    ? null : ResolveNode(parentPath);
+                                if (screenNode != null && !string.IsNullOrEmpty(typeName))
+                                {
+                                    var childClr = ResolveWidgetClrType(typeName);
+                                    if (childClr != null)
+                                    {
+                                        var routes = MatchingPlaceholderColls(
+                                            screenNode, childClr, readOnly: false);
+                                        if (routes.Count > 1)
+                                        {
+                                            // Mirror WriteWidgetInline's ambiguous_container refusal.
+                                            addErr(idx, "ambiguous_container",
+                                                   "type '" + typeName + "' fits multiple collections on '" +
+                                                   parentPath + "': " + string.Join(", ", routes) +
+                                                   " - pass the collection sub-path explicitly (e.g. " +
+                                                   parentPath + "/" + routes[0] + ")", null);
+                                            break;
+                                        }
+                                        if (routes.Count == 0)
+                                        {
+                                            // Check whether a read-only collection would
+                                            // have matched (mirror WriteWidgetInline).
+                                            var roHits = MatchingPlaceholderColls(
+                                                screenNode, childClr, readOnly: true);
+                                            if (roHits.Count > 0)
+                                            {
+                                                addErr(idx, "read_only_collection",
+                                                       "type '" + typeName + "' only fits runtime-managed " +
+                                                       "(read-only) collection(s) on '" + parentPath + "': " +
+                                                       string.Join(", ", roHits) +
+                                                       " - these cannot be authored into", null);
+                                                break;
+                                            }
+                                            // Zero matches, no ro hit: flat add (no warning).
+                                        }
+                                        else // routes.Count == 1
+                                        {
+                                            // Widget will be routed into the collection.
+                                            recordedPath = parentPath.TrimEnd('/') + "/" + routes[0] + "/" + name;
+                                            addWarn(idx, "routed_into_collection",
+                                                    "create_widget will place '" + name + "' into collection '" +
+                                                    routes[0] + "' on '" + parentPath +
+                                                    "'; effective path will be '" + recordedPath + "'");
+                                        }
+                                    }
+                                }
+
+                                // Credit an earlier delete, same as other create ops.
+                                if (ResolveNode(recordedPath) != null && !deleted.Contains(recordedPath))
+                                    addWarn(idx, "already_exists",
+                                            "'" + recordedPath + "' already exists in the live model; the create may collide");
+                                created[recordedPath] = new HypoNode { Verb = verb, Type = typeName ?? "" };
+                                deleted.Remove(recordedPath);
                             }
                             break;
 
@@ -2631,7 +4000,8 @@ public class StudioMCPBridge : BaseNetLogic
     // property `name` on an existing-or-hypothetical node `path`.
     private void ValidateOnNode(
         int idx, string verb, string path, string name, string value,
-        Dictionary<string, string> created, HashSet<string> deleted,
+        Dictionary<string, HypoNode> created, HashSet<string> deleted,
+        Dictionary<string, string> relocated,
         List<string> willCreate,
         Action<int, string, string, string> addErr,
         Action<int, string, string> addWarn)
@@ -2661,16 +4031,26 @@ public class StudioMCPBridge : BaseNetLogic
             return;
         }
 
-        var node = ResolveNode(path);
+        // Resolve through the hypothetical tree (handles relocated prefix rewrites).
+        string effectivePath = HypoResolve(path, created, relocated);
+        var node = effectivePath != null ? ResolveNode(effectivePath) : null;
         if (node == null)
         {
-            string hypoType;
-            if (!created.TryGetValue(path, out hypoType))
+            HypoNode hypoNode;
+            if (effectivePath == null || !created.TryGetValue(effectivePath, out hypoNode))
             {
                 addErr(idx, "unresolved_reference",
                        "no node at '" + path + "'" + NearestHint(path, willCreate), null);
                 return;
             }
+            string hypoType = hypoNode.Type;
+            // create_variable always produces an IUAVariable.  Setting
+            // name="Value" is the variable self-assign path -- valid by
+            // definition.  Return CLEAN; coercion is deferred to apply
+            // (a live variable is required for type-checking).
+            if (verb == "set_property" && name == "Value" &&
+                hypoNode.Verb == "create_variable")
+                return;
             // HYPOTHETICAL node: it does not exist yet, so the live-instance
             // guard cannot see it. Fall back to TYPE-level reflection off the
             // declared type - the same property set describe_type reports.
@@ -2714,6 +4094,29 @@ public class StudioMCPBridge : BaseNetLogic
                        (sugg != null ? " (did you mean " + sugg + "?)" : ""), extra.ToString());
             }
             return;   // value coercion needs a live variable; deferred to apply
+        }
+
+        // Set a VARIABLE's OWN value: `set_property name=Value` on an IUAVariable
+        // node targets the node itself, not a child variable -- mirror of
+        // SetPropertyInline line 2771. Return here so DeclaredPropertyGuard never
+        // sees "Value" as a property name on the variable. (An IUAObject with a
+        // real child "Value" property, e.g. SpinBox, is not IUAVariable and falls
+        // through to node.GetVariable("Value") + DeclaredPropertyGuard below.)
+        if (verb == "set_property" && name == "Value" && node is IUAVariable selfVar)
+        {
+            if (IsArrayVariable(selfVar))
+            {
+                addErr(idx, "unsupported_array_write",
+                       "variable '" + path + "' is array-typed; array writes are not supported via set_property",
+                       null);
+                return;
+            }
+            if (value != null)
+            {
+                var bad = CoerceCheck(selfVar, value);
+                if (bad != null) addErr(idx, "bad_value", bad, null);
+            }
+            return;
         }
 
         // LIVE node: run the same guards the write path runs.
@@ -2846,16 +4249,21 @@ public class StudioMCPBridge : BaseNetLogic
             case "LocalizedText":
             case "String":
                 return null;   // CoerceAssign accepts any string for these
-            case "Int16": case "Int32": case "Int64":
-            case "UInt16": case "UInt32": case "UInt64": case "Byte": case "SByte":
+            case "Int16":
+            case "Int32":
+            case "Int64":
+            case "UInt16":
+            case "UInt32":
+            case "UInt64":
+            case "Byte":
+            case "SByte":
                 {
-                    long iv;
-                    if (!long.TryParse(raw, System.Globalization.NumberStyles.Integer,
-                                       System.Globalization.CultureInfo.InvariantCulture, out iv))
-                        return "value must be an integer for " + dt + ": " + raw;
-                    return null;
+                    UAValue iv;
+                    return ParseInteger(dt, raw, out iv);
                 }
-            case "Float": case "Double": case "Size":
+            case "Float":
+            case "Double":
+            case "Size":
                 {
                     double dv;
                     if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
@@ -2864,6 +4272,7 @@ public class StudioMCPBridge : BaseNetLogic
                     return null;
                 }
             case "NodeId":
+                if (IsNodeIdClearToken(raw)) return null;
                 return ResolveNode(raw) == null
                     ? "NodeId value must be a resolvable node path: " + raw : null;
             case "Color":
@@ -2871,6 +4280,16 @@ public class StudioMCPBridge : BaseNetLogic
             default:
                 return CheckEnumOrRaw(dt, raw);
         }
+    }
+
+    // Tokens meaning "no target" for a NodeId/NodePointer property. Kept in
+    // one place so the validator and the setter can never disagree about
+    // what clears a pointer.
+    private static bool IsNodeIdClearToken(string raw)
+    {
+        string s = (raw ?? "").Trim();
+        return s.Length == 0 ||
+               s.Equals("null", System.StringComparison.OrdinalIgnoreCase);
     }
 
     // Color parse-check, mirroring CoerceAssign's Color arm without the write.
@@ -3024,7 +4443,7 @@ public class StudioMCPBridge : BaseNetLogic
         if (int.TryParse(raw, out ord)) { v.Value = ord; return null; }
         // GENERIC: reflect the property's real enum type and parse the friendly
         // name from its own metadata. Handles every enum (FontWeight,
-        // TextHorizontalAlignment, alignment, ...) correctly — no hardcoded
+        // TextHorizontalAlignment, alignment, ...) correctly -- no hardcoded
         // per-enum map to maintain or get wrong. Case-insensitive. An invalid
         // name gets a valid-member list straight from the enum.
         var et = ResolveEnumType(dt);
@@ -3043,6 +4462,25 @@ public class StudioMCPBridge : BaseNetLogic
         var known = KnownEnumMembers(dt);
         if (known != null)
             return "invalid value '" + raw + "' for enum " + dt + "; valid: " + string.Join(", ", known);
+        // I31 (2026-08-28, SpinBox.ValueChangeBehaviour=__probe__ - Studio process
+        // GONE, no log line, no managed exception). The string assign below is the
+        // crash site: when the DATATYPE's browse name matches no loaded enum type,
+        // an invalid enum member fell through to a bare-string assign whose failure
+        // is a NATIVE assert, which the catch below can never see. Resolve the enum
+        // from the OWNER's declared CLR property instead - the same reflection
+        // DeclaredArrayGuard/DeclaredPropertyGuard use, and the one enum source that
+        // does not depend on the datatype NAME - and answer with the same bad_value +
+        // valid-member list the other 21 enum properties already produce.
+        var declared = DeclaredEnumType(v);
+        if (declared != null)
+        {
+            try { v.Value = Convert.ToInt32(Enum.Parse(declared, raw, true)); return null; }
+            catch
+            {
+                return "invalid value '" + raw + "' for enum " + declared.Name + "; valid: " +
+                       string.Join(", ", Enum.GetNames(declared));
+            }
+        }
         // Genuinely non-enum datatype: attempt the string assign, catching the
         // native assert so we still return a clean message.
         try { v.Value = raw; return null; }
@@ -3063,7 +4501,7 @@ public class StudioMCPBridge : BaseNetLogic
         switch (dt)
         {
             case "HorizontalAlignment": return new[] { "Left", "Right", "Center", "Stretch" };
-            case "VerticalAlignment":   return new[] { "Top", "Bottom", "Center", "Stretch" };
+            case "VerticalAlignment": return new[] { "Top", "Bottom", "Center", "Stretch" };
             default: return null;
         }
     }
@@ -3077,24 +4515,24 @@ public class StudioMCPBridge : BaseNetLogic
     //   VerticalAlignment   Top=0  Bottom=1  Center=2  Stretch=3
     //   HorizontalAlignment Left=0 Right=1   Center=2  Stretch=3
     // i.e. the EXTREME member is 1 and Center is 2. An earlier map assumed the WPF
-    // order, so "Bottom" set ordinal 2 (=Center) and rendered centered — a live
+    // order, so "Bottom" set ordinal 2 (=Center) and rendered centered -- a live
     // build burned ~14 tool calls reverse-engineering this. Do NOT "fix" Center
     // back to 1; that reintroduces the swap. (Note the sibling Content*/Text*
-    // alignment enums DO use the standard Center=1 order — different enums.)
+    // alignment enums DO use the standard Center=1 order -- different enums.)
     private static bool TryEnumOrdinal(string dt, string name, out int ord)
     {
         ord = 0;
         string key = (dt ?? "") + "." + (name ?? "").Trim().ToLowerInvariant();
         switch (key)
         {
-            case "HorizontalAlignment.left":    ord = 0; return true;
-            case "HorizontalAlignment.right":   ord = 1; return true;
-            case "HorizontalAlignment.center":  ord = 2; return true;
+            case "HorizontalAlignment.left": ord = 0; return true;
+            case "HorizontalAlignment.right": ord = 1; return true;
+            case "HorizontalAlignment.center": ord = 2; return true;
             case "HorizontalAlignment.stretch": ord = 3; return true;
-            case "VerticalAlignment.top":       ord = 0; return true;
-            case "VerticalAlignment.bottom":    ord = 1; return true;
-            case "VerticalAlignment.center":    ord = 2; return true;
-            case "VerticalAlignment.stretch":   ord = 3; return true;
+            case "VerticalAlignment.top": ord = 0; return true;
+            case "VerticalAlignment.bottom": ord = 1; return true;
+            case "VerticalAlignment.center": ord = 2; return true;
+            case "VerticalAlignment.stretch": ord = 3; return true;
             default: return false;
         }
     }
@@ -3151,12 +4589,69 @@ public class StudioMCPBridge : BaseNetLogic
                 case "ReadWrite": mode = DynamicLinkMode.ReadWrite; break;
                 default: mode = DynamicLinkMode.Read; break;
             }
+
+            // CLEAR THE PRIOR BINDING FIRST - this is Studio's own
+            // right-click -> "Remove binding" step, and skipping it is a real
+            // bug: SetDynamicLink replaces the link's VALUE but leaves any
+            // converter already attached to that link in place, so the
+            // property ends up with a target AND a stale converter fighting
+            // over it - reported as a clean success. Measured 2026-09-01:
+            // binding a Label.Text that carried a formatted dynamic link left
+            // its DynamicLinkFormatter attached. attach_formatter already
+            // calls ResetDynamicLink; bind does too now. What was removed is
+            // REPORTED rather than dropped silently.
+            // ResetDynamicLink clears BOTH converter positions, so BOTH have
+            // to be inspected before it runs:
+            //   link-level     - HasConverter on the DynamicLink. Where a
+            //                    StringFormatter (formatted dynamic link) sits.
+            //   property-level - HasConverter on the property itself. Where an
+            //                    ExpressionEvaluator sits (attach_expression
+            //                    uses propVar.SetConverter, never the link).
+            // Measured 2026-09-01: only the link was walked, so binding over a
+            // property-level ExpressionEvaluator DESTROYED it and reported
+            // "converter": false - an affirmative all-clear over a real loss,
+            // which is worse than staying silent. Report the KIND too, so the
+            // caller can tell a formatter from a formula it just lost.
+            bool hadLink = false, hadConverter = false;
+            string converterKind = "";
+            try
+            {
+                var priorLink = propVar.Refs.GetVariable(
+                    FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                if (priorLink != null)
+                {
+                    hadLink = true;
+                    foreach (var c in priorLink.Children)
+                        if (c is IUAObject)
+                        {
+                            hadConverter = true;
+                            converterKind = c.BrowseName;
+                            break;
+                        }
+                }
+                var propConv = propVar.Refs.GetObject(
+                    FTOptix.CoreBase.ReferenceTypes.HasConverter);
+                if (propConv != null)
+                {
+                    hadConverter = true;
+                    converterKind = propConv.BrowseName;
+                }
+            }
+            catch { }
+            propVar.ResetDynamicLink();
+            string cleared = ",\"prior binding cleared\":{\"link\":" +
+                (hadLink ? "true" : "false") + ",\"converter\":" +
+                (hadConverter ? "true" : "false") +
+                (hadConverter ? ",\"converter kind\":\"" +
+                 JsonEscape(converterKind) + "\"" : "") + "}";
+
             if (srcVar != null)
             {
                 propVar.SetDynamicLink(srcVar, mode);
                 return "{\"ok\":true,\"path\":\"" + JsonEscape(path + "/" + name) +
                        "\",\"source\":\"" + JsonEscape(source) +
-                       "\",\"mode\":\"" + JsonEscape(modeStr) + "\",\"via\":\"dynamiclink\"}";
+                       "\",\"mode\":\"" + JsonEscape(modeStr) + "\",\"via\":\"dynamiclink\""
+                       + cleared + "}";
             }
             // RAW NodePath binding - the alias/template mechanism. The stored
             // value is a LITERAL path ("{Alias1}/MyInt" or "../../Alias1/MyInt")
@@ -3176,7 +4671,8 @@ public class StudioMCPBridge : BaseNetLogic
             return "{\"ok\":true,\"path\":\"" + JsonEscape(path + "/" + name) +
                    "\",\"raw\":\"" + JsonEscape(raw) +
                    "\",\"mode\":\"" + JsonEscape(modeStr) + "\",\"via\":\"dynamiclink-raw\"" +
-                   ",\"note\":\"literal NodePath - resolves per instance at runtime; render-verify\"}";
+                   ",\"note\":\"literal NodePath - resolves per instance at runtime; render-verify\""
+                   + cleared + "}";
         }
         catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
     }
@@ -3307,26 +4803,23 @@ public class StudioMCPBridge : BaseNetLogic
     // runs at Studio DESIGN TIME against Project.Current, not a live runtime/PLC - the
     // blast radius is "the open project", the same as any other bridge write.
     //
-    // CONFIRMED HAZARD, not theoretical. Calling
-    // SearchBrokenDynamicLinks' FindBrokenDynamicLink through this endpoint killed
-    // the whole FTOptixStudio.exe process outright - reproduced twice, across two
-    // separate Studio sessions (crash, user relaunched Studio + StartBridge, called
-    // it again, crashed again). No exception was ever caught by the try/catch below;
-    // the process just died, which on .NET means something fatal happened on a
-    // thread this handler doesn't control (most likely: this TcpListener accept
-    // thread is NOT Studio's main/UI thread, and this particular built-in tool -
-    // presumably written assuming it's driven by the UI's own Execute gesture -
-    // touches something UI-thread-affine and crashes hard off-thread). This file's
-    // OWN _bridge_write docstring already documents this exact class of problem for
-    // property writes ("Several target endpoints require the bridge's
-    // main-thread-marshaled write path... until that ships the bridge replies
-    // not_implemented") - ExecuteMethod needs the same treatment, which it does NOT
-    // have yet. Until proper main-thread marshaling is added here, treat EVERY call
-    // through this endpoint as able to crash Studio, not just this one method - a
-    // custom, UI-free [ExportMethod] may well be fine, but that has not been
-    // verified either. For finding/fixing broken links specifically, use Studio's
-    // own right-click Execute instead (the safe, supported path) until this is
-    // fixed properly.
+    // SESSION, NOT THREAD (issue #4, root-caused 2026-09-24). ExecuteMethod on this
+    // HTTP thread used to kill FTOptixStudio.exe on ANY method - Optix's own
+    // SearchBrokenDynamicLinks, a custom method that throws mid-mutation (#4), even
+    // a method whose body does nothing. Every kill was the same native heap
+    // corruption (c0000374 in ntdll). The cause is that this thread has no Optix
+    // session: native code dereferences the missing session (merely READING
+    // Context.Sessions.CurrentSessionInfo here is enough to kill Studio). Studio's
+    // right-click Execute survives because the GUI thread has one; the managed path
+    // is otherwise identical (LogicBehavior.ExecuteMethod -> NetCodeExecutor is
+    // synchronous reflection that catches and logs the method's exceptions).
+    // ImpersonateRootTemporary() gives this thread a session for the call. Proven
+    // live on the bare-vs-impersonated A/B: no-op, CheckFormula, the #4 shape and UI
+    // creation all survive impersonated; the same calls bare kill Studio.
+    // Dead ends, for the record: DelayedTask/LongRunningTask/IContext.Dispatch never
+    // fire at design time, and Sessions.CurrentSessionHandler throws
+    // NotImplementedException, so the GUI session cannot be borrowed - root it is.
+    // The legacy unsafe=1 query param is accepted and ignored.
     private string InvokeMethodInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
@@ -3354,7 +4847,9 @@ public class StudioMCPBridge : BaseNetLogic
         object[] outputArgs;
         try
         {
-            obj.ExecuteMethod(methodName, inputArgs, out outputArgs);
+            // NEVER call ExecuteMethod (or read session info) outside this scope.
+            using (obj.Context.Sessions.ImpersonateRootTemporary())
+                obj.ExecuteMethod(methodName, inputArgs, out outputArgs);
         }
         catch (Exception ex)
         {
@@ -3373,7 +4868,7 @@ public class StudioMCPBridge : BaseNetLogic
         }
         return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
                "\",\"method\":\"" + JsonEscape(methodName) +
-               "\",\"output_args\":[" + outSb + "]}";
+               "\",\"session\":\"root\",\"output_args\":[" + outSb + "]}";
     }
 
     // Wire a UI event on a node (EventHandler graph, reverse-engineered from
@@ -3385,6 +4880,10 @@ public class StudioMCPBridge : BaseNetLogic
     //     ObjectPointer -> the builtin FTOptix.CoreBase.Objects.VariableCommands object;
     //     InputArguments = VariableToModify (VariablePointer) [+ Value] + ArrayIndex,
     //     the proven shape (FTRemoteAccessWidgetSetupLogic.cs:128-161 + cheatsheet).
+    //   - NATIVE UI COMMAND (also no custom NetLogic - see _UiCommands):
+    //       command=OpenDialog|CloseDialog|OpenKeyboard [&args=Name=Value;...]
+    //     ObjectPointer -> the builtin UICommands object, which lives OUTSIDE the
+    //     project root and so cannot be reached as a `method` path at all.
     //   - CUSTOM METHOD: method=ObjectPath/MethodName (an object owning an [ExportMethod]).
     // ObjectPointer is a typed FTOptix.Core.NodePointer (the dispatcher resolves the call
     // target through it; a plain NodeId wires but never invokes). FTOptix.Core/.CoreBase
@@ -3392,12 +4891,81 @@ public class StudioMCPBridge : BaseNetLogic
     // fully-qualified to dodge the System.EventHandler ambiguity (CS0104). Node-attach
     // order matches the sample: container -> ObjectPointer, Method, InputArguments; then
     // populate InputArguments after it's parented.
+    // Native FTOptix.UI commands reachable BY NAME through `command`, the way the
+    // VariableCommands pair is. They all live on the builtin UICommands object
+    // OUTSIDE the project root, which is why they cannot be a `method` path (a
+    // method_path of "Root/Objects/Commands/UICommands/OpenKeyboard" answers
+    // node_not_found - the field detour that motivated this list).
+    //   OpenDialog    Dialog (NodeId), AliasNode (NodeId), ParentItem (NodeId)
+    //   CloseDialog   no arguments
+    //   OpenKeyboard  KeyboardType (String), TargetVariable (NodeId),
+    //                 ParentItem (NodeId)   <- Modules/FTOptix.UI/<ver>/Module.xml
+    // KEEP IN SYNC with service/core.py::bridge_wire_event's _UI_COMMANDS.
+    private static readonly string[] _UiCommands = { "OpenDialog", "CloseDialog", "OpenKeyboard" };
+
+    // OpenKeyboard's three arguments, in Module.xml order. All three must be
+    // present (an empty ParentItem is the late-bound form, not an absent one).
+    private static readonly string[] _OpenKeyboardArgs =
+        { "KeyboardType", "TargetVariable", "ParentItem" };
+
+    // null when `args` names exactly OpenKeyboard's three arguments, else the
+    // message saying which are missing or unrecognized. Count, not order: the
+    // runtime counts arguments and rejects the call if the number is wrong.
+    private static string OpenKeyboardArgsError(string argsParam)
+    {
+        var given = new List<string>();
+        foreach (var pair in (argsParam ?? "").Split(';'))
+        {
+            int eq = pair.IndexOf('=');
+            if (eq <= 0) continue;
+            given.Add(pair.Substring(0, eq).Trim());
+        }
+        var missing = new List<string>();
+        foreach (var need in _OpenKeyboardArgs)
+            if (!given.Contains(need)) missing.Add(need);
+        var extra = new List<string>();
+        foreach (var g in given)
+            if (Array.IndexOf(_OpenKeyboardArgs, g) < 0) extra.Add(g);
+        if (missing.Count == 0 && extra.Count == 0) return null;
+        return "OpenKeyboard takes exactly its three InputArguments" +
+               (missing.Count > 0 ? " - missing: " + string.Join(", ", missing) : "") +
+               (extra.Count > 0 ? " - not an OpenKeyboard argument: " + string.Join(", ", extra) : "") +
+               ". Pass args=\"KeyboardType=<Numeric|AlphaNumeric|...>;TargetVariable=" +
+               "<variable path>;ParentItem=\" - an empty ParentItem is late-bound to " +
+               "the event node, as a Studio-authored handler does. A wrong argument " +
+               "count fails at RUNTIME, silently, on the click.";
+    }
+
     private string WireEventInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
         string evt = QueryParam(firstLine, "event");
         string command = QueryParam(firstLine, "command");
         string method = QueryParam(firstLine, "method");
+        // B19: method ARGUMENTS. Without this only argument-less methods are
+        // reachable (Dialog.Close, *.Refresh) -- and the ones that matter all take
+        // arguments: ChangePanel(NewPanel), ChangePanelByTabName(TabName),
+        // OpenDialog(Dialog, AliasNode). Semicolon-separated Name=Value pairs;
+        // ';' rather than ',' because node paths routinely contain commas.
+        string argsParam = QueryParam(firstLine, "args");
+        // explicit caller escape hatch. When replace=true and a
+        // matching handler exists, delete it first and proceed with the full
+        // create path. The default (replace absent / false) remains in-place
+        // update or the unsafe-error gate.
+        string replaceRaw = QueryParam(firstLine, "replace");
+        bool replace = string.Equals(replaceRaw, "true", StringComparison.OrdinalIgnoreCase);
+        // B3-on-the-ObjectPointer. An ABSOLUTE NodeId names the DESIGN-TIME node,
+        // but a UI object is instantiated PER SESSION under
+        // UI/<engine>/Sessions/<id>/UIRoot/..., so at runtime the call target is
+        // not at the pointed NodeId and the dispatcher answers "No behaviour or
+        // observer found that handles the method". The command path escapes this
+        // only because VariableCommands is a global singleton.
+        // `object_raw` is a LITERAL NodePath RELATIVE TO THE EVENT NODE (the node
+        // the handler hangs off) -- e.g. "../Loader" for a sibling. The four
+        // levels from ObjectPointer up to that node (MethodContainer1 /
+        // MethodsToCall / EventHandler) are prepended here so callers need not
+        // count them. Method-path mode only; ignored with `command`.
+        string objectRaw = QueryParam(firstLine, "object_raw");
         if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(evt))
             return ErrorJson("bad_query", "required: path, event");
         if (string.IsNullOrEmpty(command) && string.IsNullOrEmpty(method))
@@ -3439,10 +5007,47 @@ public class StudioMCPBridge : BaseNetLogic
             // Resolve the call target (ObjectPointer value + Method name) by mode.
             NodeId objPtrTarget;
             string methodName;
+            IUANode methodTargetNode = null;   // method mode only - the call target
             IUAVariable cmdTargetVar = null;   // command mode only
             string cmdValueRaw = null;         // command mode, Set only
             bool cmdNeedsValue = false;
-            if (!string.IsNullOrEmpty(command))
+            bool uiCommand = !string.IsNullOrEmpty(command) &&
+                             Array.IndexOf(_UiCommands, command) >= 0;
+            if (uiCommand)
+            {
+                // OpenKeyboard takes THREE InputArguments - KeyboardType (String),
+                // TargetVariable (NodeId), ParentItem (NodeId), per
+                // Modules/FTOptix.UI/<ver>/Module.xml. A wrong COUNT is a RUNTIME
+                // error ("Called method OpenKeyboard with an invalid number of
+                // arguments"), i.e. a click that does nothing and a Studio log line
+                // nobody reads, so the count is settled here instead - before the
+                // EventHandler is created, so a rejected call leaves no half-built
+                // handler behind. Names, not order: the generic args block below
+                // maps each pair to its argument by name.
+                if (command == "OpenKeyboard")
+                {
+                    var argErr = OpenKeyboardArgsError(argsParam);
+                    if (argErr != null) return ErrorJson("bad_query", argErr);
+                }
+                // Native UI commands (_UiCommands) live on the builtin FTOptix.UI
+                // UICommands object at
+                // /Objects/Commands/UICommands -- OUTSIDE the project root, so
+                // ResolveNode cannot reach it and a method path of
+                // "Commands/UICommands/OpenDialog" answers node_not_found. Fetch it
+                // by PATH from the /Objects root (Project.Current.Owner), which is
+                // how a Studio-authored handler points at it too
+                // ("/Objects/Commands/UICommands"). Its arguments come from `args`
+                // (Dialog=<type path>;AliasNode=<node>;ParentItem=) -- populated by
+                // the generic args block below, where ParentItem, if named with an
+                // EMPTY value, is late-bound to the event node ("..@NodeId" from
+                // InputArguments), which is what a Studio-authored OpenDialog carries.
+                IUANode uiObj = null;
+                try { uiObj = Project.Current.Owner.Get("Commands/UICommands"); } catch { }
+                if (uiObj == null) return ErrorJson("command_unavailable", "UICommands not in address space");
+                objPtrTarget = uiObj.NodeId;
+                methodName = command;
+            }
+            else if (!string.IsNullOrEmpty(command))
             {
                 string varPath = QueryParam(firstLine, "variable");
                 if (string.IsNullOrEmpty(varPath))
@@ -3454,11 +5059,13 @@ public class StudioMCPBridge : BaseNetLogic
                 objPtrTarget = vcObj.NodeId;
                 switch (command)
                 {
-                    case "SetVariable": case "Set":
+                    case "SetVariable":
+                    case "Set":
                         methodName = "Set"; cmdNeedsValue = true;
                         cmdValueRaw = QueryParam(firstLine, "value") ?? "";
                         break;
-                    case "ToggleVariable": case "Toggle":
+                    case "ToggleVariable":
+                    case "Toggle":
                         methodName = "Toggle";
                         break;
                     default:
@@ -3472,7 +5079,376 @@ public class StudioMCPBridge : BaseNetLogic
                 var objNode = ResolveNode(method.Substring(0, slash));
                 if (objNode == null) return ErrorJson("node_not_found", "no method object at: " + method.Substring(0, slash));
                 objPtrTarget = objNode.NodeId;
+                methodTargetNode = objNode;
                 methodName = method.Substring(slash + 1);
+            }
+
+            // Existing-handler lookup: scan the node's children for any
+            // FTOptix.CoreBase.EventHandler whose ListenEventType variable holds the
+            // same NodeId as evtTypeId. Handlers authored in Studio can carry any
+            // BrowseName, so the match is on event-type identity, NOT on the
+            // "EH_" + evt + "_" + BrowseName string. The result gates all subsequent
+            // behaviour: in-place update, unsafe-error
+            //, or delete-then-create when replace=true.
+            FTOptix.CoreBase.EventHandler existingHandler = null;
+            foreach (var child in node.Children)
+            {
+                if (!(child is FTOptix.CoreBase.EventHandler candidateEh)) continue;
+                var letCheck = candidateEh.GetVariable("ListenEventType");
+                if (letCheck == null) continue;
+                var candidateEvtId = letCheck.Value.Value as NodeId;
+                if (candidateEvtId != null && candidateEvtId == evtTypeId)
+                {
+                    existingHandler = candidateEh;
+                    break;
+                }
+            }
+
+            // Gate: a matching handler already lives on the node.
+            // replace=true  -> delete-then-create (explicit caller escape hatch).
+            // replace=false -> in-place update (DEFAULT).
+            bool replaced = false;
+            if (existingHandler != null)
+            {
+                if (replace)
+                {
+                    // replace=true: delete the existing handler so the full normal
+                    // create path below produces a clean, correctly-wired handler.
+                    existingHandler.Delete();
+                    replaced = true;
+                }
+                else
+                {
+                    // safety gate -- determine whether the found handler's
+                    // shape allows a safe in-place rewrite before proceeding. Unsafe
+                    // triggers (any one -> return handler_exists with existing summary):
+                    //   (1) >1 MethodContainer in MethodsToCall -- ambiguous which to update.
+                    //   (2) A sibling EventHandler on `node` whose ListenEventType cannot
+                    //       be read -- we cannot confirm it is NOT also for this event type.
+                    //   (3) A non-EventHandler child whose BrowseName equals the name we
+                    //       would use for a freshly-created handler -- would block replace.
+                    var mcList = new List<IUANode>();
+                    foreach (var mcChild in existingHandler.MethodsToCall) mcList.Add(mcChild);
+
+                    // Condition (1): count MethodContainers.
+                    bool inPlaceSafe = mcList.Count == 1;
+
+                    // Condition (2): scan siblings for EventHandlers with unreadable LET.
+                    if (inPlaceSafe)
+                    {
+                        foreach (var sibling in node.Children)
+                        {
+                            if (!(sibling is FTOptix.CoreBase.EventHandler sibEh)) continue;
+                            if (sibEh == existingHandler) continue;
+                            var sibLet = sibEh.GetVariable("ListenEventType");
+                            if (sibLet == null || !(sibLet.Value.Value is NodeId))
+                            {
+                                inPlaceSafe = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Condition (3): non-EventHandler child with the create-path BrowseName.
+                    if (inPlaceSafe)
+                    {
+                        string expectedName = "EH_" + evt + "_" + node.BrowseName;
+                        foreach (var c in node.Children)
+                        {
+                            if (c.BrowseName == expectedName &&
+                                !(c is FTOptix.CoreBase.EventHandler))
+                            {
+                                inPlaceSafe = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!inPlaceSafe)
+                    {
+                        // Build the existing-handler summary for the structured error.
+                        // Summarise from the FIRST MethodContainer when one exists.
+                        string existingBrowseName = existingHandler.BrowseName;
+                        string existingTarget = "";
+                        string existingArgsJson = "[]";
+
+                        if (mcList.Count >= 1)
+                        {
+                            var firstMc = mcList[0];
+                            var optrVar    = firstMc.GetVariable("ObjectPointer");
+                            var mNameVar   = firstMc.GetVariable("Method");
+                            string objStr  = optrVar?.Value.Value?.ToString() ?? "";
+                            string mStr    = mNameVar?.Value.Value?.ToString() ?? "";
+                            existingTarget = string.IsNullOrEmpty(mStr)
+                                ? objStr
+                                : (string.IsNullOrEmpty(objStr) ? mStr : objStr + "/" + mStr);
+
+                            IUANode iaNode = null;
+                            foreach (var ch in firstMc.Children)
+                                if (ch.BrowseName == "InputArguments") { iaNode = ch; break; }
+                            if (iaNode != null)
+                            {
+                                var names = iaNode.Children
+                                    .Select(a => "\"" + JsonEscape(a.BrowseName) + "\"")
+                                    .ToList();
+                                existingArgsJson = "[" + string.Join(",", names) + "]";
+                            }
+                        }
+
+                        var existSb = new StringBuilder();
+                        existSb.Append("{\"ok\":false,\"error\":{\"code\":\"handler_exists\",\"message\":\"");
+                        existSb.Append(JsonEscape(
+                            "a handler for this event type already exists and cannot be safely "
+                            + "rewritten in place: " + existingBrowseName
+                            + " -- use replace=true to delete it first"));
+                        existSb.Append("\",\"existing\":{\"browse_name\":\"");
+                        existSb.Append(JsonEscape(existingBrowseName));
+                        existSb.Append("\",\"target\":\"");
+                        existSb.Append(JsonEscape(existingTarget));
+                        existSb.Append("\",\"args\":");
+                        existSb.Append(existingArgsJson);
+                        existSb.Append("}}}");
+                        return existSb.ToString();
+                    }
+
+                    // Safe path: exactly one MethodContainer, no
+                    // ambiguous siblings, no name-conflict children -- proceed with
+                    // in-place update -- rewrite MethodContainer1's ObjectPointer,
+                    // Method, and InputArguments without deleting + recreating the
+                    // handler. Arguments absent from the new call are DELETED
+                    // (wholesale replacement of InputArguments), not left stale.
+                    IUANode existingMc = null;
+                    foreach (var ch in existingHandler.MethodsToCall)
+                    { existingMc = ch; break; }
+                    if (existingMc == null)
+                        return ErrorJson("handler_malformed",
+                            "existing handler has no MethodContainer in MethodsToCall: " +
+                            existingHandler.BrowseName);
+
+                    var existingObjPtr = existingMc.GetVariable("ObjectPointer");
+                    if (existingObjPtr == null)
+                        return ErrorJson("handler_malformed",
+                            "existing handler MethodContainer has no ObjectPointer variable");
+                    var existingMethodVar = existingMc.GetVariable("Method");
+                    if (existingMethodVar == null)
+                        return ErrorJson("handler_malformed",
+                            "existing handler MethodContainer has no Method variable");
+
+                    // Snapshot pre-update values for the changed list.
+                    var prevObjPtrVal = existingObjPtr.Value.Value as NodeId;
+                    var prevMethodName = existingMethodVar.Value.Value as string;
+                    var prevLink = existingObjPtr.Refs.GetVariable(
+                        FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                    string prevLinkPath = prevLink?.Value.Value as string;
+                    var prevArgNames = new List<string>();
+                    IUANode existingInputArgs = null;
+                    foreach (var ch in existingMc.Children)
+                        if (ch.BrowseName == "InputArguments") { existingInputArgs = ch; break; }
+                    if (existingInputArgs != null)
+                        foreach (var ch in existingInputArgs.Children)
+                            prevArgNames.Add(ch.BrowseName);
+
+                    // Compute rawPath for the update, using the existing ObjectPointer
+                    // as the link holder (same SameTypeRelativePath call as create path).
+                    bool ehAutoRel = false;
+                    string ehRawPath = null;
+                    if (!string.IsNullOrEmpty(objectRaw) && string.IsNullOrEmpty(command))
+                        ehRawPath = "../../../../" + objectRaw;
+                    else if (string.IsNullOrEmpty(command) && methodTargetNode != null)
+                    {
+                        ehRawPath = SameTypeRelativePath(existingObjPtr, methodTargetNode);
+                        ehAutoRel = ehRawPath != null;
+                    }
+
+                    // --- Write ObjectPointer value ---
+                    existingObjPtr.Value = objPtrTarget;
+
+                    // --- Write link path ---
+                    var opLink = existingObjPtr.Refs.GetVariable(
+                        FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                    if (ehRawPath != null)
+                    {
+                        if (ehRawPath.IndexOf('@') < 0) ehRawPath += "@NodeId";
+                        if (opLink == null)
+                        {
+                            // Materialize a new DynamicLink (same pattern as create path).
+                            existingObjPtr.SetDynamicLink(null, DynamicLinkMode.Read);
+                            opLink = existingObjPtr.Refs.GetVariable(
+                                FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                            if (opLink == null)
+                                return ErrorJson("link_materialize_failed",
+                                    "SetDynamicLink(null) did not materialize a DynamicLink " +
+                                    "on ObjectPointer (update path)");
+                        }
+                        opLink.Value = ehRawPath;
+                        var kindVar = existingObjPtr.GetVariable("Kind");
+                        if (kindVar != null) kindVar.Value = new NodeId(0, 58);
+                    }
+                    else if (opLink != null)
+                    {
+                        // No link wanted -- blank the path so the pointer falls back
+                        // to the NodeId value rather than a stale relative path.
+                        opLink.Value = "";
+                    }
+
+                    // --- Write Method name ---
+                    existingMethodVar.Value = methodName;
+
+                    // --- Replace InputArguments wholesale ---
+                    // Delete all existing argument children first so no stale args remain.
+                    if (existingInputArgs == null)
+                    {
+                        existingInputArgs = InformationModel.MakeObject("InputArguments");
+                        existingMc.Add(existingInputArgs);
+                    }
+                    else
+                    {
+                        var toDelete = new List<IUANode>();
+                        foreach (var ch in existingInputArgs.Children)
+                            toDelete.Add(ch);
+                        foreach (var ch in toDelete)
+                            try { ch.Delete(); } catch { }
+                    }
+                    // Populate the now-empty InputArguments (same logic as create path).
+                    if (cmdTargetVar != null)
+                    {
+                        var vtm = InformationModel.MakeVariable("VariableToModify",
+                            FTOptix.Core.DataTypes.VariablePointer);
+                        vtm.Value = cmdTargetVar.NodeId;
+                        existingInputArgs.Add(vtm);
+                        if (cmdNeedsValue)
+                        {
+                            var valVar = InformationModel.MakeVariable("Value",
+                                cmdTargetVar.DataType);
+                            existingInputArgs.Add(valVar);
+                            var cverr = CoerceAssign(valVar, cmdValueRaw, firstLine);
+                            if (cverr != null) return ErrorJson("bad_value", cverr);
+                        }
+                        var ai = InformationModel.MakeVariable("ArrayIndex",
+                            OpcUa.DataTypes.UInt32);
+                        ai.Value = (uint)0;
+                        existingInputArgs.Add(ai);
+                    }
+                    else if (!string.IsNullOrEmpty(argsParam) || uiCommand)
+                    {
+                        foreach (var pair in (argsParam ?? "").Split(';'))
+                        {
+                            if (pair.Trim().Length == 0) continue;
+                            int eq = pair.IndexOf('=');
+                            if (eq <= 0)
+                                return ErrorJson("bad_query",
+                                    "args entry must be Name=Value, got: " + pair);
+                            string argName = pair.Substring(0, eq).Trim();
+                            string argVal  = pair.Substring(eq + 1);
+                            if (uiCommand && argName == "ParentItem" && argVal.Length == 0)
+                            {
+                                var pv = InformationModel.MakeVariable(argName,
+                                    OpcUa.DataTypes.NodeId);
+                                existingInputArgs.Add(pv);
+                                pv.SetDynamicLink(null, DynamicLinkMode.Read);
+                                var pl = pv.Refs.GetVariable(
+                                    FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                                if (pl != null) pl.Value = "../../../../..@NodeId";
+                                continue;
+                            }
+                            if (argVal.Length == 0)
+                            {
+                                existingInputArgs.Add(InformationModel.MakeVariable(
+                                    argName, OpcUa.DataTypes.NodeId));
+                                continue;
+                            }
+                            var argTarget = ResolveNode(argVal);
+                            if (argTarget != null)
+                            {
+                                var nv = InformationModel.MakeVariable(argName,
+                                    OpcUa.DataTypes.NodeId);
+                                nv.Value = argTarget.NodeId;
+                                existingInputArgs.Add(nv);
+                            }
+                            else
+                            {
+                                var sv = InformationModel.MakeVariable(argName,
+                                    OpcUa.DataTypes.String);
+                                existingInputArgs.Add(sv);
+                                var argErr = CoerceAssign(sv, argVal, firstLine);
+                                if (argErr != null) return ErrorJson("bad_value", argErr);
+                            }
+                        }
+                    }
+
+                    // --- Read-back verification ---
+                    var rbObjPtr = existingMc.GetVariable("ObjectPointer");
+                    if (rbObjPtr == null)
+                        return ErrorJson("readback_failed",
+                            "ObjectPointer not readable after in-place update");
+                    var rbObjPtrVal = rbObjPtr.Value.Value as NodeId;
+                    if (rbObjPtrVal == null || rbObjPtrVal != objPtrTarget)
+                        return ErrorJson("readback_mismatch",
+                            "ObjectPointer value did not read back as written");
+
+                    var rbMethodVar = existingMc.GetVariable("Method");
+                    if (rbMethodVar == null)
+                        return ErrorJson("readback_failed",
+                            "Method not readable after in-place update");
+                    var rbMethodName = rbMethodVar.Value.Value as string;
+                    if (rbMethodName != methodName)
+                        return ErrorJson("readback_mismatch",
+                            "Method name did not read back as written: got " + rbMethodName);
+
+                    // Link read-back: ehRawPath already has @NodeId appended if needed.
+                    var rbLink = rbObjPtr.Refs.GetVariable(
+                        FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                    string rbLinkPath = rbLink?.Value.Value as string;
+                    if (ehRawPath != null && rbLinkPath != ehRawPath)
+                        return ErrorJson("readback_mismatch",
+                            "ObjectPointer link did not read back as written: " + rbLinkPath);
+
+                    // InputArguments read-back: collect new arg names.
+                    IUANode rbInputArgs = null;
+                    foreach (var ch in existingMc.Children)
+                        if (ch.BrowseName == "InputArguments") { rbInputArgs = ch; break; }
+                    var newArgNames = new List<string>();
+                    if (rbInputArgs != null)
+                        foreach (var ch in rbInputArgs.Children)
+                            newArgNames.Add(ch.BrowseName);
+
+                    // --- Build changed list ---
+                    var changed = new List<string>();
+                    if (prevObjPtrVal != rbObjPtrVal) changed.Add("ObjectPointer");
+                    if (prevLinkPath != rbLinkPath)   changed.Add("ObjectPointerLink");
+                    if (prevMethodName != rbMethodName) changed.Add("Method");
+                    bool argsDiffer = prevArgNames.Count != newArgNames.Count;
+                    if (!argsDiffer)
+                        for (int i = 0; i < prevArgNames.Count; i++)
+                            if (prevArgNames[i] != newArgNames[i])
+                            { argsDiffer = true; break; }
+                    if (argsDiffer) changed.Add("InputArguments");
+
+                    // Build the via string. Append +existing to reflect that the
+                    // operation RESULT was an in-place update of an existing handler.
+                    string updVia = (uiCommand ? "uicommand:" + methodName
+                        : string.IsNullOrEmpty(command)
+                        ? "eventhandler"
+                          + (string.IsNullOrEmpty(argsParam) ? "" : "+args")
+                          + (string.IsNullOrEmpty(objectRaw) ? "" : "+lateobj")
+                          + (ehAutoRel ? "+reltype" : "")
+                        : "command:" + methodName) + "+existing";
+
+                    var changedSb = new StringBuilder("[");
+                    for (int i = 0; i < changed.Count; i++)
+                    {
+                        if (i > 0) changedSb.Append(",");
+                        changedSb.Append("\"");
+                        changedSb.Append(JsonEscape(changed[i]));
+                        changedSb.Append("\"");
+                    }
+                    changedSb.Append("]");
+
+                    return "{\"ok\":true,\"updated\":true,\"node\":\"" + JsonEscape(path) +
+                           "\",\"event\":\"" + JsonEscape(evt) +
+                           "\",\"via\":\"" + JsonEscape(updVia) +
+                           "\",\"changed\":" + changedSb + "}";
+                }
             }
 
             var eh = InformationModel.MakeObject<FTOptix.CoreBase.EventHandler>("EH_" + evt + "_" + node.BrowseName);
@@ -3485,6 +5461,51 @@ public class StudioMCPBridge : BaseNetLogic
                 "ObjectPointer", OpcUa.DataTypes.NodeId);
             objPtr.Value = objPtrTarget;
             mc.Add(objPtr);
+            // The link path the ObjectPointer should carry, if any. TWO sources:
+            //   objectRaw   - the caller's own literal, relative to the event node
+            //   same-type   - FIELD FINDING 2026-09-04. When the method object and
+            //                 the event node live under the SAME ObjectType, the
+            //                 absolute NodeId above names the TYPE's copy of the
+            //                 object, so at runtime the per-session instance calls
+            //                 into nothing: "No behaviour or observer found that
+            //                 handles the method". Derive the relative path the way
+            //                 bind gets it for free. Untouched across types, where
+            //                 the absolute id is the correct target.
+            bool autoRel = false;
+            string rawPath = null;
+            if (!string.IsNullOrEmpty(objectRaw) && string.IsNullOrEmpty(command))
+                rawPath = "../../../../" + objectRaw;
+            else if (string.IsNullOrEmpty(command) && methodTargetNode != null)
+            {
+                rawPath = SameTypeRelativePath(objPtr, methodTargetNode);
+                autoRel = rawPath != null;
+            }
+            if (rawPath != null)
+            {
+                // Same legacy pattern as the raw bind: materialize an empty link,
+                // then write the literal path into the DynamicLink variable. Must
+                // happen AFTER mc.Add(objPtr) -- the link is a child reference and
+                // needs the variable parented first.
+                objPtr.SetDynamicLink(null, DynamicLinkMode.Read);
+                var opLink = objPtr.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                if (opLink == null)
+                    return ErrorJson("link_materialize_failed",
+                        "SetDynamicLink(null) did not materialize a DynamicLink on ObjectPointer");
+                // The @ attribute selects what the link MEANS. A method target is
+                // the NODE, so it needs @NodeId -- without it the link resolves to
+                // the node's VALUE and the dispatcher gets nothing to call. A
+                // Studio-authored handler stores "../../../../../Loader@NodeId";
+                // the same path WITHOUT the suffix is accepted and silently does
+                // nothing. Callers may supply their own @attr; only default it.
+                if (rawPath.IndexOf('@') < 0) rawPath += "@NodeId";
+                opLink.Value = rawPath;
+                // Kind constrains what the pointer may address. Studio sets
+                // BaseObjectType (ns=0;i=58) here; leaving it Null is the third
+                // difference from a working handler.
+                var kindVar = objPtr.GetVariable("Kind");
+                if (kindVar != null)
+                    kindVar.Value = new NodeId(0, 58);
+            }
             var mName = InformationModel.MakeVariable("Method", OpcUa.DataTypes.String);
             mName.Value = methodName;
             mc.Add(mName);
@@ -3512,10 +5533,93 @@ public class StudioMCPBridge : BaseNetLogic
                 ai.Value = (uint)0;
                 inputArgs.Add(ai);
             }
+            else if (!string.IsNullOrEmpty(argsParam) || uiCommand)
+            {
+                // One typed child per Name=Value pair. The TYPE is decided by
+                // whether the value resolves to a node, because that is the only
+                // distinction the callers actually need:
+                //
+                //   ChangePanel(NewPanel=UI/Screens/Alarms)   -> a node
+                //   ChangePanelByTabName(TabName=Alarms)      -> a string
+                //
+                // A node-valued argument is a NodePointer, NOT a bare NodeId, for
+                // the same reason ObjectPointer above is one: the dispatcher
+                // resolves the call target through the pointer, and a plain NodeId
+                // wires but never resolves at invoke time.
+                //
+                // KNOWN LIMIT: an argument whose declared type is numeric
+                // (ChangePanelByTabIndex(TabIndex)) lands as a String and will fail
+                // at invoke. Prefer the ByTabName form. Typing these properly means
+                // reading the method's declared InputArguments off the target type
+                // rather than inferring, which is the right fix and a bigger one.
+                foreach (var pair in (argsParam ?? "").Split(';'))
+                {
+                    if (pair.Trim().Length == 0) continue;
+                    int eq = pair.IndexOf('=');
+                    if (eq <= 0)
+                        return ErrorJson("bad_query",
+                            "args entry must be Name=Value, got: " + pair);
+                    string argName = pair.Substring(0, eq).Trim();
+                    string argVal = pair.Substring(eq + 1);
+                    if (uiCommand && argName == "ParentItem" && argVal.Length == 0)
+                    {
+                        // The dialog's parent is the WIDGET THAT OPENED IT -- a
+                        // per-session node, so it must be late-bound, never an
+                        // absolute NodeId. Five levels up from a variable under
+                        // InputArguments reaches the event node.
+                        var pv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId);
+                        inputArgs.Add(pv);
+                        pv.SetDynamicLink(null, DynamicLinkMode.Read);
+                        var pl = pv.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                        if (pl != null) pl.Value = "../../../../..@NodeId";
+                        continue;
+                    }
+                    // An EMPTY value declares the argument and leaves it Null.
+                    // ChangePanel's signature is (NewPanel, AliasNode) and the
+                    // OPTIONAL AliasNode must still be PRESENT -- a Studio-authored
+                    // handler carries it as a Null variable, and omitting it is one
+                    // of the three reasons a hand-built call silently does nothing.
+                    if (argVal.Length == 0)
+                    {
+                        inputArgs.Add(InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId));
+                        continue;
+                    }
+                    var argTarget = ResolveNode(argVal);
+                    if (argTarget != null)
+                    {
+                        // A PLAIN UAVariable holding the NodeId -- NOT a NodePointer.
+                        // Verified against a Studio-authored ChangePanel handler:
+                        // its NewPanel is a UAVariable, and a NodePointer there does
+                        // not resolve (the call is accepted and does nothing).
+                        // ObjectPointer is the one that IS a NodePointer.
+                        var nv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId);
+                        nv.Value = argTarget.NodeId;
+                        inputArgs.Add(nv);
+                    }
+                    else
+                    {
+                        var sv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.String);
+                        inputArgs.Add(sv);
+                        var argErr = CoerceAssign(sv, argVal, firstLine);
+                        if (argErr != null) return ErrorJson("bad_value", argErr);
+                    }
+                }
+            }
 
-            string via = string.IsNullOrEmpty(command) ? "eventhandler" : "command:" + methodName;
+            // Append +replaced when the RESULT was a delete-then-create (replace=true),
+            // so the via string reflects the operation outcome, not just the request shape.
+            string via = (uiCommand ? "uicommand:" + methodName
+                : string.IsNullOrEmpty(command)
+                ? "eventhandler"
+                  + (string.IsNullOrEmpty(argsParam) ? "" : "+args")
+                  + (string.IsNullOrEmpty(objectRaw) ? "" : "+lateobj")
+                  + (autoRel ? "+reltype" : "")
+                : "command:" + methodName)
+                + (replaced ? "+replaced" : "");
             return "{\"ok\":true,\"node\":\"" + JsonEscape(path) + "\",\"event\":\"" + JsonEscape(evt) +
-                   "\",\"via\":\"" + JsonEscape(via) + "\"}";
+                   "\",\"via\":\"" + JsonEscape(via) + "\""
+                   + (replaced ? ",\"replaced\":true" : "")
+                   + "}";
         }
         catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
     }
@@ -3667,6 +5771,43 @@ public class StudioMCPBridge : BaseNetLogic
         return null;
     }
 
+    // Parse an integer at the variable's declared width; null on success, else a
+    // bad_value message. Range errors are refused, never wrapped.
+    private static string ParseInteger(string dt, string raw, out UAValue val)
+    {
+        val = null;
+        var ns = System.Globalization.NumberStyles.Integer;
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        string s = (raw ?? "").Trim();
+        if (dt == "UInt64")
+        {
+            ulong u;
+            if (ulong.TryParse(s, ns, ci, out u)) { val = u; return null; }
+            long neg;
+            return long.TryParse(s, ns, ci, out neg)
+                ? "value out of range for UInt64: " + raw
+                : "value must be an integer for UInt64: " + raw;
+        }
+        long iv;
+        if (!long.TryParse(s, ns, ci, out iv))
+        {
+            return System.Text.RegularExpressions.Regex.IsMatch(s, @"^[+-]?[0-9]+$")
+                ? "value out of range for " + dt + ": " + raw
+                : "value must be an integer for " + dt + ": " + raw;
+        }
+        switch (dt)
+        {
+            case "SByte":  if (iv >= sbyte.MinValue && iv <= sbyte.MaxValue) { val = (sbyte)iv; return null; } break;
+            case "Byte":   if (iv >= byte.MinValue && iv <= byte.MaxValue) { val = (byte)iv; return null; } break;
+            case "Int16":  if (iv >= short.MinValue && iv <= short.MaxValue) { val = (short)iv; return null; } break;
+            case "UInt16": if (iv >= ushort.MinValue && iv <= ushort.MaxValue) { val = (ushort)iv; return null; } break;
+            case "Int32":  if (iv >= int.MinValue && iv <= int.MaxValue) { val = (int)iv; return null; } break;
+            case "UInt32": if (iv >= uint.MinValue && iv <= uint.MaxValue) { val = (uint)iv; return null; } break;
+            case "Int64":  val = iv; return null;
+        }
+        return "value out of range for " + dt + ": " + raw;
+    }
+
     // Coerce a query-string value to a target variable's DataType (mirror of the
     // SetPropertyInline switch; kept separate so that validated path is untouched).
     // Returns UAValue (not object) so each typed return implicitly converts - an
@@ -3676,10 +5817,23 @@ public class StudioMCPBridge : BaseNetLogic
         switch (dtName)
         {
             case "Boolean": return (raw == "true" || raw == "1" || raw == "True");
-            case "Int16": case "Int32": case "Int64":
-            case "UInt16": case "UInt32": case "UInt64": case "Byte": case "SByte":
-                return Convert.ToInt32(raw);
-            case "Float": case "Double": case "Size":
+            case "Int16":
+            case "Int32":
+            case "Int64":
+            case "UInt16":
+            case "UInt32":
+            case "UInt64":
+            case "Byte":
+            case "SByte":
+                {
+                    UAValue iv;
+                    string err = ParseInteger(dtName, raw, out iv);
+                    if (err != null) throw new FormatException(err);
+                    return iv;
+                }
+            case "Float":
+            case "Double":
+            case "Size":
                 return Convert.ToDouble(raw);
             case "LocalizedText":
                 return new LocalizedText(raw, QueryParam(firstLine, "locale") ?? "en-US");
@@ -3694,6 +5848,22 @@ public class StudioMCPBridge : BaseNetLogic
         new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase)
         { "max","min","avg","abs","trunc","ceil","floor","round","sqrt","sign","like",
           "isempty","if","left_of","right_of" };
+
+    // LiteralLintTable -- maps runtime-rejected literal tokens to their design-time fixes.
+    // Three literal classes are checked by ValidateExpressionSyntax without reimplementing
+    // the ExpressionEvaluator grammar:
+    //   Class 1 -- '#RRGGBB' / '#AARRGGBB' hex colour tokens: detected by pattern (6 or 8
+    //             hex digits after a bare '#' outside a string literal); the runtime only
+    //             accepts the 0xAARRGGBB uint form (e.g. '#FFF809' -> '0xFFFFF809').
+    //   Class 2 -- Capitalised Boolean tokens: table below (LiteralBoolFixes); exact
+    //             case-sensitive word-boundary match (True/False -> true/false).
+    //   Class 3 -- Bare NodeId-typed source ref as a top-level result with no enclosing
+    //             comparison or isempty() call: text-only detection is ambiguous without
+    //             type information; check dropped -- validate in model-client tooling or
+    //             code review instead.
+    private static readonly System.Collections.Generic.Dictionary<string, string> LiteralBoolFixes =
+        new System.Collections.Generic.Dictionary<string, string>
+        { { "True", "true" }, { "False", "false" } };
 
     private const string ConcatErr =
         "ExpressionEvaluator '+' is numeric-only -- it can't compose a number with text " +
@@ -3727,13 +5897,37 @@ public class StudioMCPBridge : BaseNetLogic
         return null;
     }
 
-    // Structural validation of an ExpressionEvaluator formula. Optix exposes NO
-    // design-time parser (confirmed by reflection: ExpressionEvaluator has only
-    // Expression/ExpressionVariable + inherited Start/Stop) and validates a formula
-    // only at RUNTIME (a bad one silently no-ops). This catches the common author-time
-    // mistakes WITHOUT reimplementing the grammar: unbalanced ()/{}, out-of-range {N}
-    // placeholders, unknown function names, unterminated strings, number+string concat.
-    // String literals are skipped so parens/braces inside them don't false-positive.
+    // Structural validation of an ExpressionEvaluator formula.
+    //
+    // SDK PARSE-API PROBE -- re-investigated 2026-09-05.
+    // Probe method: GET /bridge/diag/clrtype?name=FTOptix.CoreBase.ExpressionEvaluator
+    // (DiagClrTypeJson, :5720) against the running Studio process, which walks
+    // AppDomain.CurrentDomain.GetAssemblies() and reflects all public instance/static
+    // methods + properties up the inheritance chain to NodeLogic/UAObject.
+    //
+    // Definitive result for FTOptix SDK <= 1.7.x (Optix 1.7.4.32 probe):
+    //   Declared on ExpressionEvaluator: Expression (String, r/w),
+    //                                    ExpressionVariable (String, r/w)
+    //   Inherited (NodeLogic):           Start(), Stop()
+    //   No Parse, TryParse, Validate, GetError, SyntaxCheck, or any other
+    //   error-reading surface of any kind.
+    //
+    // CONCLUSION: Optix exposes NO design-time parser for ExpressionEvaluator.
+    // Formulas are validated ONLY at RUNTIME (a bad one silently no-ops).
+    // This literal-lint function is therefore the ONLY viable design-time check.
+    // To re-probe a future SDK: arm the bridge and call DiagClrTypeJson(:5720).
+    // If a parse API appears there, replace this function with the exact call site.
+    //
+    // What this catches WITHOUT reimplementing the grammar:
+    //   * unbalanced ()/{}, out-of-range {N} placeholders, unknown function names,
+    //     unterminated string literals, numeric+string concat via '+'
+    //   * runtime-rejected literals (LiteralLintTable -- LiteralBoolFixes dict + hex pattern):
+    //       Class 1 -- '#RRGGBB'/'#AARRGGBB' colour tokens -> 0xAARRGGBB uint literal
+    //       Class 2 -- capitalised Boolean tokens: True/False -> true/false (LiteralBoolFixes)
+    //       Class 3 -- bare NodeId source ref at top level: check dropped (ambiguous from
+    //                 text alone; see LiteralLintTable comment above)
+    // String literal state is tracked throughout so inner parens/braces/hash-tokens
+    // inside quoted strings don't false-positive the checks above.
     // Returns null when the formula is structurally sound, else a human-readable reason.
     private static string ValidateExpressionSyntax(string expr, int sourceCount)
     {
@@ -3747,9 +5941,17 @@ public class StudioMCPBridge : BaseNetLogic
         {
             char c = expr[i];
             if (inStr) { if (c == '"') inStr = false; continue; }
-            if (c == '"') { inStr = true; word.Clear(); continue; }
+            if (c == '"')
+            {
+                // Class 2: check accumulated word before entering a string literal.
+                var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
+                inStr = true; word.Clear(); continue;
+            }
             if (c == '(')
             {
+                // Class 2: check before function-name check so 'True(' gives the
+                // more actionable "invalid_literal" message rather than "unknown function".
+                var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
                 string w = word.ToString();
                 if (w.Length > 0 && char.IsLetter(w[0]) && !ExprFunctions.Contains(w))
                     return "unknown function '" + w + "' (valid: " + string.Join(", ", ExprFunctions) + ")";
@@ -3759,11 +5961,15 @@ public class StudioMCPBridge : BaseNetLogic
             {
                 paren--;
                 if (paren < 0) return "unbalanced parentheses: ')' with no matching '('";
+                // Class 2: check accumulated word at closing paren boundary.
+                var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
                 word.Clear(); continue;
             }
             if (c == '}') return "unbalanced braces: '}' with no matching '{'";
             if (c == '{')
             {
+                // Class 2: check accumulated word before entering a brace group.
+                var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
                 int j = expr.IndexOf('}', i);
                 if (j < 0) return "unbalanced braces: '{' with no matching '}'";
                 string inner = expr.Substring(i + 1, j - i - 1).Trim();
@@ -3777,12 +5983,54 @@ public class StudioMCPBridge : BaseNetLogic
                 }
                 i = j; word.Clear(); continue;
             }
+            // Class 1: '#RRGGBB' or '#AARRGGBB' colour literal outside a string.
+            // The runtime requires a 0xAARRGGBB uint; a CSS-style '#...' token silently
+            // no-ops. {#name} placeholders are jumped over above, so '#' here is bare.
+            if (c == '#')
+            {
+                int hexEnd = i + 1;
+                while (hexEnd < expr.Length && IsHexDigit(expr[hexEnd])) hexEnd++;
+                int hexLen = hexEnd - (i + 1);
+                if (hexLen == 6 || hexLen == 8)
+                {
+                    string hex = expr.Substring(i + 1, hexLen);
+                    string fix = (hexLen == 6 ? "0xFF" : "0x") + hex.ToUpper();
+                    return "invalid_literal: '#" + hex + "' is a CSS hex colour -- "
+                           + "ExpressionEvaluator expects a uint: use " + fix;
+                }
+                word.Clear(); continue;
+            }
             if (char.IsLetterOrDigit(c) || c == '_') word.Append(c);
-            else word.Clear();
+            else
+            {
+                // Class 2: check accumulated word at any other non-word boundary.
+                var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
+                word.Clear();
+            }
         }
         if (inStr) return "unterminated string literal";
         if (paren > 0) return "unbalanced parentheses: " + paren + " unclosed '('";
+        // Class 2: check any word that ends exactly at the end of the expression.
+        { var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE; }
         return null;
+    }
+
+    // Class 1 (LiteralLintTable) helper: true iff c is a valid hexadecimal digit.
+    private static bool IsHexDigit(char c)
+    {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    // Class 2 (LiteralLintTable) helper: return an invalid_literal error if w is a
+    // capitalised Boolean token (True/False), otherwise null. Called at every word
+    // boundary inside ValidateExpressionSyntax so that standalone True/False tokens
+    // anywhere in the formula are caught before the expression reaches the runtime.
+    private static string LiteralBoolErr(string w)
+    {
+        string fix;
+        return w.Length > 0 && LiteralBoolFixes.TryGetValue(w, out fix)
+            ? "invalid_literal: '" + w + "' is not a valid Boolean -- use '" + fix + "'"
+            : null;
     }
 
     private static int CountSources(string sources)
@@ -3806,7 +6054,8 @@ public class StudioMCPBridge : BaseNetLogic
         var err = ValidateExpressionSyntax(expr, n);
         if (err == null)
             return "{\"ok\":true,\"valid\":true,\"sources\":" + n + "}";
-        return "{\"ok\":true,\"valid\":false,\"sources\":" + n + ",\"error\":\"" + JsonEscape(err) + "\"}";
+        return "{\"ok\":true,\"valid\":false,\"sources\":" + n + ",\"error\":\"" + JsonEscape(err) + "\"" +
+               InvalidLiteralExtra(err) + "}";
     }
 
     // Diagnostic: reflect a CLR type's public methods + properties (walking the base
@@ -3856,6 +6105,360 @@ public class StudioMCPBridge : BaseNetLogic
         }
         sb.Append("]}");
         return sb.ToString();
+    }
+
+    // Creates a child node whose BROWSE NAME must be qualified with the FTOptix.UI
+    // namespace rather than the project's. Currently used only for
+    // GridLayoutProperties: Studio writes it as `Name: ns=<FTOptix.UI>;
+    // GridLayoutProperties` (confirmed 2026-09-05 in a Studio-authored
+    // <project>/Nodes/UI/Templates/<Template>.yaml), and the layout engine honours
+    // only that one - a project-qualified child takes RowStart/ColumnStart writes
+    // that read back perfectly and render as nothing.
+    //
+    // What is namespaced is the QUALIFIED BROWSE NAME, not the NodeId: every
+    // INSTANCE node lives in the project namespace (measured live: a materialised
+    // GridLayoutProperties is NodeId ns=109 while FTOptix.UI is ns=8), so a check
+    // on NodeId.NamespaceIndex can only ever fail. IUANode.QualifiedBrowseName is
+    // the settable QualifiedName the qualifier rides on.
+    //
+    // Two-attempt order, each in its own try/catch (per SchemaDumpJson idiom):
+    //   (a) parent's CLR proxy property getter - materialises the child from the
+    //       type declaration the way GetOrCreateVariable does for a variable;
+    //       re-qualify its browse name in place.
+    //   (b) MakeObject against the resolved FTOptix.UI type, qualified BEFORE the
+    //       Add so the parent indexes the child under its final name.
+    //   (c) refuse with ui_namespace_child_unsupported - a silent fall-through to
+    //       a project-namespace create is the original bug and stays unreachable.
+    //
+    // Post-creation: re-reads QualifiedBrowseName.NamespaceIndex and compares it
+    // against the anchor's; on mismatch returns ok:false / wrong_namespace with
+    // both indices and the created path so the caller can delete it.
+    private string TryCreateUiNamespaceChild(IUANode parentNode, string childName, string parentPath)
+    {
+        int uiNsIdx = ResolveUiNamespaceIndex();
+        string createdPath = parentPath + "/" + childName;
+
+        // -- (a) Materialise via the parent's generated CLR proxy property --------
+        // The generated Optix proxy (e.g. FTOptix.UI.GridLayout) exposes structural
+        // children as CLR properties; calling GetValue triggers the SDK to
+        // materialise the node from the type declaration - but under the PROJECT
+        // browse-name qualifier, so it still has to be re-qualified.
+        try
+        {
+            var pi = parentNode.GetType().GetProperty(childName,
+                BindingFlags.Public | BindingFlags.Instance);
+            if (pi != null)
+            {
+                var child = pi.GetValue(parentNode) as IUANode;
+                if (child != null)
+                {
+                    string err = QualifyBrowseName(child, childName, uiNsIdx, createdPath);
+                    if (err != null) return err;
+                    return "{\"ok\":true,\"created_path\":\"" + JsonEscape(createdPath) + "\""
+                           + ",\"namespace\":\"FTOptix.UI\",\"via\":\"proxy-property\""
+                           + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+                }
+            }
+        }
+        catch { /* fall through to (b) */ }
+
+        // -- (b) MakeObject against the FTOptix.UI type, qualified before the Add --
+        try
+        {
+            if (uiNsIdx < 0)
+                throw new Exception("FTOptix.UI namespace not resolvable: anchor lookup returned null");
+            bool _via;
+            var typeId = ResolveUiTypeId(childName, out _via);
+            if (typeId == null)
+                throw new Exception("'" + childName + "' ObjectType not found in FTOptix.UI");
+            var child = InformationModel.MakeObject(childName, typeId);
+            var qbn = child.QualifiedBrowseName;
+            qbn.NamespaceIndex = uiNsIdx;
+            child.QualifiedBrowseName = qbn;
+            parentNode.Add(child);
+            string err = QualifyBrowseName(child, childName, uiNsIdx, createdPath);
+            if (err != null)
+            {
+                try { child.Delete(); } catch { }
+                return err;
+            }
+            return "{\"ok\":true,\"created_path\":\"" + JsonEscape(createdPath) + "\""
+                   + ",\"namespace\":\"FTOptix.UI\",\"via\":\"namespace-qualified-create\""
+                   + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+        }
+        catch { /* fall through to (c) */ }
+
+        // -- (c) Refuse -----------------------------------------------------------
+        return ErrorJson("ui_namespace_child_unsupported",
+            "'" + childName + "' must carry the FTOptix.UI browse-name qualifier; "
+            + "proxy-property materialisation and namespace-qualified create both failed - "
+            + "ensure the parent is a layout widget instance (not a project-namespace type) "
+            + "and that bridge >= 1.0.8 is loaded");
+    }
+
+    // Force `node`'s browse name into namespace `uiNsIdx`, then READ BACK and prove
+    // it. Returns null on success, a wrong_namespace error body otherwise - no
+    // ok:true is ever emitted without this read-back.
+    private string QualifyBrowseName(IUANode node, string childName, int uiNsIdx, string createdPath)
+    {
+        if (uiNsIdx < 0)
+            return "{\"ok\":false,\"error\":\"wrong_namespace\""
+                   + ",\"child_ns\":-1,\"ui_ns\":-1"
+                   + ",\"created_path\":\"" + JsonEscape(createdPath) + "\"}";
+        try
+        {
+            if (node.QualifiedBrowseName.NamespaceIndex != uiNsIdx)
+            {
+                var qbn = node.QualifiedBrowseName;
+                qbn.NamespaceIndex = uiNsIdx;
+                qbn.Name = childName;
+                node.QualifiedBrowseName = qbn;
+            }
+        }
+        catch { /* the read-back below is the verdict, not this assignment */ }
+        int actual = -1;
+        try { actual = node.QualifiedBrowseName.NamespaceIndex; } catch { }
+        if (actual != uiNsIdx)
+            return "{\"ok\":false,\"error\":\"wrong_namespace\""
+                   + ",\"child_ns\":" + actual
+                   + ",\"ui_ns\":" + uiNsIdx
+                   + ",\"created_path\":\"" + JsonEscape(createdPath) + "\"}";
+        return null;
+    }
+
+    // The FTOptix.UI namespace index, read from a browse-name-verified anchor;
+    // -1 on any failure (never throws - consistent with SchemaDumpJson).
+    private static int ResolveUiNamespaceIndex()
+    {
+        try
+        {
+            var anchor = UiTypeAnchor();
+            return anchor == null ? -1 : anchor.NodeId.NamespaceIndex;
+        }
+        catch { return -1; }
+    }
+
+    // Unified browse-name resolver for UI type names. Callers pass the name
+    // an author or agent typed; the method finds the right NodeId regardless of
+    // whether the field constant and the live BrowseName are aligned.
+    //
+    // Step (a): field constant -> InformationModel.Get(nid); accepted ONLY when
+    //   the resolved node is non-null AND node.BrowseName == name (aligned types
+    //   take this fast path - the common case for ~102 builtin types).
+    // Step (b): browse-name walk from a verified Panel anchor - walks the owner
+    //   namespace scanning siblings for BrowseName==name with NodeClass in
+    //   {ObjectType, VariableType}. Handles types whose field name differs from
+    //   their BrowseName (e.g. VirtualKeyboard* catalog). Sets viaBrowseName=true.
+    // Step (c): return null - callers keep their type_not_found / 404 behaviour.
+    //
+    // Each step is guarded by try/catch so a resolver that throws degrades to
+    // null and never aborts catalog enumeration.
+    private NodeId ResolveUiTypeId(string name, out bool viaBrowseName)
+    {
+        viaBrowseName = false;
+
+        // Step (a): field constant lookup with BrowseName alignment check.
+        try
+        {
+            var field = typeof(FTOptix.UI.ObjectTypes)
+                .GetField(name, BindingFlags.Public | BindingFlags.Static);
+            if (field != null && field.GetValue(null) is NodeId nid)
+            {
+                var node = InformationModel.Get(nid);
+                if (node != null && node.BrowseName == name)
+                    return nid;
+            }
+        }
+        catch { /* resolver throwing degrades to null, never aborts */ }
+
+        // Step (a2): the same field-constant lookup over EVERY loaded
+        // FTOptix.<Module>.ObjectTypes catalog (Alarm, DataLogger, Core, Recipe,
+        // Store, Report, ...). Alarm, logger and user objects and the
+        // AlarmGrid/LoginForm widgets live in those catalogs, not in FTOptix.UI,
+        // so create_object / create_type / create_widget could not name them
+        // (measured 2026-09-13 on 1.0.8: DigitalAlarm, DataLogger, User,
+        // AlarmGrid, LoginForm all type_not_found). "Module.Type" pins a module.
+        try
+        {
+            var modId = ResolveModuleTypeId(name);
+            if (modId != null) return modId;
+        }
+        catch { /* resolver throwing degrades to null, never aborts */ }
+
+        // Step (b): browse-name walk of the builtin TYPE TREE from a verified anchor.
+        // Owner of a type node is its SUPERTYPE (measured 2026-09-05 on the live
+        // model: Label 8/10 -> Item 8/6 -> BaseUIObject 8/112 -> BaseObjectType
+        // 0/58), so a scan of one anchor's siblings only ever sees that anchor's
+        // supertype's direct subtypes - VirtualKeyboardTextButton derives from
+        // Button, GridLayoutProperties straight from BaseObjectType, and neither
+        // is a sibling of Panel. Climb to the topmost type node and DFS the whole
+        // type tree from there.
+        try
+        {
+            var anchor = UiTypeAnchor();
+            if (anchor != null)
+            {
+                int uiNsIdx = anchor.NodeId.NamespaceIndex;
+                var root = anchor;
+                // Climb while the owner is still a type node; the last one is the
+                // ObjectType root (BaseObjectType 0/58), whose owner is the
+                // ObjectTypes folder (an Object, not a type).
+                while (root.Owner != null && root.Owner.NodeClass == NodeClass.ObjectType)
+                    root = root.Owner;
+                // Widen two hops past that root to the Types folder (0/86): EVENT
+                // types hang off BaseEventType 0/2041 under the SIBLING EventTypes
+                // folder, not under BaseObjectType (measured 2026-09-05:
+                // UserValueChanged 8/690 -> BaseEventType -> EventTypes), so a walk
+                // rooted at BaseObjectType has an event-shaped blind spot. Never a
+                // hard-coded id - both hops are relative to the verified anchor, and
+                // a missing hop degrades to the narrower root.
+                var searchRoot = root;
+                if (searchRoot.Owner != null) searchRoot = searchRoot.Owner;
+                if (searchRoot.Owner != null) searchRoot = searchRoot.Owner;
+                var hit = FindTypeByBrowseName(searchRoot, name, uiNsIdx);
+                if (hit != null)
+                {
+                    viaBrowseName = true;
+                    return hit.NodeId;
+                }
+                // Step (b2): the same walk over every non-UI module namespace
+                // (FTOptix.Alarm's DigitalAlarm and AlarmGrid, FTOptix.Core's
+                // LoginForm/LoginButton, ...) for types whose catalog field name
+                // is not their browse name, or whose catalog step (a2) missed.
+                // The project namespace is excluded so a template named like a
+                // builtin can never shadow it.
+                hit = FindTypeByBrowseName(searchRoot, name, -1);
+                if (hit != null)
+                {
+                    viaBrowseName = true;
+                    return hit.NodeId;
+                }
+            }
+        }
+        catch { /* resolver throwing degrades to null, never aborts */ }
+
+        // Step (c): not found.
+        return null;
+    }
+
+    // A browse-name-VERIFIED node in the builtin UI type namespace: the field
+    // constant for "Label" only counts when the node it resolves to is really
+    // named Label. Everything that needs the FTOptix.UI namespace index (or a
+    // foothold in the type tree) starts here so no index is ever hard-coded.
+    private static IUANode UiTypeAnchor()
+    {
+        try
+        {
+            var f = typeof(FTOptix.UI.ObjectTypes)
+                .GetField("Label", BindingFlags.Public | BindingFlags.Static);
+            if (f != null && f.GetValue(null) is NodeId nid)
+            {
+                var node = InformationModel.Get(nid);
+                if (node != null && node.BrowseName == "Label") return node;
+            }
+        }
+        catch { /* anchor lookup never throws out of the resolver */ }
+        return null;
+    }
+
+    // Depth-first search of the type tree under `root` for a type node whose
+    // BrowseName is `name`, restricted to namespace `nsIdx` so a project type
+    // can never answer for a builtin. Only type nodes and the type folders are
+    // descended (the rest of a type's Children are its declared variables).
+    // Bounded by a visit cap and a seen-set: the tree is a DAG by Owner, but the
+    // cap keeps a pathological model from turning a catalog enumeration into a
+    // hang. Reached only on a MISALIGNED name - an aligned type never leaves
+    // ResolveUiTypeId step (a).
+    private static IUANode FindTypeByBrowseName(IUANode root, string name, int nsIdx)
+    {
+        if (root == null || string.IsNullOrEmpty(name)) return null;
+        var seen = new HashSet<string>();
+        var stack = new Stack<IUANode>();
+        stack.Push(root);
+        int visited = 0;
+        while (stack.Count > 0 && visited < 50000)
+        {
+            var cur = stack.Pop();
+            if (cur == null) continue;
+            string key;
+            try { key = cur.NodeId.ToString(); } catch { continue; }
+            if (!seen.Add(key)) continue;
+            visited++;
+            try
+            {
+                // nsIdx < 0 = any namespace except OPC UA base (0) and the
+                // project's own (step (b2): module types outside FTOptix.UI).
+                bool nsOk = nsIdx >= 0 ? cur.NodeId.NamespaceIndex == nsIdx
+                          : (cur.NodeId.NamespaceIndex != 0 && cur.NodeId.NamespaceIndex != ProjectNsIdx());
+                if (cur.BrowseName == name && nsOk &&
+                    (cur.NodeClass == NodeClass.ObjectType || cur.NodeClass == NodeClass.VariableType))
+                    return cur;
+                foreach (var kid in cur.Children)
+                {
+                    // A type node carries its SUBTYPES as children; the Object-class
+                    // nodes under Types are the ObjectTypes/EventTypes/... folders,
+                    // so those are descended too. Everything else (a type's declared
+                    // variables and methods) is a leaf for this search.
+                    if (kid != null &&
+                        (kid.NodeClass == NodeClass.ObjectType ||
+                         kid.NodeClass == NodeClass.VariableType ||
+                         kid.NodeClass == NodeClass.Object))
+                        stack.Push(kid);
+                }
+            }
+            catch { /* one unreadable node must not abort the walk */ }
+        }
+        return null;
+    }
+
+    // Step (a2) worker for ResolveUiTypeId: a public static NodeId field named
+    // `name` on any loaded FTOptix.<Module>.ObjectTypes class (FTOptix.UI is
+    // step (a)'s job and is skipped here), BrowseName-verified like step (a).
+    // Accepts "FTOptix.Alarm.DigitalAlarm" to pin the module; a bare name takes
+    // the first catalog that carries it.
+    private static NodeId ResolveModuleTypeId(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        string ns = null, field = name;
+        int dot = name.LastIndexOf('.');
+        if (dot > 0) { ns = name.Substring(0, dot); field = name.Substring(dot + 1); }
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException e) { types = e.Types; }
+            catch { continue; }
+            if (types == null) continue;
+            foreach (var t in types)
+            {
+                if (t == null || t.Name != "ObjectTypes" || t.Namespace == null ||
+                    !t.Namespace.StartsWith("FTOptix.") || t == typeof(FTOptix.UI.ObjectTypes))
+                    continue;
+                if (ns != null && t.Namespace != ns) continue;
+                FieldInfo f;
+                try { f = t.GetField(field, BindingFlags.Public | BindingFlags.Static); }
+                catch { continue; }
+                if (f == null || !(f.GetValue(null) is NodeId nid)) continue;
+                // Unlike step (a), no BrowseName equality: the catalog's field
+                // name IS the public C# name (DigitalAlarm's node may carry a
+                // different browse name), and only the UI catalog has the
+                // misaligned-constant history that made step (a) strict. A
+                // loaded, type-class node behind the constant is enough.
+                IUANode node = null;
+                try { node = InformationModel.Get(nid); } catch { /* unloaded module */ }
+                if (node != null && (node.NodeClass == NodeClass.ObjectType ||
+                                     node.NodeClass == NodeClass.VariableType))
+                    return nid;
+            }
+        }
+        return null;
+    }
+
+    // The project's own namespace index (for step (b2)'s exclusion); -2 when
+    // it cannot be read so the exclusion never accidentally matches ns 0.
+    private static int ProjectNsIdx()
+    {
+        try { return Project.Current.NodeId.NamespaceIndex; } catch { return -2; }
     }
 
     private static NodeId ResolveEventType(string name)
@@ -4069,6 +6672,105 @@ public class StudioMCPBridge : BaseNetLogic
         catch { return null; }
     }
 
+    // ---- relative dynamic links inside a type -------------------------------
+    //
+    // FIELD FINDING 2026-09-04. `bind` writes the right thing without trying:
+    // its property variable is ALREADY PARENTED when propVar.SetDynamicLink(src)
+    // runs, so the SDK has a shared ancestor to be relative to and serializes the
+    // relative form. The three other link writers do not have that luxury:
+    //   attach_expression   builds its Source<n> variables DETACHED - the
+    //                       ExpressionEvaluator only reaches the model at
+    //                       SetConverter, after every source has been linked
+    //   attach_formatter    the same, inside BuildFormattedLink
+    //   wire_event(method)  ObjectPointer carries an absolute NodeId by design
+    // A detached holder leaves the SDK nothing to be relative TO, so the link
+    // serializes as an ABSOLUTE NodeId. Between unrelated subtrees that is
+    // correct. Inside an ObjectType it is a silent bug: the absolute id names the
+    // TYPE's own node, so every INSTANCE reads the type's variable (the value
+    // looks static and never moves) or, for a method target, the runtime answers
+    // "No behaviour or observer found that handles the method".
+    //
+    // The fix is to re-point the link at the relative path AFTER the structure is
+    // attached, and ONLY when holder and target sit under the same ObjectType.
+
+    // Nearest ObjectType at or above `node`, else null.
+    private static IUANode NearestTypeAncestor(IUANode node)
+    {
+        int guard = 0;
+        for (var cur = node; cur != null && guard++ < 64; cur = cur.Owner)
+            if (cur is IUAObjectType) return cur;
+        return null;
+    }
+
+    private static bool IsUnder(IUANode node, IUANode ancestor)
+    {
+        int guard = 0;
+        for (var cur = node; cur != null && guard++ < 64; cur = cur.Owner)
+            if (cur.NodeId.Equals(ancestor.NodeId)) return true;
+        return false;
+    }
+
+    // Studio's own relative NodePath form, anchored at the VARIABLE THAT HOLDS the
+    // link: one ".." per Owner step up to the common ancestor, then the browse
+    // names down. The anchor is not a guess - it is what the two hand-built
+    // relative paths in WireEventInline already count on ("../../../../" from
+    // ObjectPointer up to the event node, "../../../../.." from a variable under
+    // InputArguments to that same node), and this builder reproduces both literals
+    // exactly. Null when the two nodes share no ancestor.
+    private static string RelativeNodePath(IUANode linkHolder, IUANode target)
+    {
+        var ups = new List<IUANode>();
+        for (var c = linkHolder; c != null && ups.Count < 64; c = c.Owner) ups.Add(c);
+        var downs = new List<IUANode>();
+        for (var c = target; c != null && downs.Count < 64; c = c.Owner) downs.Add(c);
+        // ups[0] is the holder itself; a link path always starts with at least one
+        // "..", so the ancestor search starts one level up.
+        for (int u = 1; u < ups.Count; u++)
+        {
+            for (int d = 0; d < downs.Count; d++)
+            {
+                if (!ups[u].NodeId.Equals(downs[d].NodeId)) continue;
+                var sb = new StringBuilder();
+                for (int k = 0; k < u; k++) sb.Append(k + 1 < u ? "../" : "..");
+                for (int k = d - 1; k >= 0; k--) sb.Append("/").Append(downs[k].BrowseName);
+                return sb.ToString();
+            }
+        }
+        return null;
+    }
+
+    // The path a link from `linkHolder` to `target` should carry, or null when the
+    // two are not inside the same ObjectType - in which case the caller leaves the
+    // absolute link exactly as the SDK wrote it.
+    private static string SameTypeRelativePath(IUANode linkHolder, IUANode target)
+    {
+        try
+        {
+            var t = NearestTypeAncestor(linkHolder);
+            if (t == null || !IsUnder(target, t)) return null;
+            return RelativeNodePath(linkHolder, target);
+        }
+        catch { return null; }
+    }
+
+    // Re-point an ALREADY-WRITTEN dynamic link at its relative form. Returns the
+    // path written, or null when nothing was rewritten (different types, or no
+    // link materialized). Uses the same two node-model calls the raw bind does:
+    // read the HasDynamicLink child, write its Value.
+    private static string RelinkRelativeWithinType(IUAVariable linkHolder, IUANode target)
+    {
+        try
+        {
+            var rel = SameTypeRelativePath(linkHolder, target);
+            if (rel == null) return null;
+            var link = linkHolder.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+            if (link == null) return null;
+            link.Value = rel;
+            return rel;
+        }
+        catch { return null; }
+    }
+
     // Inline dereference for the detail walk: a NodePointer/Alias value is a
     // NodeId (resolved to a project path), a DynamicLink value is already a
     // NodePath string. Kills the describe-per-pointer round trip: a detail
@@ -4178,6 +6880,29 @@ public class StudioMCPBridge : BaseNetLogic
         catch { return null; }
     }
 
+    // ResolveNode, then a fallback for nodes whose BROWSE NAME contains the
+    // path separator: a StoreColumn behind a recipe array is literally named
+    // "/RecipeSettings_0", which Get() cannot spell. Walk separators from
+    // the right; the first prefix that resolves is the parent, and the rest of
+    // the string (slash and all) is matched against its children's BrowseName.
+    // "DataStores/DB/Tables/T/Columns//RecipeSettings_9" -> parent ".../Columns",
+    // child "/RecipeSettings_9".
+    private IUANode ResolveNodeLoose(string path)
+    {
+        var n = ResolveNode(path);
+        if (n != null || string.IsNullOrEmpty(path)) return n;
+        for (int i = path.Length - 1; i > 0; i--)
+        {
+            if (path[i] != '/') continue;
+            var parent = ResolveNode(path.Substring(0, i));
+            if (parent == null) continue;
+            string rest = path.Substring(i + 1);
+            foreach (var child in parent.Children)
+                if (child.BrowseName == rest) return child;
+        }
+        return null;
+    }
+
     private string DataTypeName(IUAVariable v)
     {
         try
@@ -4259,7 +6984,27 @@ public class StudioMCPBridge : BaseNetLogic
     private static string ErrorJson(string code, string message)
     {
         return "{\"error\":{\"code\":\"" + JsonEscape(code) +
-               "\",\"message\":\"" + JsonEscape(message) + "\"}}";
+               "\",\"message\":\"" + JsonEscape(message) + "\"" +
+               InvalidLiteralExtra(message) + "}}";
+    }
+
+    // 1.0.8: ValidateExpressionSyntax's two literal-lint checks
+    // return a plain string prefixed "invalid_literal: ", ending "...use <fix>"
+    // or "...use '<fix>'". Every JSON body that carries that string as its error
+    // message gets a structured {reason, fix} sibling here, so a caller (or an
+    // LLM) can read the fix value without parsing prose. Returns "" (no extra
+    // field) for every other error class -- this must never fire on a message
+    // that merely CONTAINS "invalid_literal" mid-sentence, only one that IS the
+    // literal-lint's own message shape.
+    private static string InvalidLiteralExtra(string message)
+    {
+        const string prefix = "invalid_literal: ";
+        if (message == null || !message.StartsWith(prefix)) return "";
+        string reason = message.Substring(prefix.Length);
+        int idx = reason.LastIndexOf("use ", StringComparison.Ordinal);
+        string fix = idx >= 0 ? reason.Substring(idx + 4).Trim().Trim('\'') : "";
+        return ",\"invalid_literal\":{\"reason\":\"" + JsonEscape(reason) +
+               "\",\"fix\":\"" + JsonEscape(fix) + "\"}";
     }
 
     private static string Bool(bool b) { return b ? "true" : "false"; }

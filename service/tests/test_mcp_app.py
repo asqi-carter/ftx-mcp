@@ -27,6 +27,8 @@ EXPECTED_TOOLS = {
     # no human at the keyboard.
     "optix_bridge_arm",
     "optix_project",
+    # (1.0.8): optix_bridge_arm generalised to any design-time [ExportMethod].
+    "optix_execute_method",
     "optix_status",  # consolidated optix_health/_doctor/_services_status/_studio_version
     "optix_build_check",
     "optix_list_projects",
@@ -82,6 +84,7 @@ EXPECTED_TOOLS = {
     # aliases and stay always-registered.
     "optix_observe",
     "optix_interact",
+    "optix_read_netlogic",
 }
 
 # The 14 per-noun bridge primitives, gated behind FTXMCP_BRIDGE_PRIMITIVES=1
@@ -92,6 +95,7 @@ _BRIDGE_PRIMITIVE_TOOLS = {
     "optix_bridge_set_property",
     "optix_bridge_bind_property",
     "optix_bridge_attach_expression",
+    "optix_bridge_attach_formatter",
     "optix_bridge_wire_event",
     "optix_bridge_delete_node",
     "optix_bridge_move_node",
@@ -200,7 +204,8 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             "optix_observe",
             # compiles to a throwaway copy / tails a diagnostic log — neither mutates
             "optix_build_check", "optix_bridge_log_tail",
-            "optix_bridge_log_tail"}
+            "optix_bridge_log_tail",
+            "optix_read_netlogic"}
     DESTRUCTIVE = {"optix_deploy","optix_deploy_updatesvc","optix_bridge_delete_node",
                    "optix_runtime_stop","optix_cdp_click","optix_cdp_type",
                    "optix_cdp_key","optix_cdp_fill","optix_cdp_navigate",
@@ -250,6 +255,73 @@ def test_mcp_bridge_tool_returns_structured_nudge_on_failure(
     assert out["state"] == "failed"
     assert out["reason_code"] == "bridge_unreachable_studio_closed"
     assert "StartBridge" in out["nudge"]
+
+
+def test_mcp_bridge_attach_formatter_roundtrip(
+    cfg: core.Config, projects_root, monkeypatch
+) -> None:
+    """MCP-surface roundtrip: optix_bridge_attach_formatter (gated by
+    FTXMCP_BRIDGE_PRIMITIVES=1) calls core.bridge_attach_formatter with the
+    right arguments and returns ok:true to the caller.
+
+    Confirms the full path from MCP tool invocation → core function →
+    structured response — the same roundtrip the bridge HTTP layer validates
+    end-to-end in test_bridge_writes.py but exercised here through the
+    registered MCP tool surface.
+    """
+    monkeypatch.setenv("FTXMCP_BRIDGE_PRIMITIVES", "1")
+    make_project(projects_root, "Alpha")
+    seen: dict = {}
+
+    def fake_attach(cfg_, project, node_path, prop_name, format,
+                    sources=None, mode=None):
+        seen.update(project=project, node_path=node_path,
+                    prop_name=prop_name, format=format,
+                    sources=sources, mode=mode)
+        return {"ok": True, "via": "attach-formatter",
+                "node": node_path, "prop": prop_name}
+
+    monkeypatch.setattr(core, "bridge_attach_formatter", fake_attach)
+    monkeypatch.setattr(core, "default_project", lambda c: "Alpha")
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_attach_formatter")
+    out = _tool_fn(tool)(
+        node_path="UI/MainWindow/L1",
+        prop_name="Text",
+        format="../NavPanel{#navIdx}@NodeId",
+        sources="navIdx=Model/GlobalVariables/AlarmTab",
+        project="Alpha",
+    )
+    assert out["ok"] is True
+    assert seen["node_path"] == "UI/MainWindow/L1"
+    assert seen["prop_name"] == "Text"
+    assert seen["format"] == "../NavPanel{#navIdx}@NodeId"
+    assert seen["sources"] == "navIdx=Model/GlobalVariables/AlarmTab"
+
+
+def test_mcp_bridge_attach_formatter_node_attribute_refused(
+    cfg: core.Config, projects_root, monkeypatch
+) -> None:
+    """Rejection path: passing a node attribute name as prop_name is refused
+    before any HTTP dispatch, and the MCP surface returns a structured error
+    (never a raw exception) with a clear reason_code so the caller knows what
+    to fix.
+    """
+    monkeypatch.setenv("FTXMCP_BRIDGE_PRIMITIVES", "1")
+    make_project(projects_root, "Alpha")
+    monkeypatch.setattr(core, "default_project", lambda c: "Alpha")
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_attach_formatter")
+    # DisplayName is a node attribute — the pre-dispatch guard must fire.
+    out = _tool_fn(tool)(
+        node_path="UI/MainWindow/L1",
+        prop_name="DisplayName",
+        format="../NavPanel{#navIdx}@NodeId",
+        project="Alpha",
+    )
+    # _bridge_guarded catches BridgeWriteFailed and returns a structured dict.
+    assert out.get("reason_code") == "write_failed"
+    assert "node_attribute_not_settable" in out.get("detail", "")
 
 
 def test_mcp_health_tool_returns_expected_keys(cfg: core.Config) -> None:
@@ -582,7 +654,7 @@ def test_cdp_read_text_tool_registered_and_forwards_to_core(
     seen = {}
 
     def fake_read_text(cfg_, region=None, navigate_url=None, settle_seconds=None,
-                       psm=6):
+                       psm=6, project=None):
         seen.update(region=region, psm=psm)
         return {"state": "succeeded", "text": "SP-101", "region": region,
                 "size_bytes": 10, "navigated": False, "captured_at": "t"}
@@ -612,7 +684,8 @@ def test_cdp_find_text_tool_registered_and_forwards_to_core(
 ) -> None:
     seen = {}
 
-    def fake_find_text(cfg_, text, navigate_url=None, settle_seconds=None):
+    def fake_find_text(cfg_, text, navigate_url=None, settle_seconds=None,
+                       project=None):
         seen["text"] = text
         return {"state": "succeeded", "found": True, "matches": [
             {"text": "Start", "confidence": 0.95, "bbox_px": [1, 2, 3, 4],
@@ -878,10 +951,13 @@ def test_with_project_tool_count_and_annotations_unchanged(cfg: core.Config) -> 
     OFF by default behind FTXMCP_BRIDGE_PRIMITIVES (51 - 14 = 37).
     (v1.0.6): optix_bridge_invoke_method adds one, never gated (37 + 1 = 38).
     (v1.0.7): the cold-start pair optix_bridge_arm (consolidated arm/stop)
-    and optix_project (consolidated open/new) add two more (40 + 2 = 42)."""
+    and optix_project (consolidated open/new) add two more (40 + 2 = 42).
+    (v1.0.8): optix_execute_method (right-click -> Execute any design-time
+    [ExportMethod]) adds one, never gated (42 + 1 = 43).
+    (1.0.8): optix_read_netlogic adds one, never gated (43 + 1 = 44)."""
     mcp = make_mcp(cfg)
     by_name = {t.name: t for t in _list_tools(mcp)}
-    assert len(by_name) == 42
+    assert len(by_name) == 44
     assert by_name["optix_list_screens"].annotations.readOnlyHint is True
     write = by_name["optix_bridge_add_bound_widget"].annotations
     assert write.readOnlyHint is False and write.destructiveHint is False
@@ -928,6 +1004,179 @@ def test_with_project_resolution_is_uniform(cfg: core.Config, monkeypatch,
     assert "project" not in seen
 
 
+# ---- optix_execute_method MCP-surface acceptance tests ------
+#
+# optix_execute_method is the MCP surface for right-click -> Execute ANY
+# design-time [ExportMethod].  Unlike optix_bridge_arm (which hard-wires
+# StartBridge/StopBridge and verifies via the bridge port), this tool always
+# passes verify="none" and returns state="executed" once the click lands.
+# These tests pin the two observable MCP-level behaviours that do NOT require
+# a live Studio: the bad_args guard on empty node/method, and the hand-off to
+# core.execute_design_method with the right arguments.
+
+
+def test_execute_method_tool_rejects_empty_node_or_method(
+        cfg: core.Config) -> None:
+    """The MCP layer rejects calls where `node` or `method` is empty before
+    reaching core — a missing node name or method name has no sensible default
+    and must fail fast with a `bad_args` error rather than a confusing UIA
+    'row not found' deep in studio_arm."""
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_execute_method")
+    fn = _tool_fn(tool)
+    for bad in (
+        {"project": "P", "node": "", "method": "Apply"},
+        {"project": "P", "node": "FormattedLinkScript", "method": ""},
+    ):
+        out = fn(**bad)
+        assert out.get("ok") is False and out.get("error") == "bad_args", (
+            f"expected bad_args for {bad}, got {out!r}"
+        )
+
+
+def test_execute_method_tool_delegates_to_core(
+        cfg: core.Config, monkeypatch, tmp_path) -> None:
+    """optix_execute_method calls core.execute_design_method with the
+    project, node, and method supplied by the caller — it does NOT call
+    bridge_arm or any other core function."""
+    make_project(cfg.projects_root, "MyProj")
+    seen: dict = {}
+
+    def _fake_execute_design_method(c, project, node, method, **kw):
+        seen.update(project=project, node=node, method=method)
+        return {"ok": True, "state": "executed", "nudge": "check Studio Output"}
+
+    monkeypatch.setattr(core, "execute_design_method", _fake_execute_design_method)
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_execute_method")
+    out = _tool_fn(tool)(
+        project="MyProj", node="FormattedLinkScript", method="Apply")
+    assert out["ok"] and out["state"] == "executed", out
+    assert seen == {"project": "MyProj", "node": "FormattedLinkScript",
+                    "method": "Apply"}, (
+        f"core.execute_design_method was not called with the right args: {seen!r}"
+    )
+
+
+# ---- optix_bridge_edit MCP-surface tests -------------------
+#
+# Six regression pins that lock the observable MCP surface of optix_bridge_edit
+# so architectural refactors (e.g. changing def->async def, leaking ctx into
+# the JSON schema, widening the 'apply'-only bad_ops guard to status) are
+# caught as test failures before they reach the service.
+
+def test_bridge_edit_schema_excludes_ctx(cfg: core.Config) -> None:
+    """ctx is a FastMCP injection — it must NOT appear in the JSON schema
+    that MCP clients see.  Regression guard: if the signature ever loses its
+    Context type annotation FastMCP will expose ctx as a callable parameter,
+    confusing every LLM-side client.
+
+    The eight documented user-facing parameters must ALL be present."""
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_edit")
+    props = tool.parameters.get("properties", {})
+    for expected in ("action", "batch_id", "chunk_seconds", "chunk_ops",
+                     "ops", "dry_run", "strict", "project"):
+        assert expected in props, (
+            f"optix_bridge_edit schema is missing {expected!r}; "
+            f"present keys: {list(props)}"
+        )
+    assert "ctx" not in props, (
+        "optix_bridge_edit schema must not expose `ctx` — it is a FastMCP "
+        "runtime injection, not a callable parameter"
+    )
+
+
+def test_bridge_edit_is_sync_then_offloaded(cfg: core.Config) -> None:
+    """optix_bridge_edit must be a sync def that the post-registration offload
+    pass wrapped async.  Regression guard against anyone changing it to
+    `async def`: FastMCP runs async tool fns directly on the event loop, so a
+    blocking bridge HTTP call inside an async def would stall the loop and
+    reproduce the bridge-drop bug the offload pass was introduced to fix.
+
+    Two invariants:
+      * is_async is True  — the tool IS async after wrapping
+      * _ftx_sync_fn set — the ORIGINAL sync fn is reachable (tests use it to
+        call the tool without an event loop)
+    """
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_edit")
+    assert tool.is_async is True, (
+        "optix_bridge_edit must be offloaded (is_async=True after make_mcp)"
+    )
+    assert hasattr(tool, "_ftx_sync_fn") and tool._ftx_sync_fn is not None, (
+        "optix_bridge_edit must expose _ftx_sync_fn — the sync-wrap offload "
+        "path was NOT applied, which means the tool was registered as async def "
+        "and the blocking bridge HTTP will stall the event loop"
+    )
+
+
+def test_bridge_edit_direct_call_ctx_none_handles_missing_event_loop(
+    cfg: core.Config, monkeypatch, projects_root: Path
+) -> None:
+    """_tool_fn(tool)(..., ctx=None) applies a 2-op batch to completion.
+
+    The on_progress callback wraps ctx.report_progress inside
+    anyio.from_thread.run; with ctx=None that call raises AttributeError.
+    core.bridge_edit's defensive try/except swallows the callback failure and
+    the apply loop continues — the batch still returns state='succeeded'.
+
+    This proves two things:
+      1. _tool_fn() correctly returns the original sync fn (_ftx_sync_fn), not
+         the async wrapper, so the call works without an event loop.
+      2. The callback defensive wrap actually handles the missing event loop /
+         None ctx rather than crashing the tool call.
+    """
+    make_project(projects_root, "Alpha")
+    monkeypatch.setattr(
+        core, "bridge_validate_ops",
+        lambda cfg_, project, ops, strict=False: {
+            "ok": True, "errors": [], "warnings": [],
+            "op_count": len(ops), "strict": False,
+        },
+    )
+    monkeypatch.setattr(core, "_apply_one_edit", lambda cfg_, project, op: {})
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_edit")
+    ops = [
+        {"op": "set_property", "path": "UI/Foo/Bar", "name": "Width",  "value": "100"},
+        {"op": "set_property", "path": "UI/Foo/Bar", "name": "Height", "value": "50"},
+    ]
+    out = _tool_fn(tool)(ctx=None, project="Alpha", ops=ops)
+    assert out.get("state") == "succeeded", (
+        f"expected state='succeeded'; got: {out}"
+    )
+    assert out.get("applied") == 2, (
+        f"expected applied=2 (both ops landed); got applied={out.get('applied')}"
+    )
+
+
+def test_bridge_edit_status_action_not_refused_as_bad_ops(
+    cfg: core.Config,
+) -> None:
+    """action='status' with ops=[] must NOT trigger the bad_ops guard.
+
+    The bad_ops pre-check (ops must be a non-empty list) is gated to
+    action='apply' only.  action='status' does not consume ops at all — it
+    reads the batch journal from disk.  Regression guard against accidentally
+    widening the guard to all actions."""
+    mcp = make_mcp(cfg)
+    tool = next(t for t in _list_tools(mcp) if t.name == "optix_bridge_edit")
+    # No existing batches -> returns {"batches": [], "project": "Alpha"} or
+    # similar status document.  The important invariant is no error='bad_ops'.
+    out = _tool_fn(tool)(ctx=None, project="Alpha", action="status", ops=[])
+    assert out.get("error") != "bad_ops", (
+        f"action='status' must not be refused by the bad_ops guard: {out}"
+    )
+    # Confirm the result looks like a status document, not an unrelated failure.
+    assert "batches" in out or "state" in out or "batch_id" in out, (
+        f"unexpected shape from action='status': {out}"
+    )
+
+
+# ---- static integrity gate --------------------------------
+
+
 def test_excluded_outliers_keep_bespoke_no_project_envelope(cfg: core.Config, monkeypatch) -> None:
     """optix_save / optix_emulator(action="run"|"restart") are intentionally NOT
     decorated with @_with_project: they own a bespoke no-project envelope keyed
@@ -943,3 +1192,68 @@ def test_excluded_outliers_keep_bespoke_no_project_envelope(cfg: core.Config, mo
     emu_out = _tool_fn(by_name["optix_emulator"])(action="run")
     assert emu_out.get("launched") is False
     assert emu_out.get("error") != "no_project"
+
+
+# ---- thread-pool limiter hardening (root-cause A, 2026-09-05) ---------------
+
+
+def test_thread_limiter_bounds_concurrent_offloaded_calls(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """OPTIX_THREAD_LIMITER caps concurrent offloaded sync tool calls.
+
+    Root-cause A hardening for the 2026-09-05 service-crash incident.
+    Evidence: service.jsonl on a test box showed four consecutive "start" entries
+    with no following "stop" or "crash" — the external_kill signature
+    (Task Scheduler ExecutionTimeLimit, result 0x00041306).  A 3450-op burst
+    without a limiter saturates the anyio thread pool and stalls the process.
+
+    This test verifies two invariants:
+      1. All N calls complete successfully even when N exceeds the cap (no
+         deadlock — queued calls are eventually served).
+      2. Peak concurrency inside the sync function is bounded by the limiter,
+         not by N (no O(N) thread growth).
+    """
+    import threading
+    import time
+
+    LIMIT = 4
+    CALLS = 12  # deliberately > LIMIT so some calls must queue
+    monkeypatch.setenv("OPTIX_THREAD_LIMITER", str(LIMIT))
+
+    # Shared concurrency counter — accessed from worker threads, guarded by a lock.
+    _lock = threading.Lock()
+    _active = 0
+    _peak = 0
+
+    def _counted_list_screens(cfg_, project):
+        """Sync fn that records peak concurrent invocations."""
+        nonlocal _active, _peak
+        with _lock:
+            _active += 1
+            if _active > _peak:
+                _peak = _active
+        time.sleep(0.02)          # hold briefly so concurrent calls overlap
+        with _lock:
+            _active -= 1
+        return {"screens": [], "count": 0}
+
+    monkeypatch.setattr(core, "list_screens", _counted_list_screens)
+    monkeypatch.setattr(core, "default_project", lambda _cfg: "Alpha")
+
+    mcp = make_mcp(cfg)
+
+    async def _run_all():
+        coros = [mcp.call_tool("optix_list_screens", {}) for _ in range(CALLS)]
+        return await asyncio.gather(*coros)
+
+    results = asyncio.run(_run_all())
+
+    # Invariant 1: all CALLS completed (no deadlock under the limiter).
+    assert len(results) == CALLS
+
+    # Invariant 2: peak concurrent sync-fn invocations is bounded by LIMIT.
+    assert _peak <= LIMIT, (
+        f"thread-pool limiter not effective: peak concurrent invocations={_peak}, "
+        f"OPTIX_THREAD_LIMITER={LIMIT}; expected peak <= {LIMIT}"
+    )

@@ -237,3 +237,68 @@ def test_run_emulator_f5_is_gentle_by_default(cfg: core.Config, projects_root: P
     core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
     ps = runner.calls[0][0][-1]
     assert "{F5}" in ps and "IsIconic($h)" in ps
+
+
+# ---- (1.0.8) multi-Studio targeting without a bridge ---------------------
+
+def _studio_scan(*entries):
+    """[(pid, cmdline_tokens), ...] -> studio_guard scan records."""
+    return [{"pid": pid, "name": "ftoptixstudio.exe", "cmdline": list(cmd)}
+            for pid, cmd in entries]
+
+
+def test_save_targets_studio_by_cmdline_when_no_bridge(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """Two Studios open, no bridge: the one whose argv names THIS project's
+    .optix gets the Ctrl+S — never the first window."""
+    from service import studio_guard
+    make_project(projects_root, "Alpha")
+    make_project(projects_root, "Beta")
+    alpha = str(projects_root / "Alpha" / "Alpha.optix")
+    beta = str(projects_root / "Beta" / "Beta.optix")
+    monkeypatch.setattr(studio_guard, "_scan", lambda: _studio_scan(
+        (111, ["C:\\Studio\\FTOptixStudio.exe", alpha]),
+        (222, ["C:\\Studio\\FTOptixStudio.exe", "open", beta])))
+    studio_guard.reset_cache()
+    monkeypatch.setattr(core, "_bridge_cfg_for", lambda c, p: None)
+    captured = {}
+
+    def fake_build(target_pid=0, gentle=True, send_key="^s"):
+        captured["pid"] = target_pid
+        return "ps"
+    monkeypatch.setattr(core, "_build_save_ps", fake_build)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=222"))
+    core.save(cfg, "Beta", timeout=0.01, runner=runner)
+    assert captured["pid"] == 222
+
+
+def test_save_refuses_when_several_studios_and_none_attributable(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    from service import studio_guard
+    make_project(projects_root, "Alpha")
+    monkeypatch.setattr(studio_guard, "_scan", lambda: _studio_scan(
+        (111, ["C:\\Studio\\FTOptixStudio.exe"]),
+        (222, ["C:\\Studio\\FTOptixStudio.exe"])))
+    studio_guard.reset_cache()
+    monkeypatch.setattr(core, "_bridge_cfg_for", lambda c, p: None)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=111"))
+    out = core.save(cfg, "Alpha", timeout=0.01, runner=runner)
+    assert out["saved"] is False and out["reason"] == "ambiguous_studio"
+    assert out["studio_count"] == 2
+    assert runner.calls == []  # no keystroke was sent
+
+
+def test_save_single_unattributable_studio_keeps_legacy_first_window(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    from service import studio_guard
+    make_project(projects_root, "Alpha")
+    monkeypatch.setattr(studio_guard, "_scan", lambda: _studio_scan(
+        (111, ["C:\\Studio\\FTOptixStudio.exe"])))
+    studio_guard.reset_cache()
+    monkeypatch.setattr(core, "_bridge_cfg_for", lambda c, p: None)
+    captured = {}
+
+    def fake_build(target_pid=0, gentle=True, send_key="^s"):
+        captured["pid"] = target_pid
+        return "ps"
+    monkeypatch.setattr(core, "_build_save_ps", fake_build)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=111"))
+    core.save(cfg, "Alpha", timeout=0.01, runner=runner)
+    assert captured["pid"] == 0

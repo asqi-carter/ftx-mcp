@@ -67,6 +67,16 @@
 
 .PARAMETER RepoRoot
     Path to the ftx-mcp checkout (default: parent of this script).
+
+.PARAMETER AllowElevated
+    Required to run this script from an elevated (Administrator) shell.
+    Without it, setup refuses outright: a task registered from an elevated
+    shell becomes Admin-owned, which means (a) uninstall/re-register later
+    demands elevation forever after, and (b) a later
+    'services.ps1 start -Silent' from a normal shell fails with
+    Access is denied (0x80070005) when it tries to change the task's
+    console mode (I27). Pass this switch only when the box genuinely hands
+    out elevated shells only (corp IT, some CI runners).
 #>
 [CmdletBinding()]
 param(
@@ -77,6 +87,7 @@ param(
     [switch]$NoAuthPrompt,
     [switch]$NoServiceRegister,
     [switch]$HideConsole,
+    [switch]$AllowElevated,
     [string]$RepoRoot
 )
 
@@ -130,11 +141,27 @@ Ok "ExecutionPolicy (effective) = $execPolicy"
 
 # Elevation check: setup needs NO admin rights, and tasks registered from an
 # elevated shell get Admins-owned descriptors - uninstall/re-register then
-# demands elevation forever after (field report 2026-07-22). Warn, don't block:
-# corp boxes sometimes only hand out elevated shells.
+# demands elevation forever after (field report 2026-07-22). Refuse outright
+# unless -AllowElevated is passed: an elevated-registered task also breaks
+# 'services.ps1 start -Silent' from a later regular shell (I27 - Access is
+# denied 0x80070005 trying to rewrite the task's console-mode action), and
+# that failure reads nowhere near this cause without a loud check up front.
 $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if ($isElevated) {
+if ($isElevated -and -not $AllowElevated) {
+    Write-Host ""
     Write-Host "note: running ELEVATED. Setup does not need admin - scheduled tasks registered from an elevated shell will require an elevated uninstall later. Prefer a regular PowerShell window." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Refusing to continue: an elevated-registered task also breaks" -ForegroundColor Yellow
+    Write-Host "'services.ps1 start -Silent' later from a normal shell (it fails with" -ForegroundColor Yellow
+    Write-Host "Access is denied / 0x80070005 trying to change the console mode)." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Re-run this script from a regular (non-elevated) PowerShell window," -ForegroundColor Yellow
+    Write-Host "or pass -AllowElevated if this box only hands out elevated shells." -ForegroundColor Yellow
+    Write-Host ""
+    Fail "refusing an elevated run without -AllowElevated. See remedy above."
+}
+if ($isElevated) {
+    Write-Host "note: running ELEVATED (-AllowElevated passed). Scheduled tasks registered from an elevated shell will require an elevated uninstall later, and 'services.ps1 start -Silent' from a normal shell will need elevation too." -ForegroundColor Yellow
 }
 
 # Surface persisted auth state up front. FTX_AUTH_REQUIRED lives at User env

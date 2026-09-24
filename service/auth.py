@@ -290,7 +290,7 @@ DEFAULT_SCOPE_RULES: tuple[ScopeRule, ...] = (
 # deploy-family tools that are popped from the registry when
 # enable_deploy=False (harmless: a popped tool never
 # dispatches) so the table describes the enable_deploy=True superset. Also
-# includes the 14 gated bridge-primitive tools (FTXMCP_BRIDGE_PRIMITIVES,
+# includes the 16 gated bridge-primitive tools (FTXMCP_BRIDGE_PRIMITIVES,
 # default off) for the same reason — a gate-popped tool never dispatches, but
 # the table must still cover it for when the gate is on.
 #
@@ -305,7 +305,7 @@ DEFAULT_SCOPE_RULES: tuple[ScopeRule, ...] = (
 TOOL_SCOPES: dict[str, str] = {
     # ---- health (1): liveness/status probes ----
     "optix_runtime_status": "health",
-    # ---- read (22): read-only introspection ----
+    # ---- read (23): read-only introspection ----
     "optix_list_skills": "read",
     "optix_get_skill": "read",
     "optix_list_projects": "read",
@@ -330,6 +330,7 @@ TOOL_SCOPES: dict[str, str] = {
     "optix_observe": "read",  # U14 consolidated read-side CDP capture
     "optix_build_check": "read",  # compiles to a throwaway copy; mutates nothing
     "optix_bridge_log_tail": "read",  # bridge transport diagnostics
+    "optix_read_netlogic": "read",
     # ---- author (35): mutates project / previews / drives canvas ----
     # U16 batched authoring: `author`, same as every per-noun bridge write it
     # dispatches to. It can only do what those tools can do — batching does not
@@ -351,12 +352,17 @@ TOOL_SCOPES: dict[str, str] = {
     "optix_bridge_create_netlogic": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_reorder": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_attach_expression": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_attach_formatter": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_attach_string_formatter": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_wire_event": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_save": "author",
     # Both drive Studio's GUI / CLI and change what is on the operator's
     # screen, so "author" — never "read". optix_bridge_arm is the one bridge
     # tool that is NOT read-tier (optix_bridge_status stays "read").
     "optix_bridge_arm": "author",   # consolidated arm/stop
+    # Same UIA gesture as optix_bridge_arm, generalised to any design-time
+    # [ExportMethod] — it runs project code, so "author", never "read".
+    "optix_execute_method": "author",
     "optix_project": "author",      # consolidated open/new; new writes disk
     "optix_emulator": "author",  # consolidated run/restart/stop/status/log
     "optix_add_widget": "author",

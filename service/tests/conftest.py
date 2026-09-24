@@ -28,6 +28,19 @@ def _no_host_processes(monkeypatch: pytest.MonkeyPatch):
     studio_guard.reset_cache()
 
 
+@pytest.fixture(autouse=True)
+def _no_host_localappdata(monkeypatch: pytest.MonkeyPatch, tmp_path_factory):
+    """Isolate the suite from the host's %LOCALAPPDATA%.
+
+    On a Windows box with armed bridges, %LOCALAPPDATA%\\ftx-mcp\\bridges holds
+    the REAL bridge registry: tests would discover the operator's bridges and,
+    on a faked connection-refused, delete their registry files. Studio's
+    Configuration.xml lives there too. Tests that exercise either set
+    LOCALAPPDATA again in the test body, which wins over this default.
+    """
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path_factory.mktemp("localappdata")))
+
+
 @dataclass
 class FakeProc:
     returncode: int = 0

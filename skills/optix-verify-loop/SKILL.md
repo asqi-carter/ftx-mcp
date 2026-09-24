@@ -53,7 +53,21 @@ the pattern this skill exists to stop.
    transient UI state (open dropdowns, dialog overlays, unsaved form fields)
    before the capture.
 
-5b. **Run reported launched but the emulator never spawns?** If
+5b. **Port mismatch or "connection refused" in the screenshot?** The web-engine
+   port is now resolved per-project: `optix_observe` / `optix_interact` read the
+   project's own `WebPresentationEngine.Port` node — via the armed bridge, or
+   from `Nodes/UI/UI.yaml` when no bridge is up — rather than the machine-global
+   `OPTIX_RUNTIME_TEST_PORT` (which is an operator override only). When the
+   emulator is alive but serving on a different port than expected the tools
+   self-heal and follow it automatically (`port_followed` appears in the result).
+   For a persistent failure: `optix_status(action="doctor", project=...)` has a
+   `web_port` row — `project_says` / `service_expects` / `listening` (pid + process
+   name, so an Ignition-owned squatter is named) — and surfaces the runtime log's
+   bind-fail signature with remedies. Pass `port=N` to override the resolver
+   explicitly. A project with no engine node returns `source="no_engine"` with a
+   nudge naming `optix_bridge_ensure_web_engine`.
+
+5c. **Run reported launched but the emulator never spawns?** If
    `optix_emulator(action="run")` returns `runtime_identity: "not_running"` with
    `probable_cause: "target_or_modal"` (or repeated starts just never serve),
    hypothesize FIRST that Studio's toolbar target dropdown is set to another
@@ -80,6 +94,22 @@ the pattern this skill exists to stop.
    two-restart debug detour for ONE stuck edit — not a template to repeat
    for every component going forward.
 
+   **(g) READ THE RUNTIME LOG — do this BEFORE theorising about a cause.**
+   `%LOCALAPPDATA%\Rockwell Automation\FactoryTalk Optix\Emulator\Log\<Project>\FTOptixRuntime.0.log`
+   Converters and dynamic links are NOT silent: they log the failure with the
+   offending node path (e.g. `ERROR;160007;Result data type 'NodeId'
+   unsupported`). Neither the bridge nor the MCP surfaces this, so a screenshot
+   alone cannot separate "wrong value" from "converter refused to run". Record
+   `wc -l` before the restart and read only the new lines; a real project has
+   standing noise (offline-PLC tag reads, USB/FTP, SQLite limits) to filter out.
+   Measured 2026-09-01: two confident wrong root causes were asserted in one
+   session that one look at this file would have ruled out.
+
+   **`optix_save` FIRST if you intend to believe the result.** F5 staging does
+   NOT reliably persist edits — an explicit save after several restarts still
+   advanced the project mtime, meaning earlier "verifications" had run against
+   stale state. A verify you plan to act on is worth an explicit save.
+
    **Diagnose by READING, never by writing.** Do not "rule out" hidden-state
    by setting Visible/Enabled/Opacity to their presumed defaults —
    `optix_describe_node` already shows their effective values. Every
@@ -90,5 +120,7 @@ the pattern this skill exists to stop.
 
 7. **Ship.** Once the preview is right, deploy from Studio's own Deploy
    dialog — shipping to hardware is the user's step, not yours.
+
+**Navigation, popup, keyboard, and click-surface changes require a real click in the verify step** — these pattern classes fail silently, and a screenshot of a correctly-rendered screen proves nothing about whether the handlers fire. See `optix-web-click-surface`.
 
 Refs: README §Your first loop; `docs/fast-verify-loop-strategy.md`.

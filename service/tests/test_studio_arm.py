@@ -443,11 +443,19 @@ class _FakeStudio:
 
     def RightClick(self, x, y):  # noqa: N802 -- mirrors uiautomation
         row = self._row_at(x, y)
+        row = studio_arm._strip_tags(row) if row else row  # bold leaf when filtered
         if row == "Misc.":
             self.menu = self._menu(["NodeSet", "Rename", "Delete", "New"])
         elif row == "DesignTimeNetLogic":
             self.menu = self._menu(["NodeSet", "Execute StopBridge",
                                     "Execute StartBridge", "Execute CreateSensors"])
+        elif row == "StudioMCPBridge":
+            # The leaf NetLogic's OWN menu lists its Execute entries too (measured
+            # 2026-09-14: a 15-item leaf menu carried Execute StartBridge). It is
+            # short, so it never clips -- which is why leaf-first is the default.
+            self.menu = self._menu(["NodeSet", "Rename", "Delete", "New",
+                                    "Execute StopBridge", "Execute StartBridge",
+                                    "Execute SetupProject"])
         else:
             self.menu = None
 
@@ -503,16 +511,18 @@ def test_arm_expands_a_collapsed_tree_down_to_the_category_folder(tmp_path, monk
 
 
 def test_arm_prefers_the_search_box_and_clears_it_afterwards(tmp_path, monkeypatch) -> None:
-    """With a Search box present the leaf name is typed, the filtered tree
-    shows the ancestor chain, the category folder's menu is used, and the
-    box is cleared on the way out so the operator gets their tree back."""
+    """Default path: the leaf name is typed into the Search box, and the leaf's
+    OWN short menu is right-clicked (never the ancestor folder's, which can
+    overrun the screen and clip the Execute entry). The box is cleared on the
+    way out so the operator gets their tree back."""
     _fork_tree(tmp_path)
     fake = _FakeStudio(search_box=True)
     _wire(monkeypatch, fake)
     out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
     assert out["ok"] and out["state"] == "armed", out
     assert out["expanded"] == ["filter:StudioMCPBridge"]
-    assert [t["row"] for t in out["tried"]] == ["Misc.", "DesignTimeNetLogic"]
+    assert [t["row"] for t in out["tried"]] == ["StudioMCPBridge"]
+    assert out["tried"][0].get("leaf") is True
     assert "StudioMCPBridge" in fake.keys          # typed into the box
     assert fake.keys[-1] == "{Ctrl}a{Delete}"     # and cleared afterwards
     assert fake.filter == "" and not fake.expanded and fake.armed
@@ -551,6 +561,25 @@ def test_window_identity_accepts_browsename_alias_and_path_label() -> None:
         fake2, "Line4_HM", project_dir=r"C:\Users\me\Desktop\Line4_HM") is None
 
 
+def test_window_identity_tolerates_the_unsaved_star() -> None:
+    r"""I34: Studio appends `*` to the project name/path while there are
+    unsaved changes (`...\NavArgDemo*`), and every bridge-edited project is
+    unsaved until Ctrl+S. Before the fix that answered studio_window_not_found,
+    which reads exactly like 'Studio is not open'."""
+    # Root row carries the marker.
+    fake = _FakeStudio(root_row="NavArgDemo*")
+    assert studio_arm._studio_window_for(fake, "NavArgDemo") is fake.win
+    # Filter active: the in-scene PATH label is the only identity, and it
+    # carries the marker too.
+    fake2 = _FakeStudio(root_row="NavArgDemo", show_root=False,
+                        path_label=r"C:\Users\op\Desktop\NavArgDemo*")
+    assert studio_arm._studio_window_for(
+        fake2, "NavArgDemo",
+        project_dir=r"C:\Users\op\Desktop\NavArgDemo") is fake2.win
+    # The star does not make a NON-matching name match.
+    assert studio_arm._studio_window_for(fake, "OtherProj") is None
+
+
 def test_served_names_include_optix_stem_and_root_node(cfg: core.Config) -> None:
     d = cfg.projects_root / "Line4_HMI"
     (d / "Nodes").mkdir(parents=True)
@@ -578,3 +607,264 @@ def test_find_bridge_for_routes_by_browsename(cfg: core.Config, monkeypatch) -> 
     assert core._find_bridge_for(cfg, "Line4_HMI")["port"] == 8769
     assert core._find_bridge_for(cfg, "Cell_v5")["port"] == 8768
     assert core._find_bridge_for(cfg, "Nobody") is None
+
+
+# ---- acceptance tests: security-warning consent handling --------------------
+#
+# _tick_suppress toggles the "do not show this warning again" checkbox via the
+# TogglePattern (with a click fallback). _click_consent walks all child controls
+# of the popup BEFORE clicking anything, so the suppression tick always lands
+# before the consent click — clicking Proceed first would destroy the dialog and
+# leave the box unticked.
+
+
+class _FakeTogglePattern:
+    """Minimal stand-in for uiautomation's TogglePattern."""
+
+    def __init__(self, state: int = 0) -> None:
+        self.ToggleState = state   # 0 = off, 1 = on (ToggleState_On)
+        self.toggled = False
+
+    def Toggle(self) -> None:  # noqa: N802 — mirrors uiautomation
+        self.toggled = True
+        self.ToggleState = 1
+
+
+class _FakeCheckbox(_Ctl):
+    """CheckBoxControl that optionally exposes a TogglePattern."""
+
+    def __init__(self, name: str, toggle_state: int = 0, has_toggle: bool = True,
+                 rect: tuple = (200, 200, 150, 20)) -> None:
+        super().__init__(name, "CheckBoxControl", rect)
+        self._tp: _FakeTogglePattern | None = (
+            _FakeTogglePattern(toggle_state) if has_toggle else None)
+
+    def GetTogglePattern(self) -> _FakeTogglePattern:  # noqa: N802
+        if self._tp is None:
+            raise Exception("toggle pattern unavailable")
+        return self._tp
+
+
+class _SimpleAuto:
+    """Minimal stand-in for the uiautomation module surface used by
+    _tick_suppress and _click_consent."""
+
+    def __init__(self) -> None:
+        self.clicks: list[tuple[int, int]] = []
+
+    def Click(self, x: int, y: int) -> None:  # noqa: N802
+        self.clicks.append((x, y))
+
+
+def _consent_win(
+    button_name: str = "Proceed",
+    with_suppress: bool = True,
+    button_first: bool = False,
+) -> tuple[_Ctl, _FakeCheckbox | None, _Ctl]:
+    """Build a synthetic Studio window containing one in-scene popup.
+
+    Returns (window, checkbox_or_None, button) so tests can inspect them.
+    When *button_first* is True the ButtonControl appears before the
+    CheckBoxControl in the popup's GetChildren() order — the implementation
+    must still tick before clicking.
+    """
+    checkbox: _FakeCheckbox | None = None
+    button = _Ctl(button_name, "ButtonControl", (220, 240, 80, 24))
+    if with_suppress:
+        checkbox = _FakeCheckbox("Do not show this warning again")
+        children: list[_Ctl] = (
+            [button, checkbox] if button_first else [checkbox, button])
+    else:
+        children = [button]
+    popup = _Ctl("Security Warning", "PaneControl", (180, 180, 340, 120), children)
+    win = _Ctl("FactoryTalk Optix Studio", "WindowControl", (0, 0, 1920, 1080), [popup])
+    return win, checkbox, button
+
+
+# -- _tick_suppress -----------------------------------------------------------
+
+def test_tick_suppress_uses_toggle_pattern_when_off(monkeypatch) -> None:
+    """TogglePattern.Toggle() is called when the checkbox is currently off."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    cb = _FakeCheckbox("Do not show this warning again", toggle_state=0)
+    assert studio_arm._tick_suppress(auto, cb) is True
+    assert cb._tp.toggled is True      # Toggle() fired
+    assert auto.clicks == []            # click fallback NOT used
+
+
+def test_tick_suppress_skips_toggle_when_already_on(monkeypatch) -> None:
+    """When ToggleState is already 1 (on) no Toggle() call is made."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    cb = _FakeCheckbox("Do not show this warning again", toggle_state=1)
+    assert studio_arm._tick_suppress(auto, cb) is True
+    assert cb._tp.toggled is False     # already on — left alone
+    assert auto.clicks == []
+
+
+def test_tick_suppress_falls_back_to_click_when_pattern_unavailable(monkeypatch) -> None:
+    """When GetTogglePattern() raises, _tick_suppress must click the control
+    instead of propagating the exception."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    cb = _FakeCheckbox("Do not show this warning again", has_toggle=False)
+    assert studio_arm._tick_suppress(auto, cb) is True
+    r = cb.BoundingRectangle
+    expected = (r.left + r.width() // 2, r.top + r.height() // 2)
+    assert expected in auto.clicks
+
+
+# -- _click_consent -----------------------------------------------------------
+
+def test_click_consent_ticks_suppress_then_clicks_proceed(monkeypatch) -> None:
+    """Baseline: the suppression checkbox is ticked and Proceed is clicked."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    win, checkbox, button = _consent_win("Proceed")
+    assert studio_arm._click_consent(auto, win, attempts=1) is True
+    assert checkbox._tp.toggled is True
+    br = button.BoundingRectangle
+    assert (br.left + br.width() // 2, br.top + br.height() // 2) in auto.clicks
+
+
+def test_click_consent_ticks_before_clicking_even_when_button_appears_first(
+        monkeypatch) -> None:
+    """The whole popup is walked before anything is clicked. Even when the
+    ButtonControl appears before the CheckBoxControl in traversal order, the
+    toggle must fire before the Proceed click — clicking first destroys the
+    dialog and leaves the box unticked."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    log: list[str] = []
+
+    class _LoggedCheckbox(_FakeCheckbox):
+        def GetTogglePattern(self) -> _FakeTogglePattern:
+            tp = super().GetTogglePattern()
+            orig = tp.Toggle
+            def _log_toggle() -> None:
+                log.append("toggled")
+                orig()
+            tp.Toggle = _log_toggle
+            return tp
+
+    class _LoggedAuto(_SimpleAuto):
+        def Click(self, x: int, y: int) -> None:
+            log.append(f"click:{x},{y}")
+            super().Click(x, y)
+
+    checkbox = _LoggedCheckbox("Do not show this warning again")
+    button = _Ctl("Proceed", "ButtonControl", (220, 240, 80, 24))
+    # Button intentionally listed BEFORE checkbox in popup children.
+    popup = _Ctl("Security Warning", "PaneControl", (180, 180, 340, 120),
+                 [button, checkbox])
+    win = _Ctl("FactoryTalk Optix Studio", "WindowControl", (0, 0, 1920, 1080), [popup])
+    auto = _LoggedAuto()
+    assert studio_arm._click_consent(auto, win, attempts=1) is True
+    assert "toggled" in log
+    first_click_idx = next(i for i, e in enumerate(log) if e.startswith("click:"))
+    assert log.index("toggled") < first_click_idx
+
+
+def test_click_consent_works_without_suppress_checkbox(monkeypatch) -> None:
+    """A popup with a consent button but no 'do not show again' checkbox still
+    consents — the checkbox is best-effort and must not block the click."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    win, _cb, button = _consent_win("Proceed", with_suppress=False)
+    assert studio_arm._click_consent(auto, win, attempts=1) is True
+    br = button.BoundingRectangle
+    assert (br.left + br.width() // 2, br.top + br.height() // 2) in auto.clicks
+
+
+@pytest.mark.parametrize("label", ["Proceed", "Yes", "Run", "Execute", "OK"])
+def test_click_consent_recognises_all_button_labels(monkeypatch, label: str) -> None:
+    """_CONSENT covers every label Studio is known to use."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    win, _cb, _btn = _consent_win(label, with_suppress=False)
+    assert studio_arm._click_consent(auto, win, attempts=1) is True
+
+
+def test_click_consent_skips_optixstudio_named_panes(monkeypatch) -> None:
+    """A pane whose name contains 'optixstudio' is the Studio chrome — it must
+    never be treated as the security-warning popup."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    button = _Ctl("Proceed", "ButtonControl", (220, 240, 80, 24))
+    studio_pane = _Ctl("FactoryTalk Optix Studio", "PaneControl",
+                       (180, 180, 340, 120), [button])
+    win = _Ctl("Studio", "WindowControl", (0, 0, 1920, 1080), [studio_pane])
+    assert studio_arm._click_consent(auto, win, attempts=1) is False
+    assert auto.clicks == []
+
+
+def test_click_consent_returns_false_when_no_popup_present(monkeypatch) -> None:
+    """Returns False — never raises — when no in-scene popup with a consent
+    button is found after all retry attempts."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    # Window contains only plain tree rows, no popup.
+    win = _Ctl("FactoryTalk Optix Studio", "WindowControl", (0, 0, 1920, 1080), [
+        _Ctl("NetLogic", "TextControl", (100, 100, 200, 28)),
+    ])
+    assert studio_arm._click_consent(auto, win, attempts=2) is False
+
+
+# ---- acceptance tests: optix_execute_method dispatch gate --------------------
+#
+# optix_execute_method (MCP tool) calls core.execute_design_method which calls
+# studio_arm.execute_method(..., verify="none"). verify="none" means:
+#   * no port-level guard (serving_port_for is never consulted)
+#   * no "already_armed" / "not_running" short-circuit
+#   * once the Execute menu item is clicked, state="executed" is returned
+# The two tests below pin these two invariants off-box, without a live Studio.
+
+
+def test_optix_execute_method_dispatch_path_returns_executed(
+        tmp_path, monkeypatch) -> None:
+    """UIA tree navigation succeeds and returns state='executed' for an
+    arbitrary method when called with verify='none' (the optix_execute_method
+    path). The fake Studio exposes 'Execute StopBridge' on the category
+    folder's context menu; the gesture must navigate Misc. → expand →
+    DesignTimeNetLogic → click that item — and then return 'executed' rather
+    than waiting for a port signal (there is none for arbitrary methods)."""
+    _fork_tree(tmp_path)
+    fake = _FakeStudio()
+    _wire(monkeypatch, fake)
+    out = studio_arm.execute_method(
+        "Cell_v5", str(tmp_path),
+        method="StopBridge", node_name="StudioMCPBridge",
+        verify="none",
+    )
+    assert out["ok"] and out["state"] == "executed", out
+    assert "nudge" in out, "caller must be told to verify the effect separately"
+    assert out["chain"] == ["Misc.", "DesignTimeNetLogic", "StudioMCPBridge"]
+    # The gesture landed: DesignTimeNetLogic was expanded and its menu was used.
+    assert fake.expanded and not fake.armed
+
+
+def test_optix_execute_method_verify_none_skips_port_guard(
+        tmp_path, monkeypatch) -> None:
+    """With verify='none' serving_port_for is never called — there is no
+    'already_armed' or 'not_running' fast-exit for arbitrary methods whose
+    port-level effect is unknown. This is the key difference from bridge_arm."""
+    _fork_tree(tmp_path)
+    fake = _FakeStudio()
+    port_guard_calls: list = []
+    monkeypatch.setitem(__import__("sys").modules, "uiautomation", fake)
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(studio_arm, "bound_ports", lambda *a, **k: set())
+    monkeypatch.setattr(
+        studio_arm, "serving_port_for",
+        lambda *a, **k: port_guard_calls.append(a) or None,
+    )
+    out = studio_arm.execute_method(
+        "Cell_v5", str(tmp_path),
+        method="StopBridge", node_name="StudioMCPBridge",
+        verify="none",
+    )
+    assert out["ok"] and out["state"] == "executed", out
+    assert not port_guard_calls, (
+        "serving_port_for must not be called when verify='none': "
+        f"got {port_guard_calls}"
+    )

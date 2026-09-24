@@ -61,23 +61,51 @@ no-ops at runtime, even fully parenthesized** — FTOptix's ExpressionEvaluator 
 number→string coercion. `optix_bridge_edit` now REJECTS this at author-time
 (`ExpressionEvaluator '+' is numeric-only ... use a StringFormatter`). To show a value
 WITH a unit/label:
-- **Bridge-authorable (do this):** two widgets — the numeric value via `attach_expression`
-  on one Label, and a **separate static Label** holding the unit (`"L"`, `"°C"`) placed
-  beside it. Anchor/position them as a pair.
-- **Native single-widget (NOT bridge-authorable today):** FTOptix's **StringFormatter**
-  converter (`Format = "{0} L"`) wrapping the ExpressionEvaluator — this is the operator's
-  GUI path in Studio, not an `optix_bridge_edit` op. Don't try to build it via
-  `attach_expression`.
+- **Formatted dynamic link — DISPUTED, do not rely on it for display text.**
+  This skill used to recommend `attach_formatter` on a Label's `Text`
+  (`"format": "{#val} {#eu}"`) as a native single-widget value+unit label.
+  Measured 2026-09-01: a StringFormatter on `Label.Text` with a numeric source
+  produced NO text at all — the label kept its static value, with no log line.
+  A formatted dynamic link appears to format a **NodePath** that the link then
+  resolves to a node (every verified working example — field-project nav loaders,
+  `../NavPanel{#idx}@NodeId` — builds a path), not display text.
+  Tested with a single `{#v}` token, not the literal-plus-token form above, so
+  the exact boundary is unconfirmed; treat the value+unit claim as unproven and
+  render-verify before using it. See `optix-formatted-dynamic-link`.
+- **Two widgets (the old workaround):** the numeric value via `attach_expression` on one
+  Label plus a **separate static Label** for the unit. Still fine, but no longer the only
+  option — this skill previously said the single-widget form was not bridge-authorable,
+  which was wrong.
+- Either way, do NOT try to build it via `attach_expression` — that verb is hard-wired to
+  ExpressionEvaluator and its `{#name}` placeholders yield positional `Source0`.
 The `left_of`/`right_of` string funcs compose text from a **string** source (e.g. split a
 string tag), not from a computed number.
 
-## Verify — converters no-op SILENTLY
-The bridge also does **not** validate the formula syntax at author-time (Optix
-does, at runtime — a malformed expression silently no-ops). So `{ok:true}` means
-"attached", not "correct". A mis-wired converter renders **nothing/transparent with no error** — the classic
-Optix trap. So `{ok:true}` from the tool is NOT proof. **Always runtime-verify**:
-`optix_emulator(action="restart")` → screenshot, and confirm
-the property actually reacts (e.g. toggle the source and re-shoot).
+## Cannot return a NodeId — hard limit
+`ERROR;160007;Result data type 'NodeId' unsupported` (measured 2026-09-01). An
+ExpressionEvaluator CANNOT produce a NodeId, so it can never pick a panel/screen
+directly. `if({0}, <panelA>, <panelB>)` attaches fine, reports `ok:true`, and
+fails at runtime. To choose a panel from a condition, compute an **Int32 index**
+and feed it to a formatted dynamic link (`../NavPanel{#idx}@NodeId`) — see
+`optix-formatted-dynamic-link`. A `ConditionalConverter` IS NodeId-native, but no
+bridge op attaches one.
+
+## Verify — the runtime LOG is the real channel
+The bridge does **not** validate formula syntax at author-time, so `{ok:true}`
+means "attached", not "correct", and a mis-wired converter renders
+nothing/transparent on screen.
+
+But it is **not silent** — it logs, with the offending node path:
+`%LOCALAPPDATA%\Rockwell Automation\FactoryTalk Optix\Emulator\Log\<Project>\FTOptixRuntime.0.log`
+Nothing in the bridge or MCP surfaces this, so a screenshot alone cannot separate
+"wrong value" from "converter refused to run". **Read the log before theorising
+about a bad render** — this file names the cause in one line, and guessing
+instead cost two wrong diagnoses in one session.
+
+Record the line count before `optix_emulator(action="restart")`, then read only
+the new lines; a real project has standing noise (offline-PLC tag reads, USB/FTP,
+SQLite limits) to filter out. Then also confirm the property reacts (toggle the
+source and re-shoot).
 
 Mid a multi-component build, don't restart per converter — attach all of
 them (and the rest of the screen's edits) first, then do ONE restart +

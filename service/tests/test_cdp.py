@@ -12,17 +12,31 @@ import json
 import urllib.request
 from pathlib import Path
 
+import importlib.util
 import pytest
 
 from service import core, _cdp
 from service.tests.conftest import FakeProc, make_fake_runner, make_project
 
 
+# Default Page.getLayoutMetrics response used by FakeWS when the test does not
+# override it.  Matches cfg.cdp_viewport_width/height (1280x720) so that
+# _resolve_point succeeds for any reasonable absolute-pixel coordinate without
+# every click/fill test needing to stub this method explicitly.
+_FAKE_WS_DEFAULTS: dict = {
+    "Page.getLayoutMetrics": {
+        "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 720},
+    },
+}
+
+
 class FakeWS:
     """Echoes a result (or error/event) for every CDP command sent."""
 
     def __init__(self, results=None, pre_events=None):
-        self.results = results or {}          # method -> result dict | Exception
+        # Merge caller overrides on top of the shared defaults so that tests
+        # providing explicit Page.getLayoutMetrics values always win.
+        self.results = {**_FAKE_WS_DEFAULTS, **(results or {})}
         self.pre_events = list(pre_events or [])  # event dicts emitted before first reply
         self.sent: list[tuple[str, dict, int]] = []
         self._outbox: list[str] = []
@@ -232,7 +246,7 @@ def _script_stale_capture_test(monkeypatch, responses: list[tuple]):
     monkeypatch.setattr(core, "_LAST_FRESH_CAPTURE", {})
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
     monkeypatch.setattr(core, "_point_screenshot_at_runtime",
-                         lambda c, sess, url, settle: True)
+                         lambda c, sess, url, settle, project=None: True)
     sessions: list[_StaleFakeSess] = []
 
     def fake_session(c, **k):
@@ -345,9 +359,11 @@ def test_discover_page_ws_picks_page_target(monkeypatch):
 
 
 def test_cdp_error_is_caught_and_returned(cfg, fake_cdp):
-    # a CDP command error during click → failed result, not a raise
+    # a CDP command error during click → failed result, not a raise.
+    # Use absolute-pixel coordinates (both > 1.0) so they are not treated as
+    # normalized fractions; (10, 10) is well within the default 1280x720 viewport.
     fake_cdp(results={"Input.dispatchMouseEvent": _cdp.CDPError("bad coords")})
-    out = core.cdp_click_runtime(cfg, x=1, y=1)
+    out = core.cdp_click_runtime(cfg, x=10, y=10)
     assert out["state"] == "failed" and "bad coords" in out["error"]
 
 
@@ -569,13 +585,16 @@ def test_navigate_if_given_no_url_is_noop(monkeypatch):
     assert sess.navigated_to == []
 
 
-def test_navigate_if_given_url_navigates_and_settles(monkeypatch):
+def test_navigate_if_given_url_navigates_but_does_not_sleep(monkeypatch):
+    # _navigate_if_given navigates but no longer sleeps; the settle is applied
+    # unconditionally by the caller (cdp_click/type/key_runtime) after dispatch
+    # so the total settle fires exactly once regardless of navigation.
     slept: list[float] = []
     monkeypatch.setattr(core.time, "sleep", lambda s: slept.append(s))
     sess = _SpySess()
     assert core._navigate_if_given(sess, "http://x/", 0.25) is True
     assert sess.navigated_to == ["http://x/"]
-    assert slept == [0.25]
+    assert slept == []
 
 
 def test_cdp_key_enter_sends_down_up_with_commit_char(cfg, fake_cdp):
@@ -767,6 +786,112 @@ def test_set_viewport_returns_false_on_cdp_error(cfg, fake_cdp):
         sess.close()
 
 
+# ---- coordinate resolution in cdp_click_runtime / cdp_fill_runtime ----------
+#
+# cdp_click_runtime and cdp_fill_runtime must:
+#   1. Re-apply the viewport override (set_viewport) after navigation so the
+#      coordinate space matches a screenshot taken under the same override.
+#   2. Route (x, y) through _resolve_point: normalized fractions (both <= 1.0)
+#      are multiplied by the CSS viewport; absolute pixels (either > 1.0) pass
+#      through unchanged.
+#   3. Return state:"failed", error:"bad_point" for out-of-frame coordinates.
+#   4. Include css_x, css_y, viewport:{w,h}, coords in the success result.
+
+def test_click_resolves_normalized_coords_to_css_pixels(cfg, fake_cdp):
+    """(x, y) both <= 1.0 are treated as normalized fractions and multiplied
+    by the CSS viewport size reported by Page.getLayoutMetrics."""
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(800, 600),
+    })
+    out = core.cdp_click_runtime(cfg, x=0.5, y=0.25)
+    assert out["state"] == "succeeded", out
+    assert out["css_x"] == 400.0
+    assert out["css_y"] == 150.0
+    assert out["coords"] == "normalized"
+    assert out["viewport"] == {"w": 800.0, "h": 600.0}
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == 400.0 and press["y"] == 150.0
+
+
+def test_click_absolute_coords_pass_through_unchanged(cfg, fake_cdp):
+    """(x, y) with either value > 1.0 are treated as absolute CSS pixels."""
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1280, 720),
+    })
+    out = core.cdp_click_runtime(cfg, x=100.0, y=200.0)
+    assert out["state"] == "succeeded", out
+    assert out["css_x"] == 100.0
+    assert out["css_y"] == 200.0
+    assert out["coords"] == "absolute"
+    assert out["viewport"] == {"w": 1280.0, "h": 720.0}
+
+
+def test_click_bad_point_out_of_frame_returns_failed(cfg, fake_cdp):
+    """A coordinate that lies outside the CSS viewport returns bad_point."""
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(800, 600),
+    })
+    out = core.cdp_click_runtime(cfg, x=900.0, y=300.0)
+    assert out["state"] == "failed"
+    assert out["error"] == "bad_point"
+    assert "outside viewport" in out["detail"]
+    # nothing dispatched
+    assert not [m for (m, _, _) in core._cdp_session.__module__ and [] or []
+                if m == "Input.dispatchMouseEvent"]
+
+
+def test_click_applies_viewport_override_after_navigate_before_dispatch(cfg, fake_cdp):
+    """The viewport re-apply (set_viewport) must come AFTER Page.navigate but
+    BEFORE Input.dispatchMouseEvent, identical to _cdp_capture_once."""
+    ws = fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(1280, 720),
+    })
+    out = core.cdp_click_runtime(cfg, x=10, y=20,
+                                  navigate_url="http://localhost:8081/")
+    assert out["state"] == "succeeded", out
+    methods = [m for (m, _, _) in ws.sent]
+    nav_idx = methods.index("Page.navigate")
+    dispatch_idx = methods.index("Input.dispatchMouseEvent")
+    override_after_nav = [i for i, m in enumerate(methods)
+                          if m == "Emulation.setDeviceMetricsOverride" and i > nav_idx]
+    assert override_after_nav, "expected set_viewport call after navigate"
+    assert override_after_nav[0] < dispatch_idx, (
+        "viewport override must precede mouse dispatch")
+
+
+def test_fill_resolves_normalized_coords_to_css_pixels(cfg, fake_cdp):
+    """cdp_fill_runtime applies the same normalized-coordinate resolution."""
+    ws = fake_cdp(results={
+        "Runtime.evaluate": {"result": {"value": "INPUT"}},
+        "Page.getLayoutMetrics": _layout_metrics(1000, 500),
+    })
+    import service.core as core_mod
+    out = core_mod.cdp_fill_runtime(cfg, x=0.1, y=0.4, text="42")
+    assert out["state"] == "succeeded", out
+    assert out["css_x"] == 100.0
+    assert out["css_y"] == 200.0
+    assert out["coords"] == "normalized"
+    assert out["viewport"] == {"w": 1000.0, "h": 500.0}
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == 100.0 and press["y"] == 200.0
+
+
+def test_fill_bad_point_out_of_frame_returns_failed(cfg, fake_cdp):
+    """cdp_fill_runtime returns bad_point when the coordinate is outside the
+    viewport — nothing is clicked or typed."""
+    fake_cdp(results={
+        "Page.getLayoutMetrics": _layout_metrics(800, 600),
+    })
+    import service.core as core_mod
+    out = core_mod.cdp_fill_runtime(cfg, x=900.0, y=300.0, text="x")
+    assert out["state"] == "failed"
+    assert out["error"] == "bad_point"
+    assert "outside viewport" in out["detail"]
+    assert out["steps"]["clicked"] is False
+
+
 # ---- screenshot region clipping (S4 feature 1: optix_cdp_screenshot region) --
 
 def _layout_metrics(vp_w: float, vp_h: float) -> dict:
@@ -917,6 +1042,7 @@ _FIND_TSV_SCALE = (
 )
 
 
+@pytest.mark.skipif(importlib.util.find_spec("PIL") is None, reason="Pillow not installed in this venv")
 def test_find_text_rescales_ocr_coords_to_css_under_devicescale(cfg, fake_cdp, monkeypatch):
     """OPTIX_CDP_SCALE>1 renders the capture LARGER than the CSS viewport, so
     tesseract's image-pixel boxes must be rescaled to CSS px — center_px feeds a
@@ -1570,3 +1696,166 @@ def test_routes_roundtrip_preserves_non_ascii(cfg, projects_root):
     assert back["state"] == "succeeded"
     assert back["routes"]["structure"]["MainWindow"]["title"] == "LINE 4 — OVERVIEW"
     assert back["routes"]["routes"]["overview"]["steps"][0]["expect_text"] == "LINE 4 — OVERVIEW"
+
+
+# ---- Bug-exact coordinate resolution: normalized vs absolute on 1280x720 ----
+#
+# The bug: normalized fractions (both <= 1.0) were dispatched raw as pixel
+# coordinates, so x=0.606 landed at pixel 0.606 instead of 775.68.
+# After the fix, _resolve_point multiplies by the CSS viewport dimensions.
+# These two tests pin the exact arithmetic using the default 1280x720
+# layout-metrics fixture and together reflect the actual bug shape: an agent
+# might pass normalized (0.606, 0.193) or the approximate pixel (775, 139)
+# intending the same target — both must resolve through their correct path.
+
+def test_normalized_coords_1280x720_dispatch_at_775_68_138_96(cfg, fake_cdp):
+    """cdp_click_runtime(x=0.606, y=0.193) on the default 1280x720 fake
+    viewport must dispatch at exactly 775.68 / 138.96 (= 0.606*1280,
+    0.193*720) — the arithmetic from the bug description."""
+    # FakeWS default already returns 1280x720 for Page.getLayoutMetrics.
+    ws = fake_cdp()
+    out = core.cdp_click_runtime(cfg, x=0.606, y=0.193)
+    assert out["state"] == "succeeded", out
+    assert out["coords"] == "normalized"
+    assert out["css_x"] == pytest.approx(775.68)
+    assert out["css_y"] == pytest.approx(138.96)
+    assert out["viewport"] == {"w": 1280.0, "h": 720.0}
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == pytest.approx(775.68)
+    assert press["y"] == pytest.approx(138.96)
+
+
+def test_absolute_coords_775_139_dispatch_unchanged_on_1280x720(cfg, fake_cdp):
+    """cdp_click_runtime(x=775, y=139) has x > 1.0 so is treated as absolute
+    CSS pixels and passes through unchanged — the absolute-pixel half of the
+    same bug shape."""
+    ws = fake_cdp()
+    out = core.cdp_click_runtime(cfg, x=775, y=139)
+    assert out["state"] == "succeeded", out
+    assert out["coords"] == "absolute"
+    assert out["css_x"] == 775.0
+    assert out["css_y"] == 139.0
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == 775.0 and press["y"] == 139.0
+
+
+# ---- cdp_viewport_scale=2: dispatched point stays in CSS px, not device px --
+#
+# OPTIX_CDP_SCALE=2 renders screenshots at 2× device pixels but
+# Input.dispatchMouseEvent still operates in CSS pixels (the same coordinate
+# space as the browser's pointer model and Page.captureScreenshot's clip).
+# A click at absolute (400, 200) must dispatch at exactly (400, 200) under
+# scale=2 — NOT at (800, 400). Mirrors the OCR rescaling tested by
+# test_find_text_rescales_ocr_coords_to_css_under_devicescale.
+
+def test_click_viewport_scale2_dispatches_in_css_px_not_device_px(cfg, fake_cdp):
+    """scale=2 changes the captured pixel density but NOT the click coordinate
+    space: dispatched (400, 200) must arrive at (400, 200), not (800, 400)."""
+    cfg2 = dataclasses.replace(cfg, cdp_viewport_scale=2.0)
+    ws = fake_cdp()  # returns 1280x720 CSS viewport via Page.getLayoutMetrics
+    out = core.cdp_click_runtime(cfg2, x=400, y=200)
+    assert out["state"] == "succeeded", out
+    assert out["css_x"] == 400.0
+    assert out["css_y"] == 200.0
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == 400.0 and press["y"] == 200.0
+    # The override is sent with the configured scale factor
+    override = next(p for (m, p, _) in ws.sent
+                    if m == "Emulation.setDeviceMetricsOverride")
+    assert override["deviceScaleFactor"] == 2.0
+
+
+# ---- Out-of-bounds bad_point + fill resolves identically to click -----------
+
+def test_click_x2000_returns_bad_point_and_dispatches_nothing_on_1280_viewport(
+        cfg, fake_cdp):
+    """x=2000 on a 1280-wide viewport: state='failed', error='bad_point', and
+    no Input.dispatchMouseEvent is sent (the point is rejected before click)."""
+    ws = fake_cdp()  # default 1280x720
+    out = core.cdp_click_runtime(cfg, x=2000, y=300)
+    assert out["state"] == "failed"
+    assert out["error"] == "bad_point"
+    assert "outside viewport" in out["detail"]
+    dispatched = [m for (m, _, _) in ws.sent if m == "Input.dispatchMouseEvent"]
+    assert dispatched == [], "bad_point must dispatch nothing"
+
+
+def test_fill_x775_y139_resolves_identically_to_click(cfg, fake_cdp):
+    """cdp_fill_runtime(x=775, y=139) must dispatch mousePressed at (775, 139)
+    — the same resolved point as cdp_click_runtime — confirming that fill
+    routes through the same _resolve_point logic (absolute-pixel branch)."""
+    ws = fake_cdp(results={"Runtime.evaluate": {"result": {"value": "INPUT"}}})
+    out = core.cdp_fill_runtime(cfg, x=775, y=139, text="42")
+    assert out["state"] == "succeeded", out
+    assert out["coords"] == "absolute"
+    assert out["css_x"] == 775.0
+    assert out["css_y"] == 139.0
+    press = next(p for (m, p, _) in ws.sent
+                 if m == "Input.dispatchMouseEvent" and p.get("type") == "mousePressed")
+    assert press["x"] == 775.0 and press["y"] == 139.0
+
+
+# ---- settle_seconds: monkeypatched time.sleep assertions --------------------
+#
+# settle_seconds=0.25 with no navigate_url: click, fill, and screenshot each
+# call time.sleep with the settle value.  With navigate_url, the settle fires
+# ONCE (after dispatch/capture) — _navigate_if_given and
+# _point_screenshot_at_runtime no longer sleep themselves, so the total settle
+# is applied exactly once regardless of whether a navigation occurred.
+
+def test_click_no_url_settle_seconds_calls_sleep_once(cfg, fake_cdp, monkeypatch):
+    """settle_seconds=0.25 with no navigate_url: exactly one sleep(0.25)
+    fires after the mouse dispatch."""
+    fake_cdp()
+    recorded: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: recorded.append(s))
+    out = core.cdp_click_runtime(cfg, x=10, y=20, settle_seconds=0.25)
+    assert out["state"] == "succeeded", out
+    assert recorded == [0.25]
+
+
+def test_fill_settle_seconds_0_25_fires_after_type(cfg, fake_cdp, monkeypatch):
+    """settle_seconds=0.25 on fill: the 0.25 settle sleep fires after
+    insert_text.  The internal 0.3 s focus-wait and the 0.25 settle are the
+    only two sleeps (no extra sleep for navigation)."""
+    fake_cdp(results={"Runtime.evaluate": {"result": {"value": "INPUT"}}})
+    recorded: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: recorded.append(s))
+    out = core.cdp_fill_runtime(cfg, x=10, y=20, text="x", settle_seconds=0.25)
+    assert out["state"] == "succeeded", out
+    assert 0.25 in recorded          # settle fires
+    assert len(recorded) == 2        # focus-wait (0.3) + settle (0.25)
+
+
+def test_screenshot_settle_seconds_0_25_with_navigate_url_calls_sleep_once(
+        cfg, fake_cdp, monkeypatch):
+    """settle_seconds=0.25 with navigate_url: exactly one sleep(0.25)
+    fires before capture (_point_screenshot_at_runtime does not sleep)."""
+    jpeg = b"\xff\xd8jpeg\xff\xd9"
+    fake_cdp(results={"Page.captureScreenshot":
+                      {"data": base64.b64encode(jpeg).decode()}})
+    recorded: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: recorded.append(s))
+    out = core.cdp_screenshot_runtime(
+        cfg, navigate_url="http://localhost:8081/", settle_seconds=0.25)
+    assert out["state"] == "succeeded", out
+    assert recorded == [0.25]
+
+
+def test_click_navigate_url_settle_fires_once_not_twice(cfg, fake_cdp, monkeypatch):
+    """With navigate_url, the settle sleep fires ONCE after dispatch — not
+    twice. _navigate_if_given navigates but never sleeps, so there is no
+    double-settle when a URL is provided."""
+    fake_cdp()
+    recorded: list[float] = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: recorded.append(s))
+    out = core.cdp_click_runtime(cfg, x=10, y=20,
+                                  navigate_url="http://localhost:8081/",
+                                  settle_seconds=0.25)
+    assert out["state"] == "succeeded", out
+    assert recorded == [0.25], (
+        f"expected exactly one settle sleep, got: {recorded}"
+    )

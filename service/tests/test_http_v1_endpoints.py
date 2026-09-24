@@ -16,9 +16,21 @@ def _client(cfg):
 
 
 def test_doctor_endpoint(cfg, monkeypatch):
-    monkeypatch.setattr(core, "doctor", lambda c: {"ready": True, "checks": []})
+    seen: list = []
+
+    def _doctor(c, project=None):
+        seen.append(project)
+        return {"ready": True, "checks": []}
+
+    monkeypatch.setattr(core, "doctor", _doctor)
     r = _client(cfg).get("/doctor")
     assert r.status_code == 200 and r.json()["ready"] is True
+    # (1.0.8) `project` is optional and passed straight through, so a
+    # doctor report can say WHERE a project name resolved (projects_root, or
+    # a directory proven open in Studio).
+    r = _client(cfg).get("/doctor?project=Alpha")
+    assert r.status_code == 200
+    assert seen == [None, "Alpha"]
 
 
 def test_save_endpoint(cfg, projects_root, monkeypatch):

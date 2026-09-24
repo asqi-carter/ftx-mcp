@@ -287,6 +287,77 @@ def test_describe_type_unknown_is_node_not_found(cfg: core.Config, projects_root
         core.describe_type(cfg, "Alpha", "Nope")
 
 
+def test_list_ui_types_misaligned_builds_summary(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """list_ui_types emits misaligned:[{name,browse_name}] for entries where
+    browse_name != name, plus a _hint nudge. Aligned entries produce no misaligned
+    key and no hint."""
+    make_project(projects_root, "Alpha")
+    types = [
+        {"name": "Label", "browse_name": "Label"},
+        {"name": "VirtualKeyboardType", "browse_name": "VirtualKeyboard", "resolved_by": "browse_name"},
+        {"name": "Button", "browse_name": "Button"},
+    ]
+    routes = {**_HEALTHY, "/bridge/types/ui": (200, {"types": types, "count": 3})}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.list_ui_types(cfg, "Alpha")
+    assert "misaligned" in out
+    assert out["misaligned"] == [{"name": "VirtualKeyboardType", "browse_name": "VirtualKeyboard"}]
+    assert "_hint" in out
+    # Aligned entries produce no misaligned key
+    by_name = {t["name"]: t for t in out["types"]}
+    assert "browse_name" not in by_name["Label"]
+    assert "browse_name" not in by_name["Button"]
+    assert by_name["VirtualKeyboardType"]["browse_name"] == "VirtualKeyboard"
+
+
+def test_list_ui_types_no_misaligned_when_all_aligned(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """When all types are aligned (browse_name == name), misaligned is absent."""
+    make_project(projects_root, "Alpha")
+    types = [{"name": "Label", "browse_name": "Label"}, {"name": "Button", "browse_name": "Button"}]
+    routes = {**_HEALTHY, "/bridge/types/ui": (200, {"types": types, "count": 2})}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.list_ui_types(cfg, "Alpha")
+    assert "misaligned" not in out
+    assert "_hint" not in out
+
+
+def test_describe_type_passes_resolved_by_through(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """describe_type passes resolved_by from the bridge response through unchanged."""
+    make_project(projects_root, "Alpha")
+    schema = {
+        "type": "VirtualKeyboard",
+        "browse_name": "VirtualKeyboard",
+        "resolved_by": "browse_name",
+        "properties": [],
+        "truncated": False,
+    }
+    routes = {**_HEALTHY, "/bridge/types/schema": (200, schema)}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.describe_type(cfg, "Alpha", "VirtualKeyboard")
+    assert out["resolved_by"] == "browse_name"
+    # aligned name: no catalog_misaligned
+    assert "catalog_misaligned" not in out
+
+
+def test_describe_type_catalog_misaligned_when_browse_name_differs(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """catalog_misaligned:True is set when the response browse_name differs from
+    the requested type name — signals the caller used a field-name alias rather than
+    the canonical browse-name identifier."""
+    make_project(projects_root, "Alpha")
+    schema = {
+        "type": "VirtualKeyboardType",
+        "browse_name": "VirtualKeyboard",
+        "properties": [],
+        "truncated": False,
+    }
+    routes = {**_HEALTHY, "/bridge/types/schema": (200, schema)}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.describe_type(cfg, "Alpha", "VirtualKeyboardType")
+    assert out["catalog_misaligned"] is True
+
+
 def test_type_tools_require_bridge(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
     make_project(projects_root, "Alpha")
     monkeypatch.setattr(core, "_bridge_http", _bridge({}, unreachable=True))
@@ -294,6 +365,73 @@ def test_type_tools_require_bridge(cfg: core.Config, projects_root: Path, monkey
         core.list_ui_types(cfg, "Alpha")
     with pytest.raises(core.BridgeUnavailable):
         core.describe_type(cfg, "Alpha", "Label")
+
+
+def test_bridge_state_includes_project_path_and_pid(cfg: core.Config, monkeypatch) -> None:
+    """bridge_state() must surface project_path and pid from /bridge/health.
+
+    Shape contract: project_path is a str at its expected key; pid is an int.
+    Both keys must be present — a KeyError here would mean the field was dropped.
+    """
+    routes = {"/bridge/health": (200, {
+        "bridge_version": "1.1.0",
+        "project": "Alpha",
+        "model_loaded": True,
+        "port": 8768,
+        "project_path": r"C:\Users\dev\Projects\Alpha\Alpha.optix",
+        "pid": 12345,
+    })}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    st = core.bridge_state(cfg)
+    assert st["available"] is True
+    # value assertions
+    assert st["project_path"] == r"C:\Users\dev\Projects\Alpha\Alpha.optix"
+    assert st["pid"] == 12345
+    # type assertions — the shape contract
+    assert isinstance(st["project_path"], str)
+    assert isinstance(st["pid"], int)
+
+
+def test_bridge_state_project_path_null(cfg: core.Config, monkeypatch) -> None:
+    """project_path may be null when Studio cannot determine the on-disk path.
+
+    Shape contract: the key must still be present; project_path is None (not
+    absent), pid is still an int at its key.
+    """
+    routes = {"/bridge/health": (200, {
+        "bridge_version": "1.1.0",
+        "project": "Alpha",
+        "model_loaded": True,
+        "port": 8768,
+        "project_path": None,
+        "pid": 99,
+    })}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    st = core.bridge_state(cfg)
+    # project_path key must exist and be explicitly None
+    assert "project_path" in st
+    assert st["project_path"] is None
+    # pid key must exist and carry the integer value
+    assert "pid" in st
+    assert st["pid"] == 99
+    assert isinstance(st["pid"], int)
+
+
+def test_bridge_state_project_path_absent_from_old_bridge(cfg: core.Config, monkeypatch) -> None:
+    """Older bridge versions that don't send project_path/pid yield None — no KeyError."""
+    routes = {"/bridge/health": (200, {
+        "bridge_version": "0.4.0",
+        "project": "Alpha",
+        "model_loaded": True,
+    })}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    st = core.bridge_state(cfg)
+    assert st["available"] is True
+    # both keys must be present in the returned dict (None, not missing)
+    assert "project_path" in st
+    assert "pid" in st
+    assert st["project_path"] is None
+    assert st["pid"] is None
 
 
 def test_list_screens_falls_back_to_file(cfg: core.Config, projects_root: Path, monkeypatch) -> None:

@@ -97,6 +97,16 @@ def studio_state(force: bool = False, scan: ScanFn | None = None) -> dict:
             "studio": {
                 "running": any(p["name"] in STUDIO_PROCS for p in procs),
                 "pids": [p["pid"] for p in procs if p["name"] in STUDIO_PROCS],
+                # (1.0.8) Studio processes WITH their command lines. _scan
+                # already reads cmdline for every process it keeps (one
+                # name-filtered psutil pass), so carrying it here is free —
+                # and it is the evidence core.resolve_project's out-of-root
+                # fallback needs to learn which project directory a running
+                # Studio was launched on. Deliberately a NEW key beside
+                # running/pids so every existing reader is untouched, and
+                # deliberately not a second scanner (see core._emulator_pids
+                # on the cost of a second cmdline-wide process_iter pass).
+                "procs": [p for p in procs if p["name"] in STUDIO_PROCS],
             },
             "editors": [p for p in procs if p["name"] in EDITOR_PROCS],
             "checked_at": now,
@@ -112,6 +122,22 @@ def reset_cache() -> None:
     """Test hook: drop the TTL cache between cases."""
     global _cache, _cache_at
     _cache, _cache_at = None, 0.0
+
+
+def studio_cmdlines(state: dict) -> list[list[str]]:
+    """Command lines of the running Studio processes in a `studio_state`
+    snapshot, one list of argv tokens per process.
+
+    Empty when enumeration failed, when nothing is running, or when the
+    snapshot predates the "procs" key. NOTE that a Studio opened from the GUI
+    carries only its bare exe path (see this module's docstring) — a caller
+    reading these must treat "no project on the command line" as normal, not
+    as an error.
+    """
+    if state.get("error"):
+        return []
+    procs = state.get("studio", {}).get("procs", []) or []
+    return [list(p.get("cmdline") or []) for p in procs]
 
 
 def attributed_editors(state: dict, project_dir: Path) -> list[dict]:

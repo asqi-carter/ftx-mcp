@@ -73,7 +73,8 @@ tools/
 # deliberately-distributed example (docs/security.md references it).
 examples/*
 !examples/claude-code-settings.json
-docs/optix-patterns/
+docs/optix-patterns/*
+!docs/optix-patterns/enum-wire-names.md
 docs/component-gallery.md
 docs/corp-it-install.md
 docs/deploy-verification.md
@@ -85,4 +86,10 @@ docs/visual-studio-quick-install.md
 docs/claude-desktop-cowork-setup.md
 bootstrap/launch.ps1
 skills/optix-deploy-safely/
-skills/optix-anchored-edit/
+
+# Local scratch and maintainer-only material; not distributed.
+tmp/
+dev/
+ci/
+Dockerfile.*
+tests/fixtures/

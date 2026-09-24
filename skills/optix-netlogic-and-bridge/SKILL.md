@@ -20,7 +20,7 @@ So the whole recipe is:
    file tools: `public class MyLogic : BaseNetLogic { public override void Start() {...} }`.
 2. `optix_bridge_create_netlogic(parent="<path>", name="MyLogic")` — `name` MUST
    equal the class name exactly. This mints a real `NetLogicObject` node.
-3. `optix_restart_emulator` — the rebuild instantiates it; `Start()` runs.
+3. `optix_emulator(action="restart")` — the rebuild instantiates it; `Start()` runs.
 
 **Placement matters.** A runtime NetLogic that reads sibling nodes through `Owner`
 must be created UNDER the object that owns them (pass that object as `parent`,
@@ -31,6 +31,50 @@ There is NO Studio "New -> NetLogic" menu step required. (This was long believed
 to be a wall; it is not — the wall was creating a plain `BaseObjectType` named
 like a class, which never binds.)
 
+### `[ExportMethod]`s need a Studio REOPEN before anything can call them
+
+A bridge-created NetLogic node starts with **no method children**. The class
+compiles, `Start()`/`Stop()` run fine, but the `[ExportMethod]`s do not exist as
+`UAMethod` nodes in the model yet — Studio materialises them only when it reopens
+the project and parses the class. Until then any
+`wire_event(..., method_path="Model/MyLogic/MyMethod")` wires cleanly, reports
+`ok`, and fails at runtime with:
+
+```
+ERROR;urn:FTOptix:CoreBase;02;Exception caught: Method 'Key2' not found on
+  target object Root/Objects/<Proj>/Model/NumKeypad
+```
+
+**Sequence that works:** (`optix_read_netlogic` to inspect the current `.cs`
+source if the class already exists →) author the `.cs` → `create_netlogic` →
+`optix_build_check` → **save, close Studio, reopen, re-arm** → confirm with
+`optix_describe_node` that the method children now exist → THEN wire buttons to
+them. Measured 2026-09-01: 15 `[ExportMethod]`s went from zero children to all
+15 `UAMethod` nodes across one reopen, with no other change.
+
+Verify with `describe_node`, not by assuming — and note this failure is silent
+everywhere except the runtime log (see `optix-verify-loop`).
+
+### Session-based NetLogic: methods are NOT callable by absolute path
+
+A NetLogic that uses `Session` (it must sit inside a UI object — `IdleTimeoutLogic`,
+anything closing dialogs, anything per-operator) is instantiated **per UI session**.
+The node at `UI/MainWindow/MyLogic` is only the TEMPLATE. A button wired to
+`method_path: "UI/MainWindow/MyLogic/DoThing"` wires cleanly, the `UAMethod` node
+exists, the click fires — and the runtime answers:
+
+```
+ERROR;CoreBase;31;No behaviour or observer found that handles the method
+  'DoThing' on node .../UI/MainWindow/MyLogic
+```
+
+**Call it directly in C#** from code already running inside the session instance
+(an event handler on that same object) instead of routing through the node. For
+an idle-timeout/close-dialogs job that is also simply less machinery.
+
+Watch for this whenever a method "exists" but nothing happens: the node being
+present says nothing about a behaviour being attached to *that* node.
+
 ## Compile pre-flight — ALWAYS before restart_emulator
 
 `optix_build_check(project=...)` copies the NetSolution to a throwaway temp dir
@@ -40,6 +84,27 @@ message}], hint?, ...}`. Run it after editing any `.cs`. A NetLogic that does no
 compile fails the build **silently** and takes the in-Studio bridge AND the
 emulator down with it — build_check turns that into an instant file:line report.
 It works whether or not Studio is open (it reads the `.cs` on disk).
+`optix_read_netlogic` offers the same offline-read reach — it retrieves a
+class's source by name without needing the bridge.
+
+**`CS0104: 'X' is an ambiguous reference` after adding a comm driver.** Studio
+injects `using FTOptix.RAEtherNetIP;` (and `FTOptix.CommunicationDriver`) into
+**every** NetLogic `.cs` in the solution when a driver is added — including files
+you wrote and files copied in. `FTOptix.RAEtherNetIP` exports its own `Encoding`,
+which collides with `System.Text.Encoding`:
+
+```
+error CS0104: 'Encoding' is an ambiguous reference between
+  'FTOptix.RAEtherNetIP.Encoding' and 'System.Text.Encoding'
+```
+
+Fix with a **using alias**, not by fully qualifying the call sites:
+`using Encoding = System.Text.Encoding;`. One line covers every usage and
+survives Studio re-injecting its usings later; qualifying the current sites
+leaves the next `Encoding.` you write broken. This bit `StudioMCPBridge.cs` on
+2026-09-02 — and remember a NetLogic that does not compile takes the in-Studio
+bridge AND the emulator down with it, so it presents as "the bridge died", not as
+a compile error.
 
 **Read the `hint`.** If every error is `CS0246` on FTOptix/UAManagedCore types,
 it is almost always **stale `.references` HintPaths** (pinned to a Studio version
@@ -70,7 +135,7 @@ ANY design-time method by hand (see below).
 ### A C# rebuild unloads the bridge; NEW BRIDGE CODE needs a Studio REOPEN
 
 - Any NetLogic (C#) recompile unloads the bridge listener — after
-  `optix_restart_emulator` the bridge is down until you re-run StartBridge.
+  `optix_emulator(action="restart")` the bridge is down until you re-run StartBridge.
 - **StartBridge after an emulator-only rebuild was OBSERVED to run the OLD bridge
   code.** The Optix docs say a DesignTime NetLogic's assembly is *reloaded from
   disk on every `[ExportMethod]` call* — but the bridge is a long-lived listener
@@ -122,8 +187,8 @@ running client keeps the old tool list.
 ## Deploying (shipping to a panel / production)
 
 Deploy is **not** done through this MCP distribution — the deploy tool family is
-disabled here on purpose; the standard loop is author -> `optix_restart_emulator`
-preview -> `optix_cdp_screenshot` verify. When you are ready to ship:
+disabled here on purpose; the standard loop is author -> `optix_emulator(action="restart")`
+preview -> `optix_observe(mode="screenshot")` verify. When you are ready to ship:
 
 - Use **Studio's own Deploy dialog** (UI) to push to a connected panel / runtime.
 - Or the **Studio CLI export** for a USB panel image:

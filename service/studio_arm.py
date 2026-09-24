@@ -54,11 +54,11 @@ import time
 import urllib.request
 from pathlib import Path
 
-# Kept in sync with core.Config.bridge_port_base / bridge_port_range and with
-# StudioMCPBridge.cs BasePort / PortRangeSize. Passed in by the caller so the
-# env overrides (OPTIX_BRIDGE_PORT_BASE/_RANGE) keep working.
-_DEFAULT_BASE = 8768
-_DEFAULT_RANGE = 4
+from .core import _BRIDGE_PORT_BASE as _DEFAULT_BASE, _BRIDGE_PORT_RANGE as _DEFAULT_RANGE
+# Imported from core so there is one authoritative declaration; callers pass
+# cfg.bridge_port_base / cfg.bridge_port_range (env-overridable) explicitly,
+# so these defaults only apply when studio_arm functions are called without
+# those arguments (e.g. tests or standalone use).
 
 
 # ---- navigation, derived from the project YAML ------------------------------
@@ -257,7 +257,15 @@ def _studio_window_for(auto, project: str, aliases: set[str] | None = None,
             for c in w.GetChildren():
                 if c.ControlTypeName != "TextControl":
                     continue
-                n = _norm(c.Name)
+                # I34 (2026-09-04): Studio appends `*` to this text while the
+                # project has unsaved changes -- the label measured that day read
+                # `C:\Users\<u>\Desktop\NavArgDemo*`. An intolerant compare
+                # answered studio_window_not_found for every bridge-edited
+                # project (unsaved by definition until Ctrl+S), which reads
+                # exactly like "Studio is not open". Strip the marker off BOTH
+                # ends -- leading in case Studio ever moves it -- for the root-row
+                # name match AND the path-prefix match below.
+                n = _norm(c.Name).strip("*").strip()
                 if n in want:
                     return w
                 if pdir and (n.replace("/", "\\") == pdir
@@ -387,15 +395,51 @@ def _open_menu_items(win) -> list[tuple[str, object]]:
 
 
 _CONSENT = re.compile(r"^(Proceed|Yes|Run|Execute|OK)$")
+# "Do not show this warning again". Studio's wording varies in casing and
+# spacing, so match loosely on the words that carry the meaning.
+_SUPPRESS = re.compile(r"do\s*not\s*show.*again", re.I)
 
 
-def _click_consent(auto, win) -> bool:
-    """Click Studio's Execute security prompt if it appeared.
+def _tick_suppress(auto, box) -> bool:
+    """Tick a 'do not show again' checkbox, preferring the toggle pattern.
+
+    Best-effort BY DESIGN: the consent click is what actually unblocks Studio,
+    so failing to suppress must never stop us from clicking Proceed.
+    """
+    try:
+        tp = box.GetTogglePattern()
+        if tp.ToggleState == 1:          # ToggleState_On — already ticked
+            return True
+        tp.Toggle()
+        return True
+    except Exception:
+        pass
+    try:
+        r = box.BoundingRectangle
+        auto.Click(r.left + r.width() // 2, r.top + r.height() // 2)
+        return True
+    except Exception:
+        return False
+
+
+def _click_consent(auto, win, attempts: int = 12) -> bool:
+    """Tick 'do not show again', then click Studio's security prompt.
 
     Scans ONLY inside in-scene popups. Never the whole window: a stray 'Yes' or
     'OK' elsewhere in the UI must never be clicked.
+
+    The checkbox is ticked BEFORE consenting because clicking Proceed destroys
+    the dialog and the box with it. Studio raises this warning once per
+    TRIGGER, not once per project, so without the tick the same modal blocks
+    the arm, then the first F5, then the next one (verified 2026-09-01: arm
+    reported consent_clicked, and F5 immediately hit the identical dialog).
+    Ticking it makes the dismissal stick for the life of the project.
+
+    NOTE the whole popup is walked before anything is clicked — the button is
+    frequently reached before the checkbox in traversal order, and consenting
+    early would dismiss the dialog with the box still unticked.
     """
-    for _ in range(12):
+    for _ in range(attempts):
         try:
             for d in win.GetChildren():
                 if d.ControlTypeName not in ("WindowControl", "PaneControl"):
@@ -403,29 +447,82 @@ def _click_consent(auto, win) -> bool:
                 if "optixstudio" in (d.Name or "").replace(" ", "").casefold():
                     continue
                 stack, seen = list(d.GetChildren()), 0
+                suppress, button = None, None
                 while stack and seen < 300:
                     el = stack.pop()
                     seen += 1
                     try:
-                        if (el.ControlTypeName == "ButtonControl"
-                                and _CONSENT.match((el.Name or "").strip())):
-                            r = el.BoundingRectangle
-                            auto.Click(r.left + r.width() // 2,
-                                       r.top + r.height() // 2)
-                            return True
+                        nm = (el.Name or "").strip()
+                        if (suppress is None
+                                and el.ControlTypeName == "CheckBoxControl"
+                                and _SUPPRESS.search(nm)):
+                            suppress = el
+                        elif (button is None
+                                and el.ControlTypeName == "ButtonControl"
+                                and _CONSENT.match(nm)):
+                            button = el
                         stack.extend(el.GetChildren())
                     except Exception:
                         continue
+                if button is None:
+                    continue
+                if suppress is not None:
+                    _tick_suppress(auto, suppress)
+                    time.sleep(0.15)
+                r = button.BoundingRectangle
+                auto.Click(r.left + r.width() // 2, r.top + r.height() // 2)
+                return True
         except Exception:
             pass
         time.sleep(0.25)
     return False
 
 
+def clear_consent(project: str, project_dir: str | Path | None = None,
+                  aliases: set[str] | None = None,
+                  attempts: int = 8) -> dict:
+    """Answer Studio's NetLogic security warning for `project`, if it is up.
+
+    Exists because the emulator's F5 raises the SAME modal the arm path already
+    handles, and the modal EATS the keystroke until answered. Clicking Proceed
+    lets the ALREADY-SENT F5 continue, so the caller must NOT resend it — F5
+    toggles, and a resend would stop the emulator it just started.
+
+    Foreground window and cursor are restored the way execute_method restores
+    them, so clearing a dialog mid-wait doesn't permanently steal focus.
+    """
+    try:
+        import uiautomation as auto  # lazy: Windows-only, may be absent
+    except Exception as e:  # pragma: no cover - import guard
+        return {"ok": False, "error": "uiautomation_unavailable", "detail": str(e)}
+
+    win = _studio_window_for(auto, project, aliases, project_dir)
+    if win is None:
+        return {"ok": False, "error": "studio_window_not_found", "project": project}
+
+    prev_cursor = auto.GetCursorPos()
+    prev_fg = auto.GetForegroundControl()
+    try:
+        win.SetActive()
+        time.sleep(0.3)
+        return {"ok": True, "consent_clicked": _click_consent(auto, win, attempts)}
+    except Exception as e:  # pragma: no cover - UIA runtime failure
+        return {"ok": False, "error": "uia_failed",
+                "detail": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            auto.SetCursorPos(*prev_cursor)
+            if prev_fg:
+                prev_fg.SetActive()
+        except Exception:
+            pass
+
+
 def execute_method(project: str, project_dir: str, method: str = "StartBridge",
                    node_name: str = "StudioMCPBridge",
                    base_port: int = _DEFAULT_BASE, port_range: int = _DEFAULT_RANGE,
-                   timeout: float = 15.0, aliases: set[str] | None = None) -> dict:
+                   timeout: float = 15.0, aliases: set[str] | None = None,
+                   verify: str | None = None) -> dict:
     """Right-click the bridge NetLogic (or an ancestor folder) in `project`'s
     Studio window and click `Execute <method>`.
 
@@ -449,13 +546,21 @@ def execute_method(project: str, project_dir: str, method: str = "StartBridge",
     # this project" is a pure loopback question. Answering it first means a box
     # without uiautomation still gets a useful already_armed/not_running
     # instead of a spurious capability error.
-    arming = method == "StartBridge"
-    already = serving_port_for(project, base_port, port_range, aliases)
-    if arming and already:
-        return {"ok": True, "state": "already_armed", "port": already,
-                "project": project}
-    if not arming and already is None:
-        return {"ok": True, "state": "not_running", "project": project}
+    # HOW success is confirmed. StartBridge/StopBridge are verified by the
+    # bridge port appearing or disappearing. Any OTHER design-time method
+    # (a generator's Build*, FormattedLinkScript's Apply, ...) produces no
+    # such signal, so judging it by the port would report verify_timeout on a
+    # perfectly successful run — pass verify="none" for those and confirm the
+    # effect by render or describe_node instead.
+    mode = verify or ("arm" if method == "StartBridge" else "stop")
+    arming = mode == "arm"
+    if mode != "none":
+        already = serving_port_for(project, base_port, port_range, aliases)
+        if arming and already:
+            return {"ok": True, "state": "already_armed", "port": already,
+                    "project": project}
+        if not arming and already is None:
+            return {"ok": True, "state": "not_running", "project": project}
 
     yaml_path = find_bridge_yaml(project_dir, node_name)
     if yaml_path is None:
@@ -496,7 +601,38 @@ def execute_method(project: str, project_dir: str, method: str = "StartBridge",
         win.SetActive()
         time.sleep(0.4)
         target = None
+        # Default: filter the Project-view tree to the leaf node and right-click
+        # THAT row. Its own context menu is short and never clips; an ancestor
+        # folder's aggregated menu can overrun the screen and render the Execute
+        # entry off-screen, so a blind click on its rectangle misses (measured
+        # 2026-09-07/14: 39-item folder menu ~1032px vs a 768px screen). The
+        # chain walk below runs only as a fallback when this pass finds nothing
+        # (e.g. no Search box present).
+        leaf = names[-1]
+        box = _search_box(win)
+        if box is not None:
+            _set_filter(auto, box, leaf)
+            filtered = True
+            expanded.append(f"filter:{leaf}")
+            time.sleep(1.5)
+            for row in _candidate_rows(win, [leaf]):
+                r = row.BoundingRectangle
+                rec = {"row": _strip_tags(row.Name), "x": r.left, "y": r.top,
+                       "leaf": True}
+                auto.RightClick(r.left + r.width() // 2, r.top + r.height() // 2)
+                time.sleep(0.8)
+                items = _open_menu_items(win)
+                rec["menu_items"] = len(items)
+                hit = [el for nm, el in items if nm.strip() == want]
+                tried.append(rec)
+                if hit:
+                    target = hit[0]
+                    break
+                auto.SendKeys("{Esc}")
+                time.sleep(0.3)
         for i, name in enumerate(names):
+            if target is not None:
+                break
             rows = _candidate_rows(win, [name])
             if not rows:
                 tried.append({"row": name, "visible": False})
@@ -547,6 +683,20 @@ def execute_method(project: str, project_dir: str, method: str = "StartBridge",
         auto.Click(r.left + r.width() // 2, r.top + r.height() // 2)
         time.sleep(0.9)
         consented = _click_consent(auto, win)
+
+        if mode == "none":
+            # The click is all there is to report. Deliberately NOT ok:false —
+            # the gesture landed; whether the method DID the right thing is a
+            # separate question the caller must answer by render/describe_node
+            # (a mis-wired converter no-ops silently).
+            return {"ok": True, "state": "executed", "project": project,
+                    "node": node_name, "method": method,
+                    "consent_clicked": consented, "tried": tried,
+                    "chain": names, "expanded": expanded,
+                    "nudge": (f"Execute {method!r} was clicked. This method has no "
+                              "port signal to verify against — confirm the effect "
+                              "with optix_describe_node or a render, not from this "
+                              "result. Check the Studio Output pane for its log.")}
 
         deadline = time.time() + timeout
         while time.time() < deadline:
