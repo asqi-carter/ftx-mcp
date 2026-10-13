@@ -4751,13 +4751,27 @@ def _scan_bridge_ports(cfg: Config, force: bool = False) -> list[dict]:
     file whose port answers connection-refused is deleted. Each result dict
     gains a ``source`` field: ``"registry"`` or ``"scan"``.
     """
-    import concurrent.futures
-
     registry = _bridge_registry_entries() or []
-    port_to_file: dict[int, Path] = {p: f for p, f in registry}
-    ports = sorted(set(_bridge_ports(cfg)) | set(port_to_file))
+    registry_ports = [p for p, _f in registry]
+    ports = sorted(set(_bridge_ports(cfg)) | set(registry_ports))
     if not ports:
         return []
+    return _probe_ports(cfg, ports, registry_ports, force=force)
+
+
+def _probe_ports(cfg: Config, ports: list[int], registry_ports: list[int],
+                 force: bool = False) -> list[dict]:
+    """Health-probe `ports` in ONE concurrent pass, in port order. Each result
+    gains ``source`` ("registry" if the port came from the registry, else
+    "scan"); a registry file whose port answers connection-refused is deleted.
+    Shared by _scan_bridge_ports (whole range) and _find_bridge_for
+    (registry ports only, on its fast path)."""
+    import concurrent.futures
+
+    reg_dir = _bridge_registry_dir()
+    port_to_file: dict[int, Path] = {
+        p: (reg_dir / f"{p}.json") for p in registry_ports
+    } if reg_dir is not None else {}
 
     def _probe(port: int) -> dict:
         st = dict(_bridge_health_at(cfg, port, force=force))
@@ -4929,6 +4943,19 @@ def _find_bridge_for(cfg: Config, project: str) -> dict | None:
     want = _bridge_want_names(cfg, project)
     if want is None:
         return None
+    # Registry first (1.0.9): a 1.0.8+ bridge writes <port>.json on bind, so
+    # the serving port is usually known before any probe. Probing only those
+    # ports answers in one ~10 ms health call. The full range scan used to run
+    # on EVERY lookup, and a dead range port does not refuse instantly where
+    # endpoint protection intercepts loopback TCP (~2 s each, measured
+    # 2026-10-13) -- with a 2 s cache TTL nearly every tool call paid it.
+    # The range is still scanned on a miss, so a pre-1.0.8 bridge that writes
+    # no registry file is found exactly as before.
+    registry_ports = sorted(p for p, _f in (_bridge_registry_entries() or []))
+    if registry_ports:
+        for st in _probe_ports(cfg, registry_ports, registry_ports):
+            if st["available"] and _bridge_name_match(st.get("project"), want):
+                return st
     for st in list_bridges(cfg):
         if _bridge_name_match(st.get("project"), want):
             return st

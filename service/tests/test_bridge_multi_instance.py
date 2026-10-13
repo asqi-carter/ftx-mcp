@@ -451,8 +451,39 @@ def test_find_bridge_for_stale_registry_resolved(
     # stale file was cleaned up by the registry probe
     assert not stale_file.exists()
 
-    # registry + range are probed together, each port exactly once
-    assert sorted(probed_ports) == [8768, 8769, 8770, 8771, 9000]
+    # registry-first fast path: only the registry ports are probed, each
+    # exactly once; the range scan is skipped because the registry answered.
+    assert sorted(probed_ports) == [8768, 9000]
+
+
+def test_find_bridge_for_registry_miss_falls_back_to_range_scan(
+    multi_bridge_cfg, monkeypatch, tmp_path
+) -> None:
+    """A registry that names only OTHER projects must not hide a bridge the
+    range scan would find (older bridge, no registry file)."""
+    _make_registry(tmp_path, {
+        8768: {"project": "Alpha", "bridge_version": "1.0.8", "model_loaded": True},
+    })
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    probed_ports: list[int] = []
+    inner = _multi_bridge({
+        8768: {"project": "Alpha", "bridge_version": "1.0.8",
+               "model_loaded": True, "port": 8768},
+        8770: {"project": "Beta", "bridge_version": "1.0.7",
+               "model_loaded": True, "port": 8770},
+    })
+
+    def fake_http(cfg_, path, **kw):
+        probed_ports.append(urlparse(cfg_.bridge_url).port)
+        return inner(cfg_, path, **kw)
+
+    monkeypatch.setattr(core, "_bridge_http", fake_http)
+    b = core._find_bridge_for(multi_bridge_cfg, "Beta")
+    assert b is not None and b["port"] == 8770 and b["source"] == "scan"
+    # registry port probed first, then the whole range (8768 served from
+    # the 2 s health cache on the second pass, so it is not re-probed)
+    assert probed_ports[0] == 8768
+    assert set(probed_ports) >= {8769, 8770, 8771}
 
 
 def test_registry_timeout_does_not_delete_entry(

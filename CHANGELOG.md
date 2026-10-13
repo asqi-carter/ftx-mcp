@@ -4,6 +4,25 @@ All notable changes to ftx-mcp. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Per-release detail lives in
 `docs/release-notes-v<version>.md`.
 
+## [Unreleased]
+
+- **Every bridge-routed tool call lost ~9-14 s of fixed overhead.** Two
+  causes, both on the path of every `optix_describe_node` /
+  `optix_get_project_map` / `optix_bridge_edit` op (measured 2026-10-13 on a
+  box with endpoint protection; the bridge itself answered in 10-50 ms):
+  - `studio_guard._scan` asked psutil for `cmdline` on EVERY process before
+    name-filtering, so it opened a handle on ~540 processes per scan (7-11 s
+    where OpenProcess is hooked). It now name-filters first and reads the
+    command line of the one or two Studio/editor hits only (~70 ms warm).
+    This scan runs on every call whose project resolves through the
+    open-in-Studio fallback (project outside `OPTIX_PROJECTS_ROOT`).
+  - `_find_bridge_for` probed the whole bridge port range on every lookup,
+    and a dead range port takes ~2 s to refuse where loopback TCP is
+    intercepted; with the 2 s health-cache TTL nearly every call paid it.
+    It now probes the registry-listed ports first and returns on a match;
+    the full range scan still runs on a miss, so a pre-1.0.8 bridge with no
+    registry file is found exactly as before.
+
 ## [1.0.8]
 
 - **`optix_bridge_invoke_method` / `POST /bridge/node/invoke` no longer kill
