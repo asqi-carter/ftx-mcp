@@ -9207,8 +9207,8 @@ def native_interact(
     Same window selection as native_screenshot_runtime (emulator pid for
     `project`, largest visible top-level window), and the SAME coordinate
     frame: `x`/`y` are client-area pixels of that window when either is
-    > 1.0, else fractions of its client size. So a point read off a
-    mode="native_screenshot" frame is clicked as-is.
+    > 1.0, else fractions of its client size. So a point read off an
+    optix_observe(target="native") frame is clicked as-is.
 
     - click: move/press/release at (x, y).
     - fill: click (x, y), type `text`, then press `submit` (default Enter;
@@ -9320,8 +9320,8 @@ def native_interact(
     if settle > 0:
         time.sleep(settle)
     result["settled_seconds"] = settle
-    result["hint"] = ("messages posted; verify with optix_observe("
-                      "mode='native_screenshot') — succeeded never means the HMI reacted")
+    result["hint"] = ("messages posted; verify with optix_observe(mode='screenshot', "
+                      "target='native') — succeeded never means the HMI reacted")
     return result
 
 
@@ -9414,11 +9414,14 @@ def _ocr_confidence_fields(cfg: Config, words: list[dict]) -> dict:
 def _ocr_capture(
     cfg: Config, *, navigate_url: str | None, settle_seconds: float | None,
     psm: int, runner: Runner, region: list[float] | None, include_region: bool,
-    project: str | None = None,
+    project: str | None = None, target: str = "web",
 ) -> dict:
     """Shared capture+OCR for cdp_ocr_runtime / cdp_read_text_runtime.
 
-    Captures via the tested cdp_screenshot_runtime path, then runs tesseract in
+    `target` picks the presentation engine the frame comes from: "web"
+    captures via the tested cdp_screenshot_runtime path, "native" via
+    native_screenshot_runtime (the FTOptixRuntime.exe window itself, no
+    CDP). Everything after the capture is identical. Then runs tesseract in
     TSV mode (a single call) so word-level confidence is available; `text` is
     reconstructed from the parsed words. `include_region` gates the `region`
     key that only cdp_read_text_runtime carries. The tesseract_not_installed /
@@ -9434,16 +9437,24 @@ def _ocr_capture(
         }
     with tempfile.TemporaryDirectory() as td:
         img = Path(td) / "runtime.jpg"
-        shot = cdp_screenshot_runtime(
-            cfg, save_path=str(img), navigate_url=navigate_url,
-            settle_seconds=settle_seconds, region=region, project=project,
-        )
+        if target == "native":
+            shot = native_screenshot_runtime(
+                cfg, save_path=str(img), region=region, project=project,
+                settle_seconds=settle_seconds,
+            )
+        else:
+            shot = cdp_screenshot_runtime(
+                cfg, save_path=str(img), navigate_url=navigate_url,
+                settle_seconds=settle_seconds, region=region, project=project,
+            )
         if shot.get("state") != "succeeded":
             out = {
                 "state": "failed", "text": None,
                 "error": shot.get("error", "screenshot_failed"),
-                "navigated": shot.get("navigated", False),
+                "navigated": shot.get("navigated", False), "target": target,
             }
+            if shot.get("message"):
+                out["message"] = shot["message"]
             if include_region:
                 out["region"] = shot.get("region")
             return out
@@ -9474,6 +9485,7 @@ def _ocr_capture(
                                "cdp_read_text" if include_region else "cdp_ocr"),
             "size_bytes": shot.get("size_bytes", 0),
             "navigated": shot.get("navigated", False), "captured_at": _now_iso(),
+            "target": target,
         }
         if include_region:
             out["region"] = shot.get("region")
@@ -9485,8 +9497,12 @@ def cdp_ocr_runtime(
     cfg: Config, navigate_url: str | None = None,
     settle_seconds: float | None = None, *, psm: int = 6,
     runner: Runner = _DEFAULT_RUNNER, project: str | None = None,
+    target: str = "web",
 ) -> dict:
     """OCR the runtime canvas via tesseract — an OPT-IN, headless read-back fallback.
+
+    `target="native"` OCRs the native presentation engine window instead of
+    the CDP canvas (see _ocr_capture); `navigate_url` is then ignored.
 
     Tesseract is resolved from PATH first, then the standard Windows install
     dirs (winget/UB-Mannheim installs don't touch PATH — found live 2026-07-17).
@@ -9507,6 +9523,7 @@ def cdp_ocr_runtime(
     return _ocr_capture(
         cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
         psm=psm, runner=runner, region=None, include_region=False, project=project,
+        target=target,
     )
 
 
@@ -9514,8 +9531,10 @@ def cdp_read_text_runtime(
     cfg: Config, region: list[float] | None = None,
     navigate_url: str | None = None, settle_seconds: float | None = None,
     *, psm: int = 6, runner: Runner = _DEFAULT_RUNNER, project: str | None = None,
+    target: str = "web",
 ) -> dict:
     """OCR a region (or the full frame) of the runtime canvas via tesseract —
+    (`target="native"`: of the native presentation engine window) —
     THE cheap check for "does the screen/widget say X", zero vision tokens.
 
     Captures through the same region-clip path as cdp_screenshot_runtime (see
@@ -9534,6 +9553,7 @@ def cdp_read_text_runtime(
     return _ocr_capture(
         cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
         psm=psm, runner=runner, region=region, include_region=True, project=project,
+        target=target,
     )
 
 
@@ -9654,7 +9674,7 @@ def _ocr_css_scale(
 def cdp_find_text_runtime(
     cfg: Config, text: str, navigate_url: str | None = None,
     settle_seconds: float | None = None, runner: Runner = _DEFAULT_RUNNER,
-    project: str | None = None,
+    project: str | None = None, target: str = "web",
 ) -> dict:
     """Locate `text` on the runtime canvas via tesseract TSV word boxes — to
     click a labeled control (center_px feeds cdp_click_runtime directly) or
@@ -9687,19 +9707,35 @@ def cdp_find_text_runtime(
             "state": "failed", "found": False, "matches": [],
             "error": "tesseract_not_installed", "hint": _tesseract_missing_hint(),
         }
-    audit(cfg, "cdp_find_text", text=text)
-    settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
-    port_follow = _maybe_follow_port(cfg, project)
-    sess = _cdp_session(cfg)
-    try:
-        navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle, project)
-        vp_w, vp_h = sess.viewport_size()
-        jpeg = sess.screenshot_jpeg()
-    except _cdp.CDPError as e:
-        return {"state": "failed", "found": False, "matches": [],
-                "error": str(e), "navigated": False}
-    finally:
-        sess.close()
+    audit(cfg, "cdp_find_text", text=text, target=target)
+    if target == "native":
+        # The native frame IS the click frame (optix_interact target="native"
+        # posts client-area pixels), so viewport == image and the CSS rescale
+        # below is an exact no-op. No navigation, no port follow.
+        import base64
+        shot = native_screenshot_runtime(
+            cfg, project=project, settle_seconds=settle_seconds, quality=90)
+        if shot.get("state") != "succeeded":
+            return {"state": "failed", "found": False, "matches": [],
+                    "error": shot.get("error", "screenshot_failed"),
+                    "message": shot.get("message"), "navigated": False,
+                    "target": target}
+        jpeg = base64.b64decode(shot["b64"])
+        vp_w, vp_h = float(shot["width"]), float(shot["height"])
+        navigated, port_follow = False, None
+    else:
+        settle = cfg.cdp_settle_seconds if settle_seconds is None else settle_seconds
+        port_follow = _maybe_follow_port(cfg, project)
+        sess = _cdp_session(cfg)
+        try:
+            navigated = _point_screenshot_at_runtime(cfg, sess, navigate_url, settle, project)
+            vp_w, vp_h = sess.viewport_size()
+            jpeg = sess.screenshot_jpeg()
+        except _cdp.CDPError as e:
+            return {"state": "failed", "found": False, "matches": [],
+                    "error": str(e), "navigated": False}
+        finally:
+            sess.close()
 
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -9742,7 +9778,7 @@ def cdp_find_text_runtime(
     out = {
         "state": "succeeded", "found": bool(result_matches),
         "matches": result_matches, "viewport": {"w": vp_w, "h": vp_h},
-        "navigated": navigated, "captured_at": _now_iso(),
+        "navigated": navigated, "captured_at": _now_iso(), "target": target,
     }
     if port_follow is not None:
         out["port_followed"] = (

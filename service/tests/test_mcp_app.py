@@ -654,7 +654,7 @@ def test_cdp_read_text_tool_registered_and_forwards_to_core(
     seen = {}
 
     def fake_read_text(cfg_, region=None, navigate_url=None, settle_seconds=None,
-                       psm=6, project=None):
+                       psm=6, project=None, target="web"):
         seen.update(region=region, psm=psm)
         return {"state": "succeeded", "text": "SP-101", "region": region,
                 "size_bytes": 10, "navigated": False, "captured_at": "t"}
@@ -685,7 +685,7 @@ def test_cdp_find_text_tool_registered_and_forwards_to_core(
     seen = {}
 
     def fake_find_text(cfg_, text, navigate_url=None, settle_seconds=None,
-                       project=None):
+                       project=None, target="web"):
         seen["text"] = text
         return {"state": "succeeded", "found": True, "matches": [
             {"text": "Start", "confidence": 0.95, "bbox_px": [1, 2, 3, 4],

@@ -2680,14 +2680,12 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     # nested pydantic discriminated union: FastMCP builds the input schema from
     # the raw signature, and a flat param set with a runtime valid-vocab nudge
     # is the robust-and-shipping shape (see the invalid-mode branch).
-    _OBSERVE_MODES = ("screenshot", "native_screenshot", "ocr", "read_text",
-                      "find_text", "diff")
+    _OBSERVE_MODES = ("screenshot", "ocr", "read_text", "find_text", "diff")
     _INTERACT_ACTIONS = ("click", "fill", "type", "key", "navigate")
 
     @mcp.tool(annotations=_RO)
     def optix_observe(
-        mode: Literal["screenshot", "native_screenshot", "ocr", "read_text",
-                      "find_text", "diff"],
+        mode: Literal["screenshot", "ocr", "read_text", "find_text", "diff"],
         # screenshot / read_text
         region: list[float] | None = None,
         save_path: str | None = None, quality: int = 65,
@@ -2702,26 +2700,32 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         # shared CDP-capture params
         navigate_url: str | None = None, settle_seconds: float | None = None,
         project: str | None = None,
+        # which presentation engine to read
+        target: Literal["web", "native"] = "web",
     ):
-        """Read-side capture of the running Optix HMI via CDP — ONE tool, pick a
+        """Read-side capture of the running Optix HMI — ONE tool, pick a
         `mode`. Consolidates the optix_cdp_screenshot / _ocr / _read_text /
         _find_text / _diff family; the per-mode tools remain as deprecated
         aliases (FTXMCP_LEGACY_TOOLS).
+
+        `target="web"` (default) reads the WebPresentationEngine through
+        Chrome/CDP. `target="native"` reads the emulator's NATIVE
+        presentation engine window (FTOptixRuntime.exe's own desktop
+        window) straight from the window: no Chrome, no CDP, no web engine
+        needed; the window may be covered but must not be minimized. Every
+        mode except `diff` honors it (screenshot / ocr / read_text /
+        find_text all run on the native frame). The native frame is the
+        window's client area at physical resolution: its coordinates
+        (and find_text's center_px) feed optix_interact(target="native")
+        as-is, and are NOT the CDP viewport of target="web".
+        `navigate_url` / `fresh` are ignored natively and `settle_seconds`
+        defaults to 0 there (nothing to navigate).
 
         mode:
           - "screenshot" — full-canvas (or `region`) JPEG; THE visual-verify
             path. Writes to `save_path` (temp if omitted); `return_image=true`
             ALSO returns typed MCP image content inline (no file round-trip).
             `fresh=true` forces a reload before capture.
-          - "native_screenshot" — JPEG of the emulator's NATIVE presentation
-            engine window (the FTOptixRuntime.exe desktop window), captured
-            straight from the window — no Chrome, no CDP, no web engine
-            needed. Same `save_path` / `quality` / `region` /
-            `return_image` handling as "screenshot". `settle_seconds`
-            defaults to 0 here. The window may be covered but must not be
-            minimized. Frame is the window's client area at physical
-            resolution: its coordinates feed optix_interact(target="native")
-            as-is, and are NOT the CDP viewport of target="web".
           - "ocr" — tesseract text read-back of the whole canvas (headless
             fallback when no vision model). Honors `psm`.
           - "read_text" — tesseract OCR of a `region` (or full frame): the
@@ -2771,14 +2775,21 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             if not sp:
                 import tempfile
                 import time as _t
-                d = os.path.join(tempfile.gettempdir(), "ftx-cdp-screenshots")
+                sub = "ftx-native-screenshots" if target == "native" else "ftx-cdp-screenshots"
+                d = os.path.join(tempfile.gettempdir(), sub)
                 os.makedirs(d, exist_ok=True)
                 sp = os.path.join(d, f"runtime-{int(_t.time() * 1000)}.jpg")
-            result = core.cdp_screenshot_runtime(
-                cfg, save_path=sp, quality=quality,
-                navigate_url=navigate_url, settle_seconds=settle_seconds,
-                fresh=fresh, region=region, project=_resolve_project(project))
-            if result.get("state") == "succeeded":
+            if target == "native":
+                result = core.native_screenshot_runtime(
+                    cfg, save_path=sp, quality=quality, region=region,
+                    project=_resolve_project(project),
+                    settle_seconds=settle_seconds)
+            else:
+                result = core.cdp_screenshot_runtime(
+                    cfg, save_path=sp, quality=quality,
+                    navigate_url=navigate_url, settle_seconds=settle_seconds,
+                    fresh=fresh, region=region, project=_resolve_project(project))
+            if result.get("state") == "succeeded" and "hint" not in result:
                 result["hint"] = (
                     "JPEG written to `path` - read it with your file tool. If "
                     "your file tool cannot reach that path, re-call with "
@@ -2792,43 +2803,20 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                 from mcp.server.fastmcp import Image as _McpImage
                 return [json.dumps(result), _McpImage(path=result["path"])]
             return result
-        if mode == "native_screenshot":
-            sp = save_path
-            if not sp:
-                import tempfile
-                import time as _t
-                d = os.path.join(tempfile.gettempdir(), "ftx-native-screenshots")
-                os.makedirs(d, exist_ok=True)
-                sp = os.path.join(d, f"native-{int(_t.time() * 1000)}.jpg")
-            result = core.native_screenshot_runtime(
-                cfg, save_path=sp, quality=quality, region=region,
-                project=_resolve_project(project),
-                settle_seconds=settle_seconds)
-            if result.get("state") == "succeeded" and "hint" not in result:
-                result["hint"] = (
-                    "JPEG of the native runtime window written to `path` - "
-                    "read it with your file tool, or re-call with "
-                    "return_image=true to receive the image inline."
-                )
-            if (return_image and result.get("state") == "succeeded"
-                    and result.get("path")):
-                from mcp.server.fastmcp import Image as _McpImage
-                return [json.dumps(result), _McpImage(path=result["path"])]
-            return result
         if mode == "ocr":
             return core.cdp_ocr_runtime(
                 cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
-                psm=psm, project=_resolve_project(project))
+                psm=psm, project=_resolve_project(project), target=target)
         if mode == "read_text":
             return core.cdp_read_text_runtime(
                 cfg, region=region, navigate_url=navigate_url,
                 settle_seconds=settle_seconds, psm=psm,
-                project=_resolve_project(project))
+                project=_resolve_project(project), target=target)
         if mode == "find_text":
             return core.cdp_find_text_runtime(
                 cfg, text, navigate_url=navigate_url,
                 settle_seconds=settle_seconds,
-                project=_resolve_project(project))
+                project=_resolve_project(project), target=target)
         # mode == "diff"
         return core.cdp_diff_runtime(dir_a, dir_b, threshold=threshold)
 
@@ -2862,7 +2850,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         be behind others and the user's focus is never taken. Native
         supports click / fill / type / key (not navigate: click the HMI's
         nav buttons). Native coordinates are the client-area frame of
-        optix_observe(mode="native_screenshot") — fractions when both <= 1,
+        optix_observe(target="native") — fractions when both <= 1,
         else pixels of that frame — and the result reports them as
         `px`/`py` with `frame: {w, h}`. Native fill = click + type + `submit`
         (an Optix field selects its content on focus, so no select-all

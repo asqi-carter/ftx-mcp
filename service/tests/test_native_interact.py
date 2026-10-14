@@ -66,7 +66,7 @@ def test_click_normalized_resolves_against_frame(cfg):
     assert (r["px"], r["py"]) == (640, 200) and r["coords"] == "normalized"
     assert r["frame"] == {"w": 1280, "h": 800} and r["hwnd"] == 4242
     assert fake.calls == [("click", 4242, 640, 200)]
-    assert "native_screenshot" in r["hint"]
+    assert "target='native'" in r["hint"]
 
 
 def test_click_absolute_pixels(cfg):

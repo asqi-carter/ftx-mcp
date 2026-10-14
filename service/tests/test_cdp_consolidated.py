@@ -181,7 +181,7 @@ def test_observe_invalid_mode_returns_structured_error(cfg):
     assert isinstance(out, dict)
     assert out["error"] == "bad_mode"
     assert set(out["valid_modes"]) == {
-        "screenshot", "native_screenshot", "ocr", "read_text", "find_text", "diff"}
+        "screenshot", "ocr", "read_text", "find_text", "diff"}
 
 
 # ---- optix_interact action -> core.* parity -----------------------------

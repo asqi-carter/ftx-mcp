@@ -6,27 +6,30 @@ All notable changes to ftx-mcp. Format loosely follows
 
 ## [Unreleased]
 
-- **`optix_observe(mode="native_screenshot")` — screenshot the native
-  presentation engine.** Captures the FTOptixRuntime.exe desktop window
-  itself (Win32 `PrintWindow` with `PW_CLIENTONLY | PW_RENDERFULLCONTENT`,
-  new `service/native_capture.py`), so a project running the native Qt
-  renderer can be verified visually without Chrome, CDP or a
-  WebPresentationEngine node. Finds the emulator process for `project`
-  (any emulator when omitted), picks its largest visible top-level window,
-  returns a JPEG with the same `save_path` / `quality` / `region` /
-  `return_image` handling as `screenshot`. ~30 ms for a 1280x800 client.
-  The window may be behind others but must not be minimized. Structured
-  failures: `native_runtime_not_found`, `native_window_not_found`,
-  `print_window_failed`, `bad_region`; `blank: true` flags an unpainted
-  frame. Frame coordinates are the window's physical client pixels, not the
-  CDP viewport.
+- **`optix_observe(target="native")` — read the native presentation
+  engine.** New `target` param (`"web"` default, `"native"`) on every
+  `optix_observe` mode but `diff`. Native captures the FTOptixRuntime.exe
+  desktop window itself (Win32 `PrintWindow` with `PW_CLIENTONLY |
+  PW_RENDERFULLCONTENT`, new `service/native_capture.py`), so a project
+  running the native Qt renderer can be verified without Chrome, CDP or a
+  WebPresentationEngine node: `screenshot` returns the JPEG, and `ocr` /
+  `read_text` / `find_text` run tesseract on that frame instead of the CDP
+  canvas. Finds the emulator process for `project` (any emulator when
+  omitted) and picks its largest visible top-level window. ~30 ms for a
+  1280x800 client. The window may be behind others but must not be
+  minimized. Structured failures: `native_runtime_not_found`,
+  `native_window_not_found`, `print_window_failed`, `bad_region`; `blank:
+  true` flags an unpainted frame. The native frame's coordinates (and
+  `find_text`'s `center_px`) are the window's physical client pixels, the
+  same frame `optix_interact(target="native")` clicks in, not the CDP
+  viewport. `navigate_url` / `fresh` are ignored natively.
 
 - **`optix_interact(target="native")` — drive the native presentation
   engine.** click / fill / type / key posted straight to the
   FTOptixRuntime.exe window (`PostMessageW`; new `service/native_input.py`):
   no Chrome or CDP, the window may be behind others, and the user's
-  foreground focus is never taken. Coordinates are the `native_screenshot`
-  frame (fractions when both <= 1, else client pixels), reported back as
+  foreground focus is never taken. Coordinates are the
+  `optix_observe(target="native")` frame (fractions when both <= 1, else client pixels), reported back as
   `px`/`py` with `frame: {w, h}`. Text goes out as one WM_CHAR per
   character (posting WM_KEYDOWN too types each character twice on Qt);
   named keys as WM_KEYDOWN/KEYUP. Verified live on Chiller_HMI: posted
