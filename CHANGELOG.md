@@ -4,6 +4,37 @@ All notable changes to ftx-mcp. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Per-release detail lives in
 `docs/release-notes-v<version>.md`.
 
+## [Unreleased]
+
+- **`optix_observe(mode="native_screenshot")` — screenshot the native
+  presentation engine.** Captures the FTOptixRuntime.exe desktop window
+  itself (Win32 `PrintWindow` with `PW_CLIENTONLY | PW_RENDERFULLCONTENT`,
+  new `service/native_capture.py`), so a project running the native Qt
+  renderer can be verified visually without Chrome, CDP or a
+  WebPresentationEngine node. Finds the emulator process for `project`
+  (any emulator when omitted), picks its largest visible top-level window,
+  returns a JPEG with the same `save_path` / `quality` / `region` /
+  `return_image` handling as `screenshot`. ~30 ms for a 1280x800 client.
+  The window may be behind others but must not be minimized. Structured
+  failures: `native_runtime_not_found`, `native_window_not_found`,
+  `print_window_failed`, `bad_region`; `blank: true` flags an unpainted
+  frame. Frame coordinates are the window's physical client pixels, not the
+  CDP viewport.
+
+- **`optix_interact(target="native")` — drive the native presentation
+  engine.** click / fill / type / key posted straight to the
+  FTOptixRuntime.exe window (`PostMessageW`; new `service/native_input.py`):
+  no Chrome or CDP, the window may be behind others, and the user's
+  foreground focus is never taken. Coordinates are the `native_screenshot`
+  frame (fractions when both <= 1, else client pixels), reported back as
+  `px`/`py` with `frame: {w, h}`. Text goes out as one WM_CHAR per
+  character (posting WM_KEYDOWN too types each character twice on Qt);
+  named keys as WM_KEYDOWN/KEYUP. Verified live on Chiller_HMI: posted
+  clicks switch screens and open a SpinBox's on-screen keypad, posted text
+  edits the value, Escape cancels, all with the runtime in the background.
+  `navigate` is web-only; `select_all` / `navigate_url` are ignored
+  natively (an Optix field selects its content on focus).
+
 ## [1.0.8]
 
 - **`optix_bridge_invoke_method` / `POST /bridge/node/invoke` no longer kill

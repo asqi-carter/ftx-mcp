@@ -8826,15 +8826,35 @@ def _resolve_region(sess: Any, region: list[float] | None) -> tuple[list[float] 
     """
     if region is None:
         return None, None
+    shape_err = _check_region_shape(region)
+    if shape_err:
+        return None, shape_err
+    vp_w, vp_h = sess.viewport_size()
+    return _region_to_pixels(region, vp_w, vp_h)
+
+
+def _check_region_shape(region: Any) -> str | None:
+    """Shape/sign validation shared by the CDP and native screenshot paths:
+    None when `region` is a numeric [x, y, w, h] with x/y >= 0 and w/h > 0,
+    else the detail string for a bad_region result."""
     if not isinstance(region, (list, tuple)) or len(region) != 4:
-        return None, "region must be [x, y, w, h]"
+        return "region must be [x, y, w, h]"
     try:
         x, y, w, h = (float(v) for v in region)
     except (TypeError, ValueError):
-        return None, "region values must be numeric"
+        return "region values must be numeric"
     if x < 0 or y < 0 or w <= 0 or h <= 0:
-        return None, "x/y must be >= 0 and w/h must be > 0"
-    vp_w, vp_h = sess.viewport_size()
+        return "x/y must be >= 0 and w/h must be > 0"
+    return None
+
+
+def _region_to_pixels(
+    region: list[float], vp_w: float, vp_h: float,
+) -> tuple[list[float] | None, str | None]:
+    """Apply the region convention against a known frame size: all four
+    values <= 1.0 are fractions of the frame, else absolute pixels. Assumes
+    _check_region_shape passed. Returns (pixel_region, None) or (None, detail)."""
+    x, y, w, h = (float(v) for v in region)
     if vp_w <= 0 or vp_h <= 0:
         return None, "could not resolve viewport size"
     if all(v <= 1.0 for v in (x, y, w, h)):
@@ -9038,6 +9058,271 @@ def cdp_screenshot_runtime(
         }
     finally:
         sess.close()
+
+
+def native_screenshot_runtime(
+    cfg: Config, save_path: str | None = None, quality: int = 65,
+    region: list[float] | None = None, project: str | None = None,
+    settle_seconds: float | None = None, *,
+    pids_fn: Callable[[str | None], list[int]] | None = None,
+    windows_fn: Callable[[list[int]], list[dict]] | None = None,
+    capture_fn: Callable[[int], Any] | None = None,
+) -> dict:
+    """Screenshot the emulator's NATIVE presentation engine window (JPEG).
+
+    The CDP path captures what Chrome renders from the WebPresentationEngine.
+    This captures the desktop window FTOptixRuntime.exe itself opens — the
+    native Qt renderer — so a project with no web engine (or one whose two
+    engines disagree) can still be verified visually. No Chrome, no CDP, no
+    navigation: it finds the emulator process for `project` (every emulator
+    when omitted), picks its largest visible top-level window, and
+    PrintWindow()s the client area (service.native_capture). The window may
+    be behind other windows; it must NOT be minimized (restore it first).
+
+    `settle_seconds` defaults to 0 here (nothing to navigate; the window is
+    whatever it is right now) — pass a value to let an animation finish.
+    `region` follows the CDP convention: all four values <= 1.0 are fractions
+    of the captured frame, else absolute pixels of it. The frame is the
+    native window's client area at physical resolution, NOT the CDP
+    viewport, so coordinates do not carry over to optix_interact.
+
+    Returns {state, source:"native", path|b64, size_bytes, width, height,
+    pid, hwnd, title, captured_at, region, blank}. `blank` is True when
+    every pixel is one colour (a renderer that is up but not painting yet —
+    retry with settle_seconds). Failures are structured, never raised:
+    native_runtime_not_found / native_window_not_found / bad_region, or the
+    native_capture reason (window_gone, print_window_failed, ...).
+
+    `pids_fn` / `windows_fn` / `capture_fn` are test seams for the
+    process scan, the Win32 window walk, and PrintWindow respectively.
+    """
+    import base64
+    import io
+
+    from . import native_capture
+
+    pids_fn = pids_fn or _emulator_pids
+    windows_fn = windows_fn or native_capture.runtime_windows
+    capture_fn = capture_fn or native_capture.capture_window
+
+    def _fail(error: str, message: str, **extra) -> dict:
+        out = {"state": "failed", "source": "native", "error": error,
+               "message": message, "path": None, "b64": None,
+               "size_bytes": 0, "captured_at": _now_iso()}
+        out.update(extra)
+        return out
+
+    if region is not None:
+        err = _check_region_shape(region)
+        if err:
+            return _fail("bad_region", err, detail=err, region=region)
+
+    settle = 0.0 if settle_seconds is None else float(settle_seconds)
+    if settle > 0:
+        time.sleep(settle)
+
+    pids = list(pids_fn(project) or [])
+    if not pids:
+        which = f"for project {project!r}" if project else "(any project)"
+        return _fail(
+            "native_runtime_not_found",
+            f"no FTOptixRuntime.exe emulator is running {which}",
+            hint="start it with optix_emulator(action='start') or F5 in Studio, "
+                 "then retry; optix_emulator(action='status') lists what's running",
+            project=project,
+        )
+    windows = windows_fn(pids) or []
+    if not windows:
+        return _fail(
+            "native_window_not_found",
+            f"emulator pid(s) {pids} own no visible top-level window",
+            hint="the runtime may be minimized (restore it), still starting, or "
+                 "running only the WebPresentationEngine (use mode='screenshot')",
+            pids=pids, project=project,
+        )
+    win = windows[0]
+    try:
+        im = capture_fn(win["hwnd"])
+    except native_capture.NativeCaptureError as e:
+        return _fail(e.reason, str(e), pid=win.get("pid"), hwnd=win.get("hwnd"),
+                     title=win.get("title"))
+
+    resolved_region = None
+    if region is not None:
+        px, err = _region_to_pixels(region, im.width, im.height)
+        if err:
+            return _fail("bad_region", err, detail=err, region=region,
+                         width=im.width, height=im.height)
+        x, y, w, h = px
+        box = (int(x), int(y), int(min(x + w, im.width)), int(min(y + h, im.height)))
+        im = im.crop(box)
+        resolved_region = [box[0], box[1], box[2] - box[0], box[3] - box[1]]
+
+    extrema = im.getextrema()
+    blank = all(lo == hi for lo, hi in extrema) if isinstance(extrema[0], tuple) else extrema[0] == extrema[1]
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=int(quality))
+    jpeg = buf.getvalue()
+
+    result: dict = {
+        "state": "succeeded", "source": "native",
+        "size_bytes": len(jpeg), "width": im.width, "height": im.height,
+        "pid": win.get("pid"), "hwnd": win.get("hwnd"),
+        "title": win.get("title"), "class_name": win.get("class_name"),
+        "windows_seen": len(windows), "captured_at": _now_iso(),
+        "region": resolved_region, "blank": blank,
+    }
+    if blank:
+        result["hint"] = ("every pixel is one colour: the window is up but not "
+                          "painted yet — retry with settle_seconds=1")
+    if save_path:
+        out = Path(save_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(jpeg)
+        result["path"] = str(out)
+    else:
+        result["path"] = None
+        result["b64"] = base64.b64encode(jpeg).decode("ascii")
+    return result
+
+
+_NATIVE_INTERACT_ACTIONS = ("click", "fill", "type", "key")
+
+
+def native_interact(
+    cfg: Config, action: str, *,
+    x: float | None = None, y: float | None = None,
+    text: str | None = None, submit: str | None = "Enter",
+    key: str | None = None, project: str | None = None,
+    settle_seconds: float | None = None,
+    pids_fn: Callable[[str | None], list[int]] | None = None,
+    windows_fn: Callable[[list[int]], list[dict]] | None = None,
+    input_mod: Any = None,
+) -> dict:
+    """Drive the emulator's NATIVE presentation engine window: click / fill /
+    type / key, posted straight to the FTOptixRuntime.exe Qt window
+    (service.native_input). No Chrome, no CDP; the window may be behind
+    other windows and never takes the user's focus.
+
+    Same window selection as native_screenshot_runtime (emulator pid for
+    `project`, largest visible top-level window), and the SAME coordinate
+    frame: `x`/`y` are client-area pixels of that window when either is
+    > 1.0, else fractions of its client size. So a point read off a
+    mode="native_screenshot" frame is clicked as-is.
+
+    - click: move/press/release at (x, y).
+    - fill: click (x, y), type `text`, then press `submit` (default Enter;
+      None leaves the edit uncommitted). An Optix input field selects its
+      content when focused (verified live on a SpinBox + on-screen keypad),
+      so there is no separate select-all step: typing replaces the value.
+    - type: `text` into whatever has focus, no click, no commit.
+    - key: one named key (Enter/Escape/Tab/Backspace/Delete/Arrow*/F1-F12/
+      ...) or a single character. Modifier combos are not supported.
+
+    "navigate" has no native equivalent (no URL to replay): click the
+    project's own nav buttons. `settle_seconds` sleeps AFTER the input is
+    posted (default 0) so a caller can let the canvas repaint before the
+    read-back it must do: state="succeeded" means the messages were posted,
+    never that the HMI reacted. Failures are structured, never raised:
+    bad_action / missing_param / bad_point / bad_key /
+    native_runtime_not_found / native_window_not_found / post_failed.
+    """
+    from . import native_capture
+    from . import native_input as _ni
+
+    ni = input_mod or _ni
+    pids_fn = pids_fn or _emulator_pids
+    windows_fn = windows_fn or native_capture.runtime_windows
+
+    def _fail(error: str, message: str, **extra) -> dict:
+        out = {"state": "failed", "source": "native", "action": action,
+               "error": error, "message": message, "at": _now_iso()}
+        out.update(extra)
+        return out
+
+    if action not in _NATIVE_INTERACT_ACTIONS:
+        return _fail("bad_action",
+                     f"native target supports {', '.join(_NATIVE_INTERACT_ACTIONS)}; "
+                     f"got {action!r} (navigate: click the HMI's nav buttons instead)",
+                     valid_actions=list(_NATIVE_INTERACT_ACTIONS))
+    need = {"click": ("x", "y"), "fill": ("x", "y", "text"),
+            "type": ("text",), "key": ("key",)}[action]
+    have = {"x": x, "y": y, "text": text, "key": key}
+    missing = [n for n in need if have[n] is None]
+    if missing:
+        return _fail("missing_param", f"action {action!r} requires: {', '.join(missing)}",
+                     required=list(need))
+    if action == "key":
+        try:
+            ni.resolve_key(key)
+        except ni.NativeInputError as e:
+            return _fail(e.reason, str(e))
+
+    pids = list(pids_fn(project) or [])
+    if not pids:
+        which = f"for project {project!r}" if project else "(any project)"
+        return _fail("native_runtime_not_found",
+                     f"no FTOptixRuntime.exe emulator is running {which}",
+                     hint="start it with optix_emulator(action='start') or F5 in Studio",
+                     project=project)
+    windows = windows_fn(pids) or []
+    if not windows:
+        return _fail("native_window_not_found",
+                     f"emulator pid(s) {pids} own no visible top-level window",
+                     hint="the runtime may be minimized (restore it) or running only "
+                          "the WebPresentationEngine (use target='web')",
+                     pids=pids, project=project)
+    win = windows[0]
+    fw, fh = int(win.get("width") or 0), int(win.get("height") or 0)
+
+    result: dict = {
+        "state": "succeeded", "source": "native", "action": action,
+        "pid": win.get("pid"), "hwnd": win.get("hwnd"), "title": win.get("title"),
+        "frame": {"w": fw, "h": fh}, "at": _now_iso(), "error": None,
+    }
+    px = py = None
+    if action in ("click", "fill"):
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            return _fail("bad_point", "x/y must be numeric", x=x, y=y)
+        if fw <= 0 or fh <= 0:
+            return _fail("bad_point", f"window client area is {fw}x{fh}", x=x, y=y)
+        if fx <= 1.0 and fy <= 1.0:
+            px, py, coords = int(round(fx * fw)), int(round(fy * fh)), "normalized"
+        else:
+            px, py, coords = int(round(fx)), int(round(fy)), "absolute"
+        if px < 0 or py < 0 or px >= fw or py >= fh:
+            return _fail("bad_point", f"point ({px}, {py}) outside frame {fw}x{fh}",
+                         x=x, y=y, frame={"w": fw, "h": fh})
+        result.update(x=float(x), y=float(y), px=px, py=py, coords=coords)
+
+    try:
+        if action in ("click", "fill"):
+            ni.post_click(win["hwnd"], px, py)
+        if action == "fill":
+            # The keypad/field needs a beat to open and take focus before the
+            # first WM_CHAR lands (0.25 s measured ample live).
+            time.sleep(0.25)
+            result["typed_chars"] = ni.post_text(win["hwnd"], text)
+            if submit:
+                result["submitted_with"] = ni.post_key(win["hwnd"], submit)
+            else:
+                result["submitted_with"] = None
+        elif action == "type":
+            result["typed_chars"] = ni.post_text(win["hwnd"], text)
+        elif action == "key":
+            result["pressed"] = ni.post_key(win["hwnd"], key)
+    except ni.NativeInputError as e:
+        return _fail(e.reason, str(e), hwnd=win.get("hwnd"))
+
+    settle = 0.0 if settle_seconds is None else float(settle_seconds)
+    if settle > 0:
+        time.sleep(settle)
+    result["settled_seconds"] = settle
+    result["hint"] = ("messages posted; verify with optix_observe("
+                      "mode='native_screenshot') — succeeded never means the HMI reacted")
+    return result
 
 
 def _find_tesseract() -> str | None:
