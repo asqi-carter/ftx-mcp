@@ -9,6 +9,15 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _f5_target_autouse(request, monkeypatch) -> None:
+    """A Studio is attributed to every project so F5 is reachable (#92 guard).
+    Tests marked ``real_studio_attribution`` exercise the real attribution."""
+    if request.node.get_closest_marker("real_studio_attribution"):
+        return
+    request.getfixturevalue("f5_target_studio")
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_web_port(monkeypatch):
     """Since I28 the readiness probe resolves the PROJECT's web
     port (default 8081) rather than cfg.runtime_test_port. On a host where
@@ -68,6 +77,7 @@ def _proj(projects_root: Path) -> None:
 
 
 def test_run_emulator_sends_f5(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -80,6 +90,7 @@ def test_run_emulator_sends_f5(cfg: core.Config, projects_root: Path, monkeypatc
 def test_run_emulator_no_save_by_default(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
     """F5 saves as part of staging — an explicit ^s beforehand is redundant, so
     the default must NOT save (v1.1 backlog 1.2)."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "save", lambda *a, **k: (_ for _ in ()).throw(AssertionError("save should not run by default")))
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -88,6 +99,7 @@ def test_run_emulator_no_save_by_default(cfg: core.Config, projects_root: Path, 
 
 
 def test_run_emulator_saves_when_opted_in(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     seen = {}
 
@@ -102,6 +114,7 @@ def test_run_emulator_saves_when_opted_in(cfg: core.Config, projects_root: Path,
 
 
 def test_run_emulator_no_studio(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
     runner = make_fake_runner(lambda cmd, kw: FakeProc(returncode=3, stdout="NO_STUDIO"))
@@ -110,6 +123,7 @@ def test_run_emulator_no_studio(cfg: core.Config, projects_root: Path, monkeypat
 
 
 def test_run_emulator_focused_false_gives_integrity_hint(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=False PID=1"))
@@ -121,6 +135,7 @@ def test_run_emulator_focused_false_gives_integrity_hint(cfg: core.Config, proje
 def test_run_emulator_waits_until_serving(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
     """wait_ready polls the runtime port until it's serving (refused twice, then up)
     so a CDP screenshot fired right after actually hits something."""
+    _mock_port(monkeypatch, reachable=False)
     import socket as _socket
     _proj(projects_root)
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
@@ -134,6 +149,7 @@ def test_run_emulator_waits_until_serving(cfg: core.Config, projects_root: Path,
 
     monkeypatch.setattr(_socket, "socket", lambda *a, **k: FakeSock())
     monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: [])
     out = core.run_emulator(cfg, "Alpha", runner=runner)
     assert out["serving"] is True
     assert out["ready_port"] == cfg.runtime_test_port
@@ -149,6 +165,24 @@ def _mock_port(monkeypatch, reachable: bool) -> None:
         def close(self): pass
 
     monkeypatch.setattr(_socket, "socket", lambda *a, **k: FakeSock())
+    # Isolate from the HOST's listener table too: a real process listening on
+    # the test port must not turn `runtime` into `foreign` (#91). Tests on the
+    # foreign / zombie branches patch `_port_owner` again, which wins.
+    monkeypatch.setattr(core, "_port_owner", _fake_port_owner(reachable))
+
+
+_REAL_PORT_OWNER = core._port_owner
+
+
+def _fake_port_owner(reachable: bool):
+    """Deterministic ``_port_owner`` stand-in: ``runtime`` owned by the first
+    fake pid when the port is reachable, ``none`` otherwise."""
+    def _owner(cfg, project, port, pids=None):
+        if not reachable:
+            return {"owner": "none", "pid": None, "name": None}
+        return {"owner": "runtime", "pid": (list(pids)[0] if pids else None),
+                "name": None}
+    return _owner
 
 
 class _PsProc:
@@ -621,6 +655,7 @@ def test_run_emulator_refuses_when_hardware_target_selected(
 ) -> None:
     """F5 fires at Studio's SELECTED target — with a panel selected, pressing
     it could deploy to hardware. The guard must refuse BEFORE any keystroke."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     _config(tmp_path, monkeypatch, "panel-id")
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -635,6 +670,7 @@ def test_run_emulator_refuses_when_hardware_target_selected(
 def test_run_emulator_proceeds_when_emulator_selected(
     cfg, projects_root, monkeypatch, tmp_path
 ) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     _config(tmp_path, monkeypatch, "emu-id")
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -648,6 +684,7 @@ def test_run_emulator_fails_open_when_config_missing(
     """Unknown installs must not brick emulator runs — absent/unreadable config
     means known=False and the run proceeds (second-layer identity check still
     applies live)."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setenv("OPTIX_STUDIO_CONFIG_XML", str(tmp_path / "nope.xml"))
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -670,10 +707,11 @@ def test_run_emulator_no_spawn_hypothesizes_target_or_modal(
     """F5 sent, focused, port never serves, NO emulator process: the response
     must teach the wrong-target/modal hypothesis and forbid retry-looping
     (live-earned 2026-07-17: 'optixServer' selected in the toolbar)."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, runner=None: {"state": "stopped"})
+                        lambda c, runner=None, project=None: {"state": "stopped"})
     import dataclasses
     cfg2 = dataclasses.replace(cfg, runtime_test_port=65431)
     out = core.run_emulator(cfg2, "Alpha", wait_ready=True, ready_timeout=0.1,
@@ -689,6 +727,7 @@ def test_run_emulator_no_spawn_names_blocking_dialog(
     """When F5 doesn't spawn the emulator AND UIA sees a blocking dialog owned
     by the bridge Studio, the diagnosis must NAME it (U22) instead of saying the
     service can't see dialogs."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_uia
     _proj(projects_root)
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -696,7 +735,7 @@ def test_run_emulator_no_spawn_names_blocking_dialog(
     monkeypatch.setattr(core, "_bridge_cfg_for", lambda cfg, project: cfg)
     monkeypatch.setattr(core, "_bridge_owner_pid", lambda cfg, runner=None: 4242)
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, runner=None: {"state": "stopped"})
+                        lambda c, runner=None, project=None: {"state": "stopped"})
     monkeypatch.setattr(studio_uia, "pending_dialog",
                         lambda pid: [{"title": "Deploy credentials", "text": "Enter password"}])
     import dataclasses
@@ -711,6 +750,7 @@ def test_run_emulator_no_spawn_names_blocking_dialog(
 def _no_spawn_hint(cfg, projects_root, monkeypatch, *, live: bool) -> str:
     """Drive the F5-sent-but-nothing-spawned path with a dialog visible, with
     the target guard resolving either live (uia) or from the config file."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_uia
     import dataclasses
     _proj(projects_root)
@@ -719,7 +759,7 @@ def _no_spawn_hint(cfg, projects_root, monkeypatch, *, live: bool) -> str:
     monkeypatch.setattr(core, "_bridge_cfg_for", lambda cfg, project: cfg)
     monkeypatch.setattr(core, "_bridge_owner_pid", lambda cfg, runner=None: 4242)
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, runner=None: {"state": "stopped"})
+                        lambda c, runner=None, project=None: {"state": "stopped"})
     monkeypatch.setattr(studio_uia, "pending_dialog",
                         lambda pid: [{"title": "Device access", "text": "x"}])
     monkeypatch.setattr(core, "resolve_active_target", lambda cfg, bridge_pid=None: {
@@ -758,6 +798,7 @@ def test_run_emulator_no_spawn_no_dialog_visible(
 ) -> None:
     """Bridge present but UIA sees no blocking dialog: fall back to the generic
     hypothesis, and say the UIA check found nothing (not 'cannot see')."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_uia
     _proj(projects_root)
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
@@ -765,7 +806,7 @@ def test_run_emulator_no_spawn_no_dialog_visible(
     monkeypatch.setattr(core, "_bridge_cfg_for", lambda cfg, project: cfg)
     monkeypatch.setattr(core, "_bridge_owner_pid", lambda cfg, runner=None: 4242)
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, runner=None: {"state": "stopped"})
+                        lambda c, runner=None, project=None: {"state": "stopped"})
     monkeypatch.setattr(studio_uia, "pending_dialog", lambda pid: [])
     import dataclasses
     cfg2 = dataclasses.replace(cfg, runtime_test_port=65431)
@@ -774,6 +815,34 @@ def test_run_emulator_no_spawn_no_dialog_visible(
     assert out["probable_cause"] == "target_or_modal"
     assert "blocking_dialog" not in out
     assert "No blocking dialog was visible" in out["hint"]
+
+
+def test_run_emulator_no_spawn_names_win32_blocking_window(
+    cfg, projects_root, monkeypatch
+) -> None:
+    """No UIA dialog, but a foreign Win32 window is over Studio: run (and so
+    restart) names it via the shared studio_arm helper and says to dismiss it."""
+    _mock_port(monkeypatch, reachable=False)
+    from service import studio_arm, studio_uia
+    import dataclasses
+    _proj(projects_root)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_cfg_for", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_bridge_owner_pid", lambda cfg, runner=None: 4242)
+    monkeypatch.setattr(core, "emulator_status",
+                        lambda c, runner=None, project=None: {"state": "stopped"})
+    monkeypatch.setattr(studio_uia, "pending_dialog", lambda pid: [])
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows", lambda: [
+        {"title": "Windows Security Alert", "pid": 31, "rect": (0, 0, 50, 50),
+         "foreground": True}])
+    monkeypatch.setattr(studio_arm, "_process_name", lambda pid: "wf.exe")
+    cfg2 = dataclasses.replace(cfg, runtime_test_port=65431)
+    out = core.run_emulator(cfg2, "Alpha", wait_ready=True, ready_timeout=0.1,
+                            runner=runner)
+    assert out["probable_cause"] == "target_or_modal"
+    assert out["blocking_window"]["source"] == "win32"
+    assert "Windows Security Alert" in out["hint"] and "dismiss" in out["hint"]
 
 
 def test_active_target_prefers_uia_then_falls_back(
@@ -808,10 +877,15 @@ def test_pending_dialog_returns_empty_off_windows() -> None:
 def test_run_emulator_still_starting_says_poll_not_toggle(
     cfg, projects_root, monkeypatch
 ) -> None:
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
-    monkeypatch.setattr(core, "emulator_status",
-                        lambda c, runner=None: {"state": "starting"})
+    # First call is run_emulator's idempotency pre-check (stopped -> F5 is
+    # sent); later calls are the post-F5 diagnosis (process exists, starting).
+    _states = iter(["stopped"])
+    monkeypatch.setattr(
+        core, "emulator_status",
+        lambda c, runner=None, project=None: {"state": next(_states, "starting")})
     import dataclasses
     cfg2 = dataclasses.replace(cfg, runtime_test_port=65431)
     out = core.run_emulator(cfg2, "Alpha", wait_ready=True, ready_timeout=0.1,
@@ -837,6 +911,7 @@ def test_uia_live_read_overrides_stale_file_and_refuses(
     """The core value: the config file says Emulator (safe) but the LIVE toolbar
     is on a hardware panel. The UIA read must WIN and refuse — source uia_live,
     no keystroke — even though the file would have green-lit the run."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     _config(tmp_path, monkeypatch, "emu-id")  # file claims the emulator is active
     _with_bridge(monkeypatch)
@@ -857,6 +932,7 @@ def test_uia_live_read_emulator_proceeds(
 ) -> None:
     """Live toolbar reads Emulator → proceeds via the uia_live path (even if the
     file's active target were something else)."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     _config(tmp_path, monkeypatch, "panel-id")  # file would refuse
     _with_bridge(monkeypatch)
@@ -872,6 +948,7 @@ def test_uia_none_falls_back_to_config_file(
 ) -> None:
     """UIA returns None (unavailable) → fall back to the config file: refuse when
     the file's active target is a panel, proceed when it's the emulator."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     _with_bridge(monkeypatch)
     monkeypatch.setattr(core.studio_uia, "read_selected_target_name",
@@ -896,38 +973,61 @@ def test_studio_uia_read_returns_none_on_linux() -> None:
     assert studio_uia.read_selected_target_name(1234, {"Emulator"}) is None
 
 
-# --- Mismatch guard (I30) ------------------------------------
-# run_emulator and restart_emulator must refuse — before issuing F5 or a stop
-# action — when a running emulator belongs to a DIFFERENT project.
+# --- Per-project lifecycle (I30 / #30) ------------------------
+# Another project's running emulator no longer blocks run/restart; only a
+# shared web port does (web_port_clash).
 
 
-def test_run_emulator_refuses_when_foreign_emulator_running(
+def test_run_emulator_proceeds_when_foreign_emulator_runs_on_other_port(
     cfg: core.Config, projects_root: Path, monkeypatch
 ) -> None:
-    """If an emulator for a different project is already running (detected via
-    cache-path attribution), run_emulator must return a mismatch error BEFORE
-    sending F5 — no keystroke, no save."""
+    """Project B's run must NOT be refused because project A's runtime is up
+    when the two web ports differ: F5 is sent and no mismatch error returned."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
         {"pid": 9999, "project_resolved": "Beta",
          "matched_path": r"\Emulator\Projects\Beta\ApplicationFiles"},
     ])
+    ports = {"alpha": 8081, "beta": 8082}
+    monkeypatch.setattr(core, "discover_web_port", lambda c, p: {
+        "port": ports.get(core.normalise_project_name(p)), "source": "project",
+        "detail": ""})
+    monkeypatch.setattr(core, "_clash_candidate_projects", lambda c: ["Beta"])
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
     out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
-    assert out["ok"] is False
-    assert out["error"] == "runtime_project_mismatch"
-    assert out["requested"] == "Alpha"
-    assert out["resolved"] == "Beta"
-    assert out["pid"] == 9999
-    assert "nudge" in out and "Beta" in out["nudge"]
+    assert out.get("error") != "runtime_project_mismatch"
+    assert out.get("launched") is True
+    assert runner.calls != []  # F5 WAS sent
+
+
+def test_run_emulator_refuses_foreign_emulator_on_same_web_port(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """Equal web ports stay refused (detect_web_port_clash) before any F5."""
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
+        {"pid": 9999, "project_resolved": "Beta",
+         "matched_path": r"\Emulator\Projects\Beta\ApplicationFiles"},
+    ])
+    monkeypatch.setattr(core, "discover_web_port",
+                        lambda c, p: {"port": 8081, "source": "project", "detail": ""})
+    monkeypatch.setattr(core, "_clash_candidate_projects", lambda c: ["Beta"])
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+    out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
+    assert out["ok"] is False and out["launched"] is False
+    assert out["error"] == "web_port_taken"
+    assert out["other_project"] == "Beta" and out["port"] == 8081
     assert runner.calls == []  # F5 must NOT have been sent
 
 
 def test_run_emulator_mismatch_guard_is_case_insensitive(
     cfg: core.Config, projects_root: Path, monkeypatch
 ) -> None:
-    """The mismatch check is case-insensitive — 'alpha' vs 'Alpha' is NOT a
-    mismatch; only a genuinely different project name triggers the guard."""
+    """'alpha' vs 'Alpha' is the same project (case-insensitive): its running
+    emulator makes run a no-op rather than a mismatch refusal."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
         {"pid": 1111, "project_resolved": "Alpha",
@@ -936,9 +1036,11 @@ def test_run_emulator_mismatch_guard_is_case_insensitive(
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
     out = core.run_emulator(cfg, "alpha", wait_ready=False, runner=runner)
-    # 'alpha' == 'Alpha' case-insensitively → NOT a mismatch → proceeds
+    # 'alpha' == 'Alpha' case-insensitively → the SAME project's emulator is
+    # already up, so run is idempotent: no F5, state already_running.
     assert out.get("error") != "runtime_project_mismatch"
-    assert out.get("launched") is True
+    assert out["state"] == "already_running" and out["launched"] is False
+    assert runner.calls == []
 
 
 def test_run_emulator_no_mismatch_when_idle(
@@ -946,6 +1048,7 @@ def test_run_emulator_no_mismatch_when_idle(
 ) -> None:
     """When no emulator is running, the mismatch guard must pass silently and
     run_emulator proceeds normally."""
+    _mock_port(monkeypatch, reachable=False)
     _proj(projects_root)
     monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [])
     monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
@@ -966,11 +1069,13 @@ def _studio_scan(*entries):
             for pid, cmd in entries]
 
 
+@pytest.mark.real_studio_attribution
 def test_run_emulator_targets_studio_by_cmdline_when_no_bridge(
     cfg: core.Config, projects_root: Path, monkeypatch
 ) -> None:
     """Two Studios open, no bridge: the one whose argv names THIS project's
     directory / .optix file receives F5 — never the first window."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_guard
     make_project(projects_root, "Alpha")
     make_project(projects_root, "Beta")
@@ -994,12 +1099,14 @@ def test_run_emulator_targets_studio_by_cmdline_when_no_bridge(
     assert captured["pid"] == 222
 
 
+@pytest.mark.real_studio_attribution
 def test_run_emulator_refuses_ambiguous_studio_when_none_attributable(
     cfg: core.Config, projects_root: Path, monkeypatch
 ) -> None:
     """When multiple Studios are open and none names the project on its command
     line, and no bridge is armed, run_emulator must refuse with ambiguous_studio
     before sending any keystroke."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_guard
     make_project(projects_root, "Alpha")
     monkeypatch.setattr(studio_guard, "_scan", lambda: _studio_scan(
@@ -1016,12 +1123,14 @@ def test_run_emulator_refuses_ambiguous_studio_when_none_attributable(
     assert runner.calls == []  # no F5 keystroke was sent
 
 
+@pytest.mark.real_studio_attribution
 def test_run_emulator_single_unattributable_studio_proceeds(
     cfg: core.Config, projects_root: Path, monkeypatch
 ) -> None:
     """With only one Studio open (but not attributable by cmdline), run_emulator
-    must proceed with target_pid=0 (first-window fallback), matching pre-1.0.8
-    behaviour and the save() single-studio rule."""
+    must proceed, pinning that one Studio's pid (it is the only possible
+    first-window target; F5 never goes out with target_pid unset, #92)."""
+    _mock_port(monkeypatch, reachable=False)
     from service import studio_guard
     make_project(projects_root, "Alpha")
     monkeypatch.setattr(studio_guard, "_scan", lambda: _studio_scan(
@@ -1039,7 +1148,7 @@ def test_run_emulator_single_unattributable_studio_proceeds(
     runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=111"))
     out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
     assert out.get("launched") is True
-    assert captured["pid"] == 0   # first-window (no pid filter)
+    assert captured["pid"] == 111   # the only Studio open
 
 
 def test_run_emulator_uses_bridge_pid_as_f5_target(
@@ -1050,6 +1159,7 @@ def test_run_emulator_uses_bridge_pid_as_f5_target(
     first-priority path that save() uses (test_save.py: test_save_targets_bridge_instance).
     The bridge PID wins over both the cmdline-based attribution and the
     first-window fallback."""
+    _mock_port(monkeypatch, reachable=False)
     make_project(projects_root, "Alpha")
     # Override the autouse _no_bridge_by_default: arm a bridge for Alpha.
     monkeypatch.setattr(core, "_bridge_cfg_for", lambda c, p: c)
@@ -1065,3 +1175,690 @@ def test_run_emulator_uses_bridge_pid_as_f5_target(
     out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
     assert captured["pid"] == 7777
     assert out.get("launched") is True
+
+
+# --- Per-project lifecycle for multiple Studios (#30) -------------------------
+
+
+def _pin_ports(monkeypatch, ports: dict) -> None:
+    """Per-project web ports for status probing (project key -> port) and a
+    socket probe that only answers on ports in ``up``."""
+    monkeypatch.setattr(
+        core, "resolve_web_port",
+        lambda cfg, project, explicit=None, **_kw: {
+            "port": ports[project.lower()], "source": "project", "detail": ""})
+
+
+def test_emulator_status_project_reports_its_own_web_port(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """status(project=X) probes and returns X's own web port, never another
+    project's, and its pids are X's only."""
+    _mock_procs(monkeypatch, [
+        _PsProc(1111, "FTOptixRuntime.exe", _EMU_ALPHA_CMD),
+        _PsProc(2222, "FTOptixRuntime.exe", _EMU_BETA_CMD),
+    ])
+    _pin_ports(monkeypatch, {"alpha": 8081, "beta": 8082})
+    serving = {8082}                      # only Beta's engine answers
+    probed: list = []
+
+    def probe(host, port, *a, **k):
+        probed.append(port)
+        return port in serving
+
+    monkeypatch.setattr(core, "_tcp_probe", probe)
+    monkeypatch.setattr(core, "_port_owner", _fake_port_owner(True))
+    a = core.emulator_status(cfg, project="Alpha")
+    b = core.emulator_status(cfg, project="Beta")
+    assert (a["pids"], a["port"], a["state"]) == ([1111], 8081, "starting")
+    assert (b["pids"], b["port"], b["state"]) == ([2222], 8082, "running")
+    assert probed == [8081, 8082]
+
+
+def test_status_reports_external_change_on_the_per_project_status(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """An emulator stopped outside MCP shows external_change on THAT project's
+    status; the other project's status does not swallow or inherit it."""
+    monkeypatch.setattr(core, "attach_mode", lambda c: False)
+    core.reset_emulator_record()
+    live = [(1111, "Alpha"), (2222, "Beta")]
+    monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
+        {"pid": p, "project_resolved": n, "matched_path": None}
+        for p, n in live if project is None or n.lower() == project.lower()])
+    monkeypatch.setattr(core, "_tcp_probe", lambda *a, **k: True)
+    monkeypatch.setattr(core, "_tail_last_lifecycle_line", lambda p: None)
+    monkeypatch.setattr(core, "_port_owner", _fake_port_owner(True))
+    monkeypatch.setattr(core, "_pids_listening_on", lambda port, cands: [])
+    _pin_ports(monkeypatch, {"alpha": 8081, "beta": 8082})
+
+    def status(project):
+        return core.with_external_change_check(
+            cfg, lambda: core.emulator_status(cfg, project=project), project=project)
+
+    assert "external_change" not in status("Alpha")          # baseline
+    live.remove((2222, "Beta"))                              # Beta dies externally
+    a = status("Alpha")
+    assert "external_change" not in a and a["pids"] == [1111]
+    b = status("Beta")
+    assert b["external_change"] is True
+    assert b["external_changes"] == [{"change": "stopped", "pid": 2222, "project": "beta"}]
+    assert b["pids"] == []
+    assert "external_change" not in status("Beta")           # reported once
+
+
+def test_stop_emulator_with_project_status_leaves_other_project_running(
+    cfg: core.Config, monkeypatch
+) -> None:
+    """stop_emulator(status=status(project=A)) kills only A's pid and reports
+    stopped even though B's emulator is still running."""
+    monkeypatch.setattr(core, "_tcp_probe", lambda *a, **k: True)
+    monkeypatch.setattr(core, "_tail_last_lifecycle_line", lambda p: None)
+    monkeypatch.setattr(core, "_port_owner", _fake_port_owner(True))
+    monkeypatch.setattr(core, "_pids_listening_on", lambda port, cands: [])
+    _pin_ports(monkeypatch, {"alpha": 8081, "beta": 8082})
+    live = {1111: "Alpha", 2222: "Beta"}
+    monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
+        {"pid": p, "project_resolved": n, "matched_path": None}
+        for p, n in live.items() if project is None or n.lower() == project.lower()])
+    killed: list[int] = []
+
+    class FakePs:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def kill(self):
+            killed.append(self.pid)
+            live.pop(self.pid, None)
+
+    monkeypatch.setattr(core.psutil, "Process", FakePs)
+    monkeypatch.setattr(core.psutil, "wait_procs", lambda procs, timeout=None: (list(procs), []))
+    st = core.emulator_status(cfg, project="Alpha")
+    out = core.stop_emulator(cfg, status=st)
+    assert killed == [1111]
+    assert out["stopped"] is True and out["still_running"] == []
+    assert 2222 in live
+
+
+# ---- page readiness wait is applied exactly once (ftx-mcp-czz.5) -----------
+
+def _serve_instantly(monkeypatch) -> None:
+    import socket as _socket
+
+    class FakeSock:
+        def settimeout(self, *a): pass
+        def connect_ex(self, addr): return 0
+        def close(self): pass
+
+    monkeypatch.setattr(_socket, "socket", lambda *a, **k: FakeSock())
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    monkeypatch.setattr(core, "attach_mode", lambda c: False)
+    monkeypatch.setattr(core, "save", lambda *a, **k: {"saved": True})
+    monkeypatch.setattr(core, "_cdp_after_runtime_up",
+                        lambda c, p: {"resolved": True})
+    # Never read the host's listener table; foreign-owner tests re-patch this.
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: [])
+
+
+def test_cold_start_run_emulator_waits_for_page_ready_once(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _serve_instantly(monkeypatch)
+    calls = []
+    monkeypatch.setattr(core, "_wait_page_ready",
+                        lambda c, p, timeout=20.0: calls.append(p) or
+                        {"ready": False, "waited": 20.0})
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+    out = core.run_emulator(cfg, "Alpha", runner=runner)
+    assert calls == ["Alpha"]
+    assert out["serving"] is True and out["page_ready"] is False
+    assert out["hint"] and out["waited_seconds"] >= 20.0
+
+
+def test_restart_through_real_run_emulator_waits_for_page_once(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """restart_emulator -> real run_emulator: the page wait runs ONCE, and
+    waited_seconds counts it once (port wait + page wait)."""
+    _proj(projects_root)
+    _serve_instantly(monkeypatch)
+    # restart's scan (old runtime), run's pre-F5 scan (stopped), then the new one
+    statuses = iter([[111], [], [222], [222], [222], [222]])
+    monkeypatch.setattr(core, "emulator_status",
+                        lambda c, r=None, project=None, runner=None:
+                        (lambda p: {"pids": p, "state": "running" if p else "stopped"})(
+                            next(statuses)))
+    monkeypatch.setattr(core, "stop_emulator",
+                        lambda c, r=None, status=None, project=None:
+                        {"stopped": True, "killed_pids": [111]})
+    monkeypatch.setattr(core, "_wait_runtime_port", lambda *a, **k: True)
+    monkeypatch.setattr(core, "_wait_new_runtime",
+                        lambda *a, **k: {"ok": True, "pids": [222], "waited": 0.0})
+    calls = []
+    monkeypatch.setattr(core, "_wait_page_ready",
+                        lambda c, p, timeout=20.0: calls.append(p) or
+                        {"ready": False, "waited": 20.0})
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+    out = core.restart_emulator(cfg, "Alpha", runner=runner)
+    assert len(calls) == 1
+    assert out["serving"] is True and out["page_ready"] is False
+    assert out["hint"]
+    assert 20.0 <= out["waited_seconds"] < 25.0
+
+
+def test_page_ready_false_with_hint_when_cdp_target_unresolved(cfg: core.Config) -> None:
+    out = {"serving": True, "waited_seconds": 1.0, "cdp_target": {"resolved": False}}
+    core._apply_page_ready(cfg, "Alpha", out)
+    assert out["serving"] is True and out["page_ready"] is False and out["hint"]
+
+
+# --- Idempotent run + port attribution (ftx-mcp-wvk.1) ---------------------
+
+
+def _f5_runner():
+    return make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+
+
+@pytest.mark.parametrize("reachable,runtime_state", [(True, "running"), (False, "starting")])
+def test_run_emulator_already_running_sends_no_f5(
+    cfg: core.Config, projects_root: Path, monkeypatch, reachable, runtime_state
+) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=reachable)
+    _mock_procs(monkeypatch, [_PsProc(1111, "FTOptixRuntime.exe", _EMU_ALPHA_CMD)])
+    monkeypatch.setattr(core, "_any_pid_has_window", lambda pids: False)
+    runner = _f5_runner()
+    out = core.run_emulator(cfg, "Alpha", runner=runner)
+    assert runner.calls == []
+    assert out["state"] == "already_running"
+    assert out["launched"] is False
+    assert out["serving"] is reachable
+    assert out["runtime_state"] == runtime_state
+    assert "action='restart'" in out["hint"]
+
+
+def test_run_emulator_stopped_still_sends_f5(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=False)
+    _mock_procs(monkeypatch, [])
+    runner = _f5_runner()
+    out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
+    assert len(runner.calls) == 1 and "{F5}" in runner.calls[0][0][-1]
+    assert out["launched"] is True and out.get("state") != "already_running"
+
+
+def test_run_emulator_other_projects_emulator_does_not_block_f5(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=False)
+    _mock_procs(monkeypatch, [_PsProc(2222, "FTOptixRuntime.exe", _EMU_BETA_CMD)])
+    runner = _f5_runner()
+    out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
+    assert len(runner.calls) == 1 and out["launched"] is True
+
+
+_EMU_CACHEDIR_CMD = [
+    "FTOptixRuntime.exe", "--application-name=Emulator",
+    rf"{_CACHE_ROOT}\Emulator\Projects\AlphaCache\ApplicationFiles",
+]
+
+
+def test_emulator_status_port_attribution_when_name_differs_from_cache_folder(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=True)
+    _mock_procs(monkeypatch, [_PsProc(3333, "FTOptixRuntime.exe", _EMU_CACHEDIR_CMD)])
+    monkeypatch.setattr(core, "_pids_listening_on",
+                        lambda port, cands: [p for p in cands if p == 3333])
+    st = core.emulator_status(cfg, project="Alpha")
+    assert st["state"] == "running" and st["running"] is True
+    assert st["attribution"] == "port" and st["pids"] == [3333]
+
+
+def test_emulator_status_no_port_attribution_when_process_not_on_port(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=True)
+    _mock_procs(monkeypatch, [_PsProc(3333, "FTOptixRuntime.exe", _EMU_CACHEDIR_CMD)])
+    monkeypatch.setattr(core, "_pids_listening_on", lambda port, cands: [])
+    st = core.emulator_status(cfg, project="Alpha")
+    assert st["state"] == "stopped" and "attribution" not in st
+
+
+def test_emulator_status_no_port_attribution_to_other_existing_project(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    _proj(projects_root)
+    make_project(projects_root, "Beta")
+    _mock_port(monkeypatch, reachable=True)
+    _mock_procs(monkeypatch, [_PsProc(2222, "FTOptixRuntime.exe", _EMU_BETA_CMD)])
+    monkeypatch.setattr(core, "_pids_listening_on", lambda port, cands: list(cands))
+    st = core.emulator_status(cfg, project="Alpha")
+    assert st["state"] == "stopped" and st["pids"] == []
+
+
+def test_emulator_status_path_match_reports_path_attribution(
+    cfg: core.Config, monkeypatch
+) -> None:
+    _mock_port(monkeypatch, reachable=True)
+    _mock_procs(monkeypatch, [_PsProc(1111, "FTOptixRuntime.exe", _EMU_ALPHA_CMD)])
+    assert core.emulator_status(cfg, project="Alpha")["attribution"] == "path"
+
+
+# ---- port ownership + bind-failure detection (ftx-mcp-iur.2, #64) ----------
+
+def _stub_run_env(monkeypatch, *, listeners, ours) -> None:
+    """Serving port instantly; listener table and emulator pids pinned."""
+    _serve_instantly(monkeypatch)
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: listeners)
+    # The classifier itself is under test on these paths: it reads only the
+    # pinned listener / emulator pid lists above, never the host table.
+    monkeypatch.setattr(core, "_port_owner", _REAL_PORT_OWNER)
+    monkeypatch.setattr(core, "_emulator_pids", lambda project=None: list(ours))
+    monkeypatch.setattr(core, "_port_attributed_emulator_pids",
+                        lambda cfg, project, port: [])
+    monkeypatch.setattr(core, "_bind_failed_since", lambda project, mark: None)
+    monkeypatch.setattr(core, "emulator_status",
+                        lambda c, r=None, project=None, runner=None: {"state": "stopped"})
+
+
+def test_run_emulator_foreign_port_owner_is_web_port_taken(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[4242], ours=[111])
+
+    class _P:
+        def __init__(self, pid): pass
+        def name(self): return "nginx.exe"
+
+    monkeypatch.setattr(core.psutil, "Process", _P)
+    out = core.run_emulator(cfg, "Alpha", runner=_f5_runner())
+    assert out["error"] == "web_port_taken"
+    assert out["serving"] is False
+    assert out["owner"] == {"pid": 4242, "process": "nginx.exe"}
+    assert out["hint"]
+
+
+def test_run_emulator_runtime_owned_port_still_serves(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[111], ours=[111])
+    monkeypatch.setattr(core, "_wait_page_ready",
+                        lambda c, p, timeout=20.0: {"ready": True, "waited": 0.0})
+    out = core.run_emulator(cfg, "Alpha", runner=_f5_runner())
+    assert out["serving"] is True
+    assert "error" not in out
+
+
+def test_run_emulator_bind_failed_log_returns_quickly(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[], ours=[])
+    # port never serves; the log reports the bind failure
+    import socket as _socket
+
+    class _Closed:
+        def settimeout(self, *a): pass
+        def connect_ex(self, addr): return 111
+        def close(self): pass
+
+    monkeypatch.setattr(_socket, "socket", lambda *a, **k: _Closed())
+    monkeypatch.setattr(core, "_bind_failed_since", lambda project, mark:
+                        "12:00:01 Bind to server address failed (code 10048)")
+    out = core.run_emulator(cfg, "Alpha", ready_timeout=60.0, runner=_f5_runner())
+    assert out["error"] == "web_bind_failed"
+    assert out["serving"] is False
+    assert out["port"] and "10048" in out["detail"]
+    assert out["waited_seconds"] < 5.0
+
+
+def test_restart_emulator_surfaces_web_bind_failed(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _proj(projects_root)
+    monkeypatch.setattr(core, "run_emulator", lambda *a, **k: {
+        "launched": True, "serving": False, "error": "web_bind_failed",
+        "port": 8081, "detail": "Bind to server address failed"})
+    monkeypatch.setattr(core, "emulator_status",
+                        lambda c, r=None, project=None: {"pids": [], "state": "stopped"})
+    out = core.restart_emulator(cfg, "Alpha", runner=_f5_runner())
+    assert out["error"] == "web_bind_failed" and out["serving"] is False
+
+
+def test_bind_failed_since_only_sees_lines_after_the_mark(
+        cfg: core.Config, monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPTIX_EMULATOR_LOG_ROOT", str(tmp_path))
+    d = tmp_path / "Alpha"
+    d.mkdir()
+    log = d / "FTOptixRuntime.0.log"
+    log.write_text("old Bind to server address failed (code 1)\n")
+    mark = core._runtime_log_mark("Alpha")
+    assert core._bind_failed_since("Alpha", mark) is None
+    with open(log, "a") as fh:
+        fh.write("new Bind to server address failed (code 10013)\n")
+    assert "10013" in core._bind_failed_since("Alpha", mark)
+
+
+@pytest.mark.parametrize("listeners,ours,expected", [
+    ([], [111], "none"),
+    ([111], [111], "runtime"),
+    ([999], [111], "foreign"),
+    (None, [111], "unknown"),
+])
+def test_port_owner_classification(cfg, monkeypatch, listeners, ours, expected) -> None:
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: listeners)
+    monkeypatch.setattr(core, "_port_attributed_emulator_pids",
+                        lambda c, p, port: [])
+    assert core._port_owner(cfg, "Alpha", 8081, pids=ours)["owner"] == expected
+
+
+@pytest.mark.parametrize("listeners,expected", [
+    ([], "none"), ([111], "runtime"), ([999], "foreign")])
+def test_emulator_status_reports_port_owner(
+        cfg: core.Config, projects_root: Path, monkeypatch, listeners, expected) -> None:
+    _proj(projects_root)
+    _mock_port(monkeypatch, reachable=bool(listeners))
+    monkeypatch.setattr(core, "_port_owner", _REAL_PORT_OWNER)  # exercise the real classifier
+    monkeypatch.setattr(core, "attach_mode", lambda c: False)
+    monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
+        {"pid": 111, "project_resolved": "Alpha", "matched_path": "x"}])
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: listeners)
+    monkeypatch.setattr(core, "_port_attributed_emulator_pids",
+                        lambda c, p, port: [])
+    st = core.emulator_status(cfg, project="Alpha")
+    assert st["port_owner"] == expected
+    assert st["port_reachable"] is bool(listeners)
+    if expected == "foreign":
+        assert st["state"] != "running"
+
+
+def test_page_ready_once_rejects_foreign_page(
+        cfg: core.Config, monkeypatch) -> None:
+    from service import _cdp
+    want = "http://127.0.0.1:8081/"
+    monkeypatch.setattr(core, "_project_web_port", lambda c, p: 8081)
+    monkeypatch.setattr(_cdp, "list_pages", lambda url: [
+        {"id": "t1", "url": want, "webSocketDebuggerUrl": "ws://x"}])
+    monkeypatch.setattr(_cdp, "activate", lambda *a, **k: None)
+
+    class _C:
+        def __init__(self, *a, **k): pass
+        def cmd(self, m, **kw):
+            if m == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"url": want}}}
+            return {"result": {"value": "complete"}}
+        def close(self): pass
+
+    monkeypatch.setattr(_cdp, "CDPClient", _C)
+    monkeypatch.setattr(core, "_port_owner", lambda *a, **k:
+                        {"owner": "foreign", "pid": 4242, "name": "x.exe"})
+    assert core._page_ready_once(cfg, "Alpha", want) is False
+    monkeypatch.setattr(core, "_port_owner", lambda *a, **k:
+                        {"owner": "runtime", "pid": 111, "name": None})
+    assert core._page_ready_once(cfg, "Alpha", want) is True
+
+
+# ---- pre-F5 port check + zombie detection (ftx-mcp-ykv.4, #76) -------------
+
+def _counting_runner(calls: list):
+    def _h(cmd, kw):
+        calls.append(cmd)
+        return FakeProc(0, "FOCUSED=True PID=1")
+    return make_fake_runner(_h)
+
+
+def test_run_emulator_foreign_web_port_owner_sends_no_f5(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[4242], ours=[])
+
+    class _P:
+        def __init__(self, pid): pass
+        def name(self): return "nginx.exe"
+
+    monkeypatch.setattr(core.psutil, "Process", _P)
+    calls: list = []
+    out = core.run_emulator(cfg, "Alpha", runner=_counting_runner(calls))
+    assert out["error"] == "web_port_taken"
+    assert out["launched"] is False
+    assert out["owner"] == {"pid": 4242, "process": "nginx.exe"}
+    assert calls == []  # no F5 keystroke (no PowerShell call at all)
+
+
+def test_run_emulator_zombie_runtime_returns_runtime_zombie_fast(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    import time as _t
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[], ours=[777])
+    monkeypatch.setattr(core, "emulator_status", lambda c, runner=None, project=None: {
+        "state": "zombie", "pids": [777], "port_reachable": False})
+    calls: list = []
+    t0 = _t.monotonic()
+    out = core.run_emulator(cfg, "Alpha", runner=_counting_runner(calls))
+    assert _t.monotonic() - t0 < 1.0
+    assert out["error"] == "runtime_zombie" and out["ok"] is False
+    assert out["pid"] == 777
+    assert out["hint"] == "use action='restart'"
+    assert out["launched"] is False
+    assert calls == []
+
+
+def test_run_emulator_starting_runtime_with_bind_failed_log_is_zombie(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[], ours=[777])
+    monkeypatch.setattr(core, "emulator_status", lambda c, runner=None, project=None: {
+        "state": "starting", "pids": [777], "port_reachable": False})
+    monkeypatch.setattr(core, "_bind_failed_since", lambda project, mark:
+                        "Bind to server address failed (code 10048)")
+    calls: list = []
+    out = core.run_emulator(cfg, "Alpha", runner=_counting_runner(calls))
+    assert out["error"] == "runtime_zombie" and out["pid"] == 777
+    assert "10048" in out["detail"] and out["launched"] is False
+    assert calls == []
+
+
+def test_run_emulator_starting_runtime_without_bind_log_is_already_running(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[], ours=[777])
+    monkeypatch.setattr(core, "emulator_status", lambda c, runner=None, project=None: {
+        "state": "starting", "pids": [777], "port_reachable": False})
+    out = core.run_emulator(cfg, "Alpha", runner=_counting_runner([]))
+    assert out["state"] == "already_running"
+
+
+def test_run_emulator_bind_failure_after_f5_reported_within_2s(
+        cfg: core.Config, projects_root: Path, monkeypatch) -> None:
+    """The bind failure line appears 3 polls after F5; the loop returns at the
+    next poll (fake clock), not at ready_timeout."""
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    _stub_run_env(monkeypatch, listeners=[], ours=[])
+    import socket as _socket
+
+    class _Closed:
+        def settimeout(self, *a): pass
+        def connect_ex(self, addr): return 111
+        def close(self): pass
+
+    clock = [1000.0]
+    monkeypatch.setattr(_socket, "socket", lambda *a, **k: _Closed())
+    monkeypatch.setattr(core.time, "time", lambda: clock[0])
+    monkeypatch.setattr(core.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    polls = {"n": 0}
+    line_at = {"t": None}
+
+    def _bind(project, mark):
+        polls["n"] += 1
+        if polls["n"] <= 3:
+            return None
+        if line_at["t"] is None:
+            line_at["t"] = clock[0]
+        return "Bind to server address failed (code 10048)"
+
+    monkeypatch.setattr(core, "_bind_failed_since", _bind)
+    out = core.run_emulator(cfg, "Alpha", ready_timeout=60.0, runner=_f5_runner())
+    assert out["error"] == "web_bind_failed"
+    assert clock[0] - line_at["t"] <= 2.0
+    assert out["waited_seconds"] < 5.0
+
+
+# ---- #92: a nonexistent project is refused before any scan / keystroke ----
+
+@pytest.fixture
+def scan_spies(monkeypatch) -> list:
+    """Every process / command-line / log scan entry point records a call."""
+    from service import studio_guard
+    calls: list = []
+
+    def _spy(name, ret):
+        def _f(*a, **k):
+            calls.append(name)
+            return ret
+        return _f
+
+    monkeypatch.setattr(core, "_studio_pid_for_project", _spy("cmdline", 0))
+    monkeypatch.setattr(core, "_emulator_entries", _spy("emulator_entries", []))
+    monkeypatch.setattr(core, "_tail_last_lifecycle_line", _spy("log", None))
+    monkeypatch.setattr(core, "_bridge_owner_pid", _spy("bridge_pid", 0))
+    # studio_state is the cached snapshot resolve_project's open-in-Studio
+    # fallback itself reads to decide existence, so it is not a "scan" here;
+    # the attribution helpers that follow resolution are spied separately.
+    monkeypatch.setattr(studio_guard, "studio_state",
+                        lambda *a, **k: {"studio": {"pids": [111, 222]}})
+    monkeypatch.setattr(core, "_unattributed_studio_verdict",
+                        _spy("window_scan", ("none", None)))
+    monkeypatch.setattr(core, "_runtime_log_mark", _spy("log_mark", {}))
+    return calls
+
+
+@pytest.mark.real_project_resolution
+@pytest.mark.parametrize("action", ["run", "restart", "status"])
+def test_nonexistent_project_is_refused_before_any_scan_or_keystroke(
+    cfg: core.Config, projects_root: Path, scan_spies: list, action: str,
+    monkeypatch
+) -> None:
+    _mock_port(monkeypatch, reachable=False)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=111"))
+    if action == "run":
+        out = core.run_emulator(cfg, "Nothere", wait_ready=False, runner=runner)
+    elif action == "restart":
+        out = core.restart_emulator(cfg, "Nothere", runner=runner)
+    else:
+        out = core.emulator_status(cfg, runner, project="Nothere")
+    assert out["ok"] is False
+    assert out["error"] == "project_not_found"
+    assert out["project"] == "Nothere"
+    assert str(projects_root) in out["hint"] and "optix_project list" in out["hint"]
+    assert runner.calls == []   # the fake keystroke sender was never called
+    assert scan_spies == []     # no process / command-line / log scan ran
+
+
+@pytest.mark.real_project_resolution
+def test_project_resolves_before_studio_commandline_and_log_scan(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """For an existing project the directory is resolved first; the Studio
+    command-line / log scans only start after it."""
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    order: list = []
+    real = core._resolve_emulator_project
+
+    def _resolve(c, p):
+        order.append("resolve")
+        return real(c, p)
+
+    monkeypatch.setattr(core, "_resolve_emulator_project", _resolve)
+    monkeypatch.setattr(core, "_emulator_entries",
+                        lambda project=None: order.append("scan") or [])
+    monkeypatch.setattr(core, "_studio_pid_for_project",
+                        lambda d, force=False: order.append("cmdline") or 4242)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=4242"))
+    core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
+    assert order[0] == "resolve"
+    assert "scan" in order and "cmdline" in order
+
+
+@pytest.mark.real_studio_attribution
+def test_run_with_no_target_pid_returns_no_target_studio_and_sends_no_keystroke(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """target_pid unset (no bridge, no command-line match, no Studio open):
+    the last guard refuses instead of sending F5 to whatever window is up."""
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    monkeypatch.setattr(core, "_studio_pid_for_project", lambda d, force=False: 0)
+    runner = make_fake_runner(lambda cmd, kw: FakeProc(0, "FOCUSED=True PID=1"))
+    out = core.run_emulator(cfg, "Alpha", wait_ready=False, runner=runner)
+    assert out["ok"] is False and out["error"] == "no_target_studio"
+    assert out["launched"] is False
+    assert runner.calls == []
+
+
+def test_run_emulator_status_unavailable_fails_closed_and_sends_no_f5(
+    cfg, projects_root, monkeypatch
+) -> None:
+    """A pre-run emulator_status exception must not fall through to F5 (F5
+    toggles; the state is unknown): ok false, status_unavailable, no keystroke."""
+    _mock_port(monkeypatch, reachable=False)
+    _proj(projects_root)
+    sent: list = []
+    runner = make_fake_runner(lambda cmd, kw: sent.append(cmd) or FakeProc(0, "FOCUSED=True PID=1"))
+
+    def boom(*a, **k):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(core, "emulator_status", boom)
+    out = core.run_emulator(cfg, "Alpha", runner=runner)
+    assert out["ok"] is False and out["error"] == "status_unavailable"
+    assert out["launched"] is False
+    assert "scan failed" in out["detail"]
+    assert out["hint"] == "optix_emulator status; fix the cause, then run"
+    assert sent == []
+
+
+def test_restart_status_unavailable_returns_same_result_and_does_not_run(
+    cfg, monkeypatch
+) -> None:
+    def boom(*a, **k):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(core, "emulator_status", boom)
+    monkeypatch.setattr(core, "stop_emulator",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no stop")))
+    monkeypatch.setattr(core, "run_emulator",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no run")))
+    out = core.restart_emulator(cfg, "P")
+    assert out["ok"] is False and out["error"] == "status_unavailable"
+    assert out["launched"] is False
+    assert out["hint"] == "optix_emulator status; fix the cause, then run"
+
+
+def test_restart_with_nothing_running_reports_started_and_real_state(
+    cfg, monkeypatch
+) -> None:
+    monkeypatch.setattr(core, "emulator_status",
+                        lambda c, r=None, project=None: {"pids": [], "state": "stopped"})
+    monkeypatch.setattr(core, "run_emulator",
+                        lambda *a, **k: {"launched": True, "serving": False})
+    out = core.restart_emulator(cfg, "P")
+    assert out["restarted"] is False and out["started"] is True
+    assert out["state"] == "launched"
+    monkeypatch.setattr(core, "run_emulator",
+                        lambda *a, **k: {"state": "already_running", "serving": True})
+    out = core.restart_emulator(cfg, "P")
+    assert out["restarted"] is False and out["started"] is True
+    assert out["state"] == "already_running"

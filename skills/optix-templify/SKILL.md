@@ -115,3 +115,17 @@ optix_bridge_edit(project, ops=[
   "Model/Types/MotorType")`.
 - A plain grouping node is `create_folder`; a plain container object (no type)
   is `create_object` without `object_type`.
+- A member's ModellingRule decides whether instances of a type must carry it.
+  Set it with the batch op `{"op": "set_modelling_rule", "path":
+  "Model/Types/MotorType/Speed", "rule": "Mandatory"}` (`Mandatory`, `Optional`
+  or `None`; anything else is `invalid_modelling_rule`, caught by `dry_run`).
+  The bridge maps the name onto the SDK enum `UAManagedCore.NamingRuleType` (there is no
+  `ModellingRule` type); the response returns the `previous` and new rule. Placeholder
+  variants are not accepted.
+  Only members under a type qualify — an instance path is `not_a_type_member`.
+- A NodePointer variable needs a `Kind` (the pointed-to node's type), never unset or
+  BaseObjectType. `{"op": "create_variable", "parent": "Model", "name": "Selected",
+  "datatype": "NodePointer", "target": "Model/Motor1"}` derives it from the target;
+  pass `kind` (builtin type name or type-node path) to override it or to make a
+  target-less pointer. Neither `target` nor `kind` is `kind_required`; `dry_run`
+  shows the resolved Kind under `report.resolved`.

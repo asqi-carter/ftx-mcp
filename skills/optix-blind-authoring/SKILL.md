@@ -61,7 +61,10 @@ A dozen ~10-op component batches beat one 120-op batch on both token cost and
 wall-clock, and each is independently debuggable. If a batch does exceed the
 chunk threshold it returns `state="chunked"` instead of dying — recover with
 `optix_bridge_edit(action="status", project=...)` to see what landed, then
-`action="continue"` with the returned `batch_id` to apply the remainder.
+`action="continue"` with the returned `batch_id` to apply the remainder. A
+`chunk_ops` / `chunk_seconds` override on the first call is saved in the batch
+journal and re-applied by every `continue` — do not repeat it (passing one to
+`continue` replaces the saved value).
 
 ## Call it once — do NOT dry_run first
 

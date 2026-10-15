@@ -142,6 +142,21 @@ in step 2 proves the surface works. See `optix-verify-loop` for the full
 verify cadence — navigation, popup, click, and keyboard changes all require
 a real click in the verify step because these four classes fail silently.
 
+### Pixel-diff verification: settle first (Optix 1.8)
+
+When proving a click by diffing a screenshot region (as the live
+`test_normalized_click_round_trip` does), capture the region repeatedly until
+two consecutive captures are byte-identical (bounded, 5 attempts) **before**
+clicking. On Optix 1.7.4.32 this settles on the second capture. On Optix
+1.8.0.555 part of the web runtime repaints on its own (e.g. region
+`[36, 664, 128, 40]` alternating 793 / 1196 bytes), so the region may never
+settle and a pixel diff proves nothing. In that case the test falls back to
+asserting that the bound variable's value changed via the bridge read
+(`describe_node` of the variable's parent) and logs which path ran
+(`path=pixel` or `path=bridge-read fallback`). Prefer a static capture region
+so the pixel path is used. The bridge read reports the design-time model, so
+treat the fallback as pending bench verification on 1.8.0.555.
+
 ## Enum wire names (applies when setting enum properties on Button)
 
 FT Optix has two name sets for the same enum and only one lands on the

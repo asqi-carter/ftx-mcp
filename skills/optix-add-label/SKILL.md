@@ -68,3 +68,33 @@ Create the variable first (`{"op": "create_variable", ...}`)
   property with `unknown_property` + the valid set rather than silently failing.
 - Studio closed? Live authoring needs Studio open with the bridge armed —
   ask the user to open the project.
+
+## Translated text (translation keys)
+
+A label that must follow the session locale takes a translation KEY, not literal
+text (`set_property` writes literal text).
+
+1. Add the rows in one call (primitives, gated by `FTXMCP_BRIDGE_PRIMITIVES`):
+   `optix_bridge_add_translations(project, rows=[{"key": "Start", "value": "Start", "locale": "en-US"}, {"key": "Start", "value": "Marche", "locale": "fr-FR"}])`
+   — or fold `{"op": "add_translations", "rows": [...]}` into an `optix_bridge_edit` batch.
+   Removing a row is **not supported** (the Optix SDK has no API for it):
+   `optix_bridge_remove_translation` and the batch verb `remove_translation` answer
+   `not_supported` (`translation_not_found` for an unknown key; both routes use the same
+   existence check, so a key just added by a primitive or batch `add_translations` answers
+   `not_supported`, never `translation_not_found`). To change a row,
+   overwrite its text with `add_translations`, or edit the key in Studio's Translations editor.
+   Repeating a key is safe: `add_translations` updates an existing key in place and reports it
+   under `updated` (new keys under `added`) instead of failing with `row_failed` / "already contains a translation".
+2. Point the label at the key:
+   `{"op": "set_text_key", "path": "UI/Screens/<Screen>/<Name>", "name": "Text", "key": "Start"}`
+   (tool `optix_bridge_set_text_key`). The key need not exist yet, but a key with no
+   row renders blank — the result's `translated` says whether a row exists.
+   `BrowseName`/`DisplayName`/`Description` are never writable this way.
+3. A model variable that must hold translated text is retyped in place:
+   `{"op": "retype", "path": "Model/<Var>", "datatype": "LocalizedText"}`
+   (`optix_bridge_retype`; value carries over as text; a value with no text form is
+   `value_not_convertible`).
+
+Every one of these takes `dry_run` and reports structured per-op errors
+(`invalid_text_key`, `invalid_locale`, `text_key_missing`, `not_localized_text`,
+`invalid_translation_rows`, ...) before anything is written.

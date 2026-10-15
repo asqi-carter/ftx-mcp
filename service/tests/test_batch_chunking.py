@@ -897,3 +897,79 @@ def test_load_journal_never_leaves_batches_dir(alpha):
 def test_generated_and_hex_ids_are_valid():
     assert core._valid_batch_id("0123abcdef45")
     assert core._valid_batch_id("my_batch-1")
+
+
+# ===========================================================================
+# (9) chunk_ops / chunk_seconds overrides persist in the journal and are
+#     honoured by action="continue" (ftx-mcp-xk7.1)
+# ===========================================================================
+
+def _six_ops(n: int = 6):
+    return [{"op": "set_property", "path": "UI/MainWindow/Root",
+             "name": f"P{i}", "value": str(i)} for i in range(n)]
+
+
+def _setup_override_batch(alpha, monkeypatch, n):
+    report = {"ok": True, "op_count": n, "strict": False,
+              "errors": [], "warnings": []}
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(report))
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    # Server defaults would apply everything at once; only the persisted
+    # per-call overrides can chunk this batch.
+    monkeypatch.setenv("OPTIX_BATCH_CHUNK_SECONDS", "99999")
+    monkeypatch.setenv("OPTIX_BATCH_CHUNK_OPS", "99999")
+
+
+def test_chunk_overrides_persisted_in_journal(alpha, monkeypatch):
+    """A batch started with chunk_ops=2 stores chunk_ops and chunk_seconds."""
+    _setup_override_batch(alpha, monkeypatch, 6)
+    _patch_apply_ok(monkeypatch)
+
+    out = core.bridge_edit(alpha, "Alpha", _six_ops(), chunk_ops=2, chunk_seconds=30)
+
+    assert out["state"] == "chunked" and out["applied"] == 2
+    j = json.loads((alpha.state_dir / "batches" / f"{out['batch_id']}.json")
+                   .read_text(encoding="utf-8"))
+    assert j["state"] == "chunked"
+    assert j["chunk_ops"] == 2
+    assert j["chunk_seconds"] == 30
+
+
+def test_continue_honours_persisted_chunk_overrides(alpha, monkeypatch):
+    """continue applies at most the persisted chunk_ops per call, not all remaining."""
+    _setup_override_batch(alpha, monkeypatch, 6)
+    applied_ops: list = []
+    _patch_apply_ok(monkeypatch, tracker=applied_ops)
+
+    first = core.bridge_edit(alpha, "Alpha", _six_ops(), chunk_ops=2)
+    assert first["state"] == "chunked" and first["applied"] == 2
+    bid = first["batch_id"]
+
+    # continue is called WITHOUT overrides; env defaults are huge.
+    second = core.bridge_edit_continue(alpha, "Alpha", bid)
+    assert second["state"] == "chunked"
+    assert second["applied"] == 4
+    assert second["remaining_ops"] == 2
+    assert len(applied_ops) == 4
+
+    j = json.loads((alpha.state_dir / "batches" / f"{bid}.json")
+                   .read_text(encoding="utf-8"))
+    assert j["chunk_ops"] == 2, "overrides must survive a continue rewrite"
+
+    third = core.bridge_edit_continue(alpha, "Alpha", bid)
+    assert third["state"] == "succeeded" and third["applied"] == 6
+
+
+def test_continue_explicit_override_wins_and_is_persisted(alpha, monkeypatch):
+    """An override passed to continue replaces the persisted one."""
+    _setup_override_batch(alpha, monkeypatch, 6)
+    _patch_apply_ok(monkeypatch)
+
+    first = core.bridge_edit(alpha, "Alpha", _six_ops(), chunk_ops=2)
+    bid = first["batch_id"]
+    second = core.bridge_edit_continue(alpha, "Alpha", bid, chunk_ops=3)
+    # 4 ops remained; chunk_ops=3 leaves 1 behind.
+    assert second["state"] == "chunked" and second["applied"] == 5
+    j = json.loads((alpha.state_dir / "batches" / f"{bid}.json")
+                   .read_text(encoding="utf-8"))
+    assert j["chunk_ops"] == 3

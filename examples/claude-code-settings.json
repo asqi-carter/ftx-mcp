@@ -10,7 +10,7 @@
   "permissions": {
     "allow": [
       "mcp__ftx-mcp__optix_health",
-      "mcp__ftx-mcp__optix_doctor",
+      "mcp__ftx-mcp__optix_status",
       "mcp__ftx-mcp__optix_list_projects",
       "mcp__ftx-mcp__optix_list_skills",
       "mcp__ftx-mcp__optix_get_skill",

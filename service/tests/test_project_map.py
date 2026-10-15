@@ -143,3 +143,82 @@ def test_map_search_mode(cfg: core.Config, monkeypatch) -> None:
     # json format returns the structured matches
     out2 = core.get_project_map(cfg, "P", match="Label", fmt="json")
     assert out2["matches"][0]["path"] == "UI/Screens/ScreenA/HelloLabel"
+
+
+# ---- PRD 0023 #2: target_path + dangling-link diagnostic ---------------------
+
+def test_map_prints_target_path_for_dynamic_link_sources(cfg: core.Config, monkeypatch) -> None:
+    tree = {"path": "UI/Lbl", "mode": "detail", "budget_left": 5, "map": {
+        "name": "Fmt", "type": "StringFormatter", "children": [
+            {"name": "Source0", "type": "UAVariable", "id": "ns=2;g=AAAA",
+             "target_path": "Model/ZzzLinkA"},
+            {"name": "Source1", "type": "UAVariable", "target_path": None,
+             "target_missing": True},
+        ]}}
+    monkeypatch.setattr(core, "_bridge_get_json", lambda c, q: (200, tree))
+    out = core.get_project_map(cfg, "P", path="UI/Lbl", ids=True)
+    lines = _inner(out["map"]).splitlines()
+    assert "  Source0 (UAVariable)  -> Model/ZzzLinkA  [ns=2;g=AAAA]" in lines
+    assert "  Source1 (UAVariable)  [DANGLING LINK: target missing]" in lines
+    assert out["diagnostics"] == [core._dangling_link_diag("UI/Lbl/Source1")]
+    assert out["diagnostics"][0]["code"] == "dangling_link"
+
+
+def test_map_without_dangling_links_has_no_diagnostics(cfg: core.Config, monkeypatch) -> None:
+    monkeypatch.setattr(core, "_bridge_get_json", lambda c, q: (200, TREE))
+    assert "diagnostics" not in core.get_project_map(cfg, "P")
+
+
+def test_describe_prefers_target_path_over_guid_and_flags_dangling(
+        cfg: core.Config, monkeypatch) -> None:
+    node = {"path": "UI/Lbl/Fmt", "properties": [
+        {"name": "Source0", "datatype": "NodeId", "value": "{NodeId:ns=2;g=AAAA}",
+         "target_path": "Model/ZzzLinkA"},
+        {"name": "Source1", "datatype": "NodeId", "value": "{NodeId:ns=2;g=BBBB}",
+         "target_path": None, "target_missing": True},
+        {"name": "Format", "datatype": "String", "value": "{0}"},
+    ]}
+    monkeypatch.setattr(core, "_require_bridge_for", lambda c, p: c)
+    monkeypatch.setattr(core, "_bridge_get_json", lambda c, q: (200, node))
+    out = core.describe_node(cfg, "P", "UI/Lbl/Fmt")
+    vals = {p["name"]: p["value"] for p in out["properties"]}
+    assert "Model/ZzzLinkA" in vals["Source0"] and "AAAA" not in vals["Source0"]
+    assert "g=BBBB" in vals["Source1"]            # GUID only as fallback
+    assert "{0}" in vals["Format"]
+    assert [d["path"] for d in out["diagnostics"]] == ["UI/Lbl/Fmt/Source1"]
+    assert out["diagnostics"][0]["code"] == "dangling_link"
+
+
+def test_map_and_describe_via_fake_bridge_http_prefer_target_path(
+        cfg: core.Config, monkeypatch) -> None:
+    """End-to-end through the JSON decode layer (fake `_bridge_http`): map and
+    describe print target_path instead of the GUID, and target_missing is
+    surfaced as a dangling_link diagnostic on both."""
+    import json
+
+    map_body = {"path": "UI/Lbl", "mode": "detail", "budget_left": 5, "map": {
+        "name": "Fmt", "type": "StringFormatter", "children": [
+            {"name": "Source0", "type": "UAVariable", "target_path": "Model/A"},
+            {"name": "Source1", "type": "UAVariable", "target_path": None,
+             "target_missing": True}]}}
+    node_body = {"path": "UI/Lbl/Fmt", "properties": [
+        {"name": "Source0", "datatype": "NodeId", "value": "{NodeId:ns=2;g=AAAA}",
+         "target_path": "Model/A"},
+        {"name": "Source1", "datatype": "NodeId", "value": "{NodeId:ns=2;g=BBBB}",
+         "target_path": None, "target_missing": True}]}
+
+    def fake_http(c, path, method="GET", timeout=5.0, **_kw):
+        body = map_body if "/bridge/map" in path else node_body
+        return 200, json.dumps(body).encode()
+
+    monkeypatch.setattr(core, "_bridge_http", fake_http)
+    monkeypatch.setattr(core, "_require_bridge_for", lambda c, p: c)
+
+    m = core.get_project_map(cfg, "P", path="UI/Lbl")
+    assert "Source0 (UAVariable)  -> Model/A" in _inner(m["map"])
+    assert [d["code"] for d in m["diagnostics"]] == ["dangling_link"]
+
+    d = core.describe_node(cfg, "P", "UI/Lbl/Fmt")
+    vals = {p["name"]: p["value"] for p in d["properties"]}
+    assert "Model/A" in vals["Source0"] and "AAAA" not in vals["Source0"]
+    assert [x["code"] for x in d["diagnostics"]] == ["dangling_link"]

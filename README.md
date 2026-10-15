@@ -25,12 +25,13 @@ the intelligence.
 ## Install (10 minutes)
 
 Requirements: Windows 11, FactoryTalk Optix Studio 1.7.x, and an MCP client
-like Claude Cowork. Also: **Google Chrome** (the CDP verify loop; skip with
+like Claude Cowork. Also: the **.NET SDK (8 or later)**, needed for
+`build_check` (without it `build_check` returns `no_dotnet`); **Google Chrome** (the CDP verify loop; skip with
 `setup.ps1 -NoCdp`) and — for the Claude Desktop **Microsoft Store build**
 connector path — **Node.js** (`winget install OpenJS.NodeJS.LTS`; the config
 uses `npx mcp-remote`). Setup auto-installs **Tesseract OCR** via winget for
 the zero-vision-token text tools (skip with `-NoOcr`; everything else works
-without it) and **Pillow** into the venv for pixel diffing.
+without it) and **Pillow** (a hard dependency) into the venv for pixel diffing.
 
 Run `setup.ps1` from a **regular PowerShell window** — not a shell hosted
 inside a packaged app like the Store build of Claude Desktop, whose
@@ -68,6 +69,57 @@ To remove an install (or reset before a clean reinstall):
 reaps any leftover CDP chrome; add `-All` to also delete state (issued
 tokens, chrome profile, persisted auth choice) and the venv.
 
+### pip / registry install
+
+`pip install ftx-mcp` installs the service and its dependencies (including
+Pillow, now a hard dependency; `ftx-mcp[visual]` is kept as an empty extra for
+older instructions). The wheel also carries the authoring skills
+(`skills/*/SKILL.md`), the Studio bridge source (`StudioMCPBridge.cs`) and the
+`/ui` dashboard, so the skill tools and `optix_bridge_arm` bridge sync work
+without a checkout; a checkout install keeps reading the repo's `skills/` and
+`studio-bridge/`.
+
+What you do **not** get from pip, and still do by hand (see
+[`docs/runbook.md`](docs/runbook.md)): Studio, Tesseract OCR, Chrome for the
+CDP loop, the scheduled tasks / service registration, auth setup and the
+BridgeTemplate refresh. `bootstrap\setup.ps1` from a checkout remains the
+supported Windows install.
+
+To get the bridge source for a project or template when you have no checkout,
+fetch it from the running service:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8765/bridge-source -OutFile StudioMCPBridge.cs
+```
+
+`GET /bridge-source` returns the shipped file as `text/plain` with an
+`X-Ftx-Mcp-Version` header.
+
+## Upgrading
+
+To upgrade a checkout install (e.g. 1.0.8 → 1.0.9), run these five steps, in order, from a regular PowerShell window in the checkout:
+
+1. `bootstrap\services.ps1 stop`
+2. `git pull` (or replace the checkout)
+3. `bootstrap\uninstall.ps1 -PurgeVenv`
+4. `bootstrap\setup.ps1`
+5. `bootstrap\services.ps1 start`
+
+Your state, secrets and logs live in `%LOCALAPPDATA%\ftx-mcp\` and survive
+the procedure (`-PurgeVenv` removes only the virtualenv).
+
+- **Existing projects:** the first `optix_bridge_arm` on each existing project
+  syncs its bridge source to the shipped version and leaves a backup of the
+  previous one under `ProjectFiles\.ftx-mcp-backups\`.
+- **BridgeTemplate:** refresh a registered BridgeTemplate with
+  the manual copy steps in `docs/runbook.md`. Projects made from an old
+  template are synced on their first arm.
+- **`pip install --upgrade` is not a supported route.** It does not upgrade a
+  checkout install: it can bump the pip-reported version while the service
+  keeps running the checkout's code. Use the five steps above.
+
+See also [`docs/release-notes-v1.0.9.md`](docs/release-notes-v1.0.9.md).
+
 ## Start the Studio Bridge (5 minutes)
 
 1. **One-time bridge setup** (per project): in the Studio project tree,
@@ -96,6 +148,8 @@ reports anything missing, with a plain-English fix for each item.
 In settings > connectors you can adjust the permissions for each of the tools
 
 ## Claude Code (5 minutes)
+
+ftx-mcp serves MCP over streamable-HTTP at `http://127.0.0.1:8766/mcp`.
 
 Requirements: MCP server healthy and claude accessible in cli
 
@@ -137,7 +191,7 @@ Create or open `.vscode/mcp.json` and add:
 - **Hand back to you to ship** when the preview looks right, you deploy
   from Studio as usual. This distribution only runs the emulator.
 
-The full tool list (35 tools by default — gate env vars can add more — plus
+The full tool list (36 tools by default — gate env vars can add more — plus
 the same surface over plain HTTP for scripts and CI) is in
 [docs/tool-reference.md](docs/tool-reference.md).
 **Token economy:** screenshots cost ~1-2k vision tokens each; the OCR modes
@@ -161,8 +215,8 @@ them with zero setup. (In Claude Code they also load natively as
   can auto-approve reads and gate writes.
 - **Write gates, not hope.** Undeclared properties, array writes, duplicate
   names, and unsafe re-parents are refused with typed errors; composite
-  operations roll back on failure. File-level edits are refused while Studio
-  has the project open.
+  operations roll back on failure. Project file reads (`optix_read_file`) are refused while Studio
+  has the project open; live-model reads and writes go through the bridge.
 - **Audited.** Every model mutation appends a JSON line to a local audit
   trail (`%LOCALAPPDATA%\ftx-mcp\logs\audit.jsonl`) what, when,
   outcome.

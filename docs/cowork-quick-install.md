@@ -30,6 +30,9 @@ Claude Desktop / Cowork. If anything fails along the way,
    involved on a default install — auth is off on loopback; the script only
    issues and embeds one if you've enabled `FTX_AUTH_REQUIRED`.
 
+   The service itself speaks MCP over streamable-HTTP at
+   `http://127.0.0.1:8766/mcp`.
+
 3. **Restart Claude Desktop.**
 
 4. **Verify:** Settings → **Developer → Local MCP servers** should show

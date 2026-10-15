@@ -77,7 +77,7 @@ def test_bridge_set_property_endpoint(cfg, projects_root, monkeypatch):
 def test_bridge_bind_endpoint(cfg, projects_root, monkeypatch):
     make_project(projects_root, "Alpha")
     monkeypatch.setattr(core, "bridge_bind_property",
-                        lambda c, p, np, n, src, mode="Read", raw=None: {"ok": True, "via": "dynamiclink", "mode": mode})
+                        lambda c, p, np, n, src, mode="Read", raw=None, dry_run=False: {"ok": True, "via": "dynamiclink", "mode": mode})
     r = _client(cfg).post("/projects/Alpha/bridge/bind",
                           json={"node_path": "UI/MainWindow/L1", "name": "Text",
                                 "source_path": "Model/V1", "mode": "ReadWrite"})

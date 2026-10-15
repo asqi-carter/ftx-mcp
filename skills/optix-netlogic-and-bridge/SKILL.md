@@ -19,7 +19,10 @@ So the whole recipe is:
 1. Write the class into the project's `ProjectFiles/NetSolution/` with the normal
    file tools: `public class MyLogic : BaseNetLogic { public override void Start() {...} }`.
 2. `optix_bridge_create_netlogic(parent="<path>", name="MyLogic")` — `name` MUST
-   equal the class name exactly. This mints a real `NetLogicObject` node.
+   equal the class name exactly. This mints a real `NetLogicObject` node. Without
+   `FTXMCP_BRIDGE_PRIMITIVES` use the batch op instead:
+   `optix_bridge_edit(ops=[{"op": "create_netlogic", "parent": "<path>", "name": "MyLogic"}])`
+   (same implementation and result).
 3. `optix_emulator(action="restart")` — the rebuild instantiates it; `Start()` runs.
 
 **Placement matters.** A runtime NetLogic that reads sibling nodes through `Owner`
@@ -27,11 +30,101 @@ must be created UNDER the object that owns them (pass that object as `parent`,
 e.g. a screen). A self-contained one can live under any loaded container; a
 NetLogic category folder runs at app start.
 
+**`create_netlogic` waits for Studio's template write (`netlogic_template`).** Studio writes a default
+`Method1` template to `ProjectFiles/NetSolution/<Class>.cs` shortly after the node is created. The
+create returns only once that file exists, is non-empty and unchanged for a settle window (max 15 s),
+and the result carries `netlogic_template: {file, ready, waited_seconds[, reason]}`. If the wait times
+out the result has `ready: false` and a `netlogic_template_write_pending` warning (also on the
+`optix_bridge_edit` batch surface): the file is NOT ready - do not write your `.cs` yet; re-read it
+(`optix_read_netlogic`) until it stops changing, otherwise a late Studio write can overwrite your content.
+
+**A slow first create is not a failure (`verified_after_timeout`).** When the class
+is not compiled yet, Studio compiles during the create and it can take well over 8 s.
+The service waits up to 90 s and NEVER re-sends the create after it was sent (a re-send
+only yields `name_exists`). If the bridge still times out or drops the response, it looks
+the node up; if it exists the result is `ok: true` with `verified_after_timeout: true` and
+a `create_netlogic_timeout_verified` warning. A `name_exists` from the single create is a
+real duplicate. If the node cannot be confirmed the original error is returned: check the
+model (`optix_describe_node`) before trying again, do not blind-retry.
+
+**Deleting a NetLogic never destroys your C# (`netlogic_source`).** Studio drops
+`ProjectFiles/NetSolution/<Class>.cs` when the LAST node bound to the class is deleted
+(it is not in the Recycle Bin), and a later `create_netlogic` of that name regenerates a
+default `Method1` template over it. The service snapshots the file around `delete` (also
+inside an `optix_bridge_edit` batch) and `create_netlogic` and restores it. The result
+then carries `netlogic_source` (`file`, `class`, `preserved`, `backup`) and a
+`netlogic_source_preserved` warning (batch: top-level `warnings` with `op_index`). The
+`.cs` stays on disk as an unused class - delete the file by hand if you want it gone; a
+later `create_netlogic` with that name binds to the preserved class. A
+`netlogic_source_restore_failed` warning means the file still differed after bounded
+restore attempts (the service waits for Studio's write-back to settle, restores via temp
+file + `os.replace`, and re-verifies after a second stability window); the copy is at the
+`backup` path (`ProjectFiles/.ftx-mcp-backups/<Class>.<ts>.cs.bak`).
+A class still used by other nodes keeps its file and nothing is reported.
+
+**The restore is backup-first and guarded after the call returns.** The `.cs` bytes are copied to
+`ProjectFiles/.ftx-mcp-backups/<Class>.<ts>.cs.bak` BEFORE the delete is sent and the copy is removed
+once the restored file is verified byte-for-byte (an untouched file leaves no backup). If Studio keeps
+rewriting the file past the stability window the result says `preserved: false` with a
+`netlogic_source_restore_failed` warning that names the backup - recover from that copy.
+For 60 s after a restore, the NEXT bridge/NetLogic call for the same project re-checks the file; if
+Studio rewrote or deleted it late, it is restored again and that call's result carries a
+`netlogic_source_restored_late` warning (`file`, `class`, `drifted_copy`). The rewritten bytes are
+first saved as `<Class>.<ts>.drifted.cs.bak`, so a deliberate edit of yours is never lost. Treat
+`netlogic_source_restored_late` as "your source is back, check it"; do not re-run the delete.
+
+**The late guard only undoes corruption, never your edit.** It restores the snapshot only when the file
+has NUL bytes or is the snapshot plus an appended tail. Any other difference (a complete, valid C# file
+you wrote yourself) is treated as a deliberate edit and left alone, with no restore and no `.drifted`
+copy. A deliberate change of that class's source (`create_netlogic` with the same name, a NetLogic
+source write/edit, `delete_node`, project close/open) clears the guard for that file first.
+
+**`create_netlogic X` when `X.cs` already exists** (a leftover kept by an earlier delete): the existing
+file is copied to `ProjectFiles/.ftx-mcp-backups/` before create runs. If its content changed during
+create, the result carries a `netlogic_source_existed` warning with the `backup` path; create never
+silently replaces an existing `.cs`. Recover your earlier source from that backup, or use a fresh
+class name.
+
+**Delete after you edited the class is safe too, and a slow delete is not a failure.**
+Deleting a NetLogic whose `.cs` you changed makes Studio recompile, which can take longer
+than the 8 s default. `delete` (`optix_bridge_delete_node`, and the `delete` op in an
+`optix_bridge_edit` batch) waits up to 90 s and does not blindly re-send. After a timeout it
+checks the model: node gone -> `ok` with `verified_after_timeout: true` and a
+`delete_node_timeout_verified` warning (never `node_not_found` / `write_failed` for a delete
+that happened); node still there -> one re-send. The source snapshot is restored even when the
+call errors (`netlogic_source` on the error). Do not retry a delete by hand after a timeout;
+check `optix_describe_node` first.
+
 There is NO Studio "New -> NetLogic" menu step required. (This was long believed
 to be a wall; it is not — the wall was creating a plain `BaseObjectType` named
 like a class, which never binds.)
 
-### `[ExportMethod]`s need a Studio REOPEN before anything can call them
+### Design-time NetLogic: `kind="design_time"` (reopen may be required)
+
+`optix_bridge_create_netlogic(parent, name, kind="design_time")` also mints the
+`BehaviourStartPriority` child with VariableType `BehaviourStartPriorityVariableType`
+(Value 180). That is what makes Studio treat the node as a design-time NetLogic, so its
+`[ExportMethod]`s become `UAMethod` children once Studio loads them. **`optix_save`
+alone does not guarantee that and there is no refresh trigger: reopen the project
+if the children are missing.** Until then `optix_execute_method` returns
+`export_method_not_loaded` (with a reopen nudge), not `menu_item_not_found`.
+Instantiating bridge writes (`create_netlogic`, `create_object`, `convert_to_type` replace, `move_node`
+copy, `invoke_method`) run under `Sessions.ImpersonateRootTemporary()`; without that session Optix
+kills Studio (c0000374) when the class is already compiled in the NetSolution (#27). A live test
+class must not `using FTOptix.Core.Log;` (Log lives in `UAManagedCore`), and
+`execute_design_method` takes the NetLogic NAME, not a path.
+`dry_run=True` reports the plan; an unknown `kind` returns `invalid_kind` (allowed:
+`runtime`, `design_time`) and writes nothing. Sequence: author the `.cs` →
+`create_netlogic(kind="design_time")` → `optix_build_check` → `optix_save` →
+`optix_describe_node` to confirm the method children → wire / execute.
+Right after the create, Studio rebuilds the user .NET solution (about 30 s; the create result
+carries `netsolution_build: {state: "building", note}`) and drops Ctrl+S meanwhile.
+`optix_save` therefore re-sends Ctrl+S every 5 s until the write lands (the second keystroke
+clicks the project tree first, `method: "tree_focus_ctrl_s"`; Studio 1.8 has no File menu) and
+keeps polling 15 s after the last keystroke. It reports `keystrokes_sent` and `write_latency_s`;
+on `saved: false` check `optix_studio_log(contains="solution")` and retry.
+
+### Runtime-kind NetLogic: `[ExportMethod]`s need a Studio REOPEN before anything can call them
 
 A bridge-created NetLogic node starts with **no method children**. The class
 compiles, `Start()`/`Stop()` run fine, but the `[ExportMethod]`s do not exist as
@@ -51,6 +144,10 @@ source if the class already exists →) author the `.cs` → `create_netlogic` �
 `optix_describe_node` that the method children now exist → THEN wire buttons to
 them. Measured 2026-09-01: 15 `[ExportMethod]`s went from zero children to all
 15 `UAMethod` nodes across one reopen, with no other change.
+
+`optix_describe_node` on a Variable (e.g. `Model/X`, or a NetLogic's `BehaviourStartPriority`) returns its own
+`datatype` and `value` (the value inside the `<untrusted>` envelope), plus `target_path` for a link
+(`target_missing` when dangling); its `properties` list stays empty.
 
 Verify with `describe_node`, not by assuming — and note this failure is silent
 everywhere except the runtime log (see `optix-verify-loop`).
@@ -86,6 +183,13 @@ emulator down with it — build_check turns that into an instant file:line repor
 It works whether or not Studio is open (it reads the `.cs` on disk).
 `optix_read_netlogic` offers the same offline-read reach — it retrieves a
 class's source by name without needing the bridge.
+
+**Bridge source (`studio-bridge/StudioMCPBridge.cs`): the bench `build_check` is the
+ONLY compile gate.** The executor sandbox has no dotnet, so unit tests cannot prove the
+bridge compiles; only `ci/w11-validate.sh <sha>` (its `build_check` gate) does. Every PRD
+touching `studio-bridge/` must name the SDK members it uses; never call an SDK member
+that is not listed there or already used in the bridge (e.g. there is no `ModellingRule`
+type - `IUANode.ModellingRule` is a `NamingRuleType` - and no `RemoveTranslation`).
 
 **`CS0104: 'X' is an ambiguous reference` after adding a comm driver.** Studio
 injects `using FTOptix.RAEtherNetIP;` (and `FTOptix.CommunicationDriver`) into
@@ -146,6 +250,31 @@ ANY design-time method by hand (see below).
   StartBridge. (Editing OTHER NetLogics is fine — only changes to the bridge's own
   code need the reopen; a normal generator/screen NetLogic edit does not.)
 
+### `optix_bridge_arm` syncs the shipped bridge source (`bridge_source`)
+
+`arm` always runs the bridge this service ships, not whatever copy the project holds. It
+compares the project's `ProjectFiles/NetSolution/StudioMCPBridge.cs` with
+`studio-bridge/StudioMCPBridge.cs` by a normalized content hash (BOM, CRLF/CR and trailing
+spaces/tabs ignored) and reports the verdict as **`bridge_source`**:
+
+| `bridge_source` | Meaning |
+|---|---|
+| `current` | Hashes match; nothing written. |
+| `synced` | Hashes differed. The project file was backed up to `ProjectFiles/.ftx-mcp-backups/StudioMCPBridge.<ts>.cs.bak` (`bridge_backup`), the shipped copy was written, and arming proceeded (StartBridge rebuilds from disk). |
+| `stale` | Hashes differ and nothing was synced: `arm` with `FTX_BRIDGE_SYNC=0` (the result carries a `warning`), or `optix_bridge_status` / health reporting that the project copy is out of date (re-arm to sync). |
+| `unknown` | The comparison could not be made (no/unreadable file, project dir not found, or nothing armed). |
+
+`bridge_project_hash` / `bridge_shipped_hash` (12 hex chars) accompany the verdict. A project with
+no `StudioMCPBridge.cs` still fails with `bridge_netlogic_absent`; `stop` never syncs.
+
+- **`FTX_BRIDGE_SYNC=0`** (service environment) turns the sync off: `arm` leaves the project
+  file alone and reports `stale` with a warning. Use it only to deliberately run a hand-edited bridge.
+- `optix_bridge_status` returns `bridge_source` per bridge entry and as a top-level aggregate
+  (any `stale` wins, then `unknown`, else `current`); health reports the same aggregate.
+- A synced bridge is new bridge code: see the REOPEN note above if Studio already has the old one loaded.
+- For the Studio project **template**, follow the manual copy steps in `docs/runbook.md`; projects
+  made from an old template are synced on their first arm.
+
 ## Running design-time [ExportMethod]s (generators, card builders)
 
 Design-time methods (a generator's `BuildFromDatabase`, a card builder's
@@ -157,14 +286,57 @@ It is off the UI thread and **crashes Studio** (observed: the whole process
 died). A safe programmatic path requires main-thread marshaling in the bridge,
 which is not shipped — until it is, use the Studio UI for these.
 
-## Multi-project note
+## Gotchas when authoring NetLogic and generators
 
-The bridge binds a single fixed port (8768, exclusive). With two projects open in
-two Studio instances, only ONE bridge can hold the port — the other's StartBridge
-fails to bind. `optix_bridge_status` reports which project the live bridge serves;
-`project=` on the tools does not re-route bridge calls to a different Studio (a
-mismatch surfaces as a wrong-project failure, not a silent write into the wrong
-project).
+- **`GetVariable(name)` is null for an uninstantiated optional property.** An optional
+  property that was never instantiated has no variable node, so
+  `node.GetVariable("Visible")` returns `null` and a `.Value` access throws a
+  `NullReferenceException`. Use the typed accessors instead, which create/return the
+  property: `VisibleVariable`, `TextVariable`, etc. (e.g. `label.VisibleVariable.Value`,
+  `label.TextVariable`). Null-check any remaining `GetVariable` result.
+- **An RAEtherNet tag is polled only while a widget binds it.** The driver reads a tag
+  only while something on screen is bound to it. A tag used solely by a NetLogic (no
+  widget binding) is never polled and its value goes stale. For NetLogic-only tags add a
+  `RemoteVariableSynchronizer` (in the NetLogic or on the model) that lists the tags to
+  keep them polled.
+- **`wire_event` output does not survive a wipe-and-rebuild generator.** A generator that
+  deletes and recreates the screen/nodes (wipe-and-rebuild) discards any EventHandlers
+  added earlier with `wire_event`. Author the EventHandlers in C# inside the generator
+  so they are recreated on each rebuild, and use `wire_event` only for nodes that persist.
+
+## Multi-project note (one bridge per Studio, identified by project)
+
+Since 1.0.9 each running Studio has exactly ONE bridge, and the bridge says which
+Studio it is. `/bridge/health` (and the registry file) return `studio_pid`,
+`project_name` and `project_dir` next to the older fields. Arming a Studio that
+already has a live bridge is idempotent: `StartBridge` returns that bridge instead
+of binding a second port, and the service's `already_armed` is only ever reported
+for the bridge whose health names that Studio pid (never another Studio's).
+
+Every bridge-calling tool resolves its bridge through one function,
+`resolve_bridge(cfg, project)`, keyed by identity — never by port order or
+first-found. It matches the project by name (case/separators normalised, `X` =
+`X/HMI`) or by directory (a directory match decides first).
+
+**`project_path` semantics.** `project_path` in `/bridge/health` and the registry is the folder
+that contains `<project>.optix` (a `.optix` file path is also accepted). It is never Studio's working
+directory (`C:\Windows\System32` is reported as unknown) and, since 1.0.9, never the `ProjectFiles`
+subfolder: the bridge reports the parent when it holds exactly one `.optix`. The service applies the same
+rule to an older bridge's `ProjectFiles` path, and refuses to guess when the parent holds several
+`.optix` files. Prefer `project_dir` / `project_name` to identify a bridge.
+
+The registry file is written as UTF-8 WITHOUT a BOM (`new UTF8Encoding(false)`), and the service
+reads it with `utf-8-sig`, so an entry with a BOM from an older bridge is still listed (#28; before,
+it was silently skipped and the candidate list came back empty).
+
+- **No bridge names the project** -> `no_bridge_for_project`, listing every bridge
+  found with its port, project, directory and Studio pid. Fix: arm that project's
+  Studio (`optix_bridge_arm`) or pass the right `project=`. File-based fallbacks
+  still work, since it is a `BridgeUnavailable`.
+- **More than one bridge names it** -> `ambiguous_bridge_for_project` (HTTP 409).
+- With several bridges armed, `optix_bridge_status` / `/ui` no longer single out
+  the lowest port at the top level; read the `bridges` list.
+- Pass `project=` on every call when more than one Studio is open.
 
 ## Restarting the MCP service (loading new tools/code)
 
@@ -177,6 +349,10 @@ running client keeps the old tool list.
   `.\bootstrap\services.ps1 start` (`status` reports task state + the health
   probe). This bounces both `ftx-mcp` (the MCP/HTTP server) and
   `ftx-mcp-chrome-cdp` (the CDP task).
+- Autostart is opt-in: `.\bootstrap\services.ps1 enable-autostart` adds an at-logon trigger to the
+  `ftx-mcp` service task **only** (never Studio, the emulator or the CDP task);
+  `disable-autostart` returns to manual start. Guarded by
+  `service/tests/test_services_autostart.py`.
 - A restart **drops the current MCP connection**; the client reconnects and
   re-lists tools. Verify with the dashboard health at `http://127.0.0.1:8765/health`
   and that `:8766` is listening.
@@ -199,3 +375,11 @@ preview -> `optix_observe(mode="screenshot")` verify. When you are ready to ship
 Promotion between environments (dev -> prod) is a per-screen manual step tracked
 outside the MCP — check each screen's NetLogic config source and any hardcoded
 host/path before promoting.
+
+## Live test runs: `session_0_no_desktop`
+
+GUI-touching live tests (anything that calls `core.save` / `core.restart_emulator`, which need Studio's
+window) SKIP with reason `session_0_no_desktop` when the pytest process has no input desktop (session 0,
+a service, or an SSH shell). A skip is not a pass: run the live suite in the interactive session
+(`ci/w11-validate.sh <sha>` does, via an Interactive scheduled task) and check `live_<sha>.log` for
+`session_0_no_desktop` skips. `FTX_LIVE_SESSION=0|1` overrides detection. See `ci/README.md`.

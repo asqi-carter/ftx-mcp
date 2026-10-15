@@ -131,6 +131,7 @@ def test_emulator_status_unset_probes_loopback(cfg: core.Config, monkeypatch) ->
 
     monkeypatch.setattr(core, "_tcp_probe", fake_probe)
     monkeypatch.setattr(core, "_emulator_pids", lambda: [1234])
+    monkeypatch.setattr(core, "_port_listener_pids", lambda port: [1234])
     st = core.emulator_status(cfg)
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == cfg.runtime_test_port

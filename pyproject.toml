@@ -1,6 +1,6 @@
 [project]
 name = "ftx-mcp"
-version = "1.0.8"
+dynamic = ["version"]
 description = "MCP server for authoring, previewing, and verifying FactoryTalk Optix Studio changes via the emulator, single Windows box."
 readme = "README.md"
 license = "MIT"
@@ -30,6 +30,10 @@ dependencies = [
     "anyio>=4",
     "psutil>=5.9",
     "websocket-client>=1.7",
+    # Pixel diff (optix_cdp_diff) and native-engine screenshots
+    # (optix_observe target="native") need it; a pip install must work out of
+    # the box, so it is a hard dependency (imports stay lazy in the code).
+    "Pillow>=10",
     # Offline structural validator (service/optix_validate.py, U17) safe_loads
     # the Nodes/**/*.yaml source tree; Linux/CI-buildable, no Studio required.
     "pyyaml>=6",
@@ -48,9 +52,9 @@ dev = [
     "mypy>=1.10",
     "httpx>=0.27",
 ]
-visual = [
-    "Pillow>=10",
-]
+# Kept empty for compatibility: Pillow moved into [project.dependencies], so
+# `pip install ftx-mcp[visual]` (older docs, bootstrap scripts) still resolves.
+visual = []
 
 [project.scripts]
 ftx-mcp = "service.main:main"
@@ -67,6 +71,15 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["service"]
+
+[tool.setuptools.package-data]
+# static/ = the /ui dashboard; _bundled/ is filled at build time by setup.py
+# (skills + bridge source) and is absent from the checkout.
+service = ["static/*", "_bundled/**/*"]
+
+[tool.setuptools.dynamic]
+# Single source of truth for the service version: service/__init__.py.
+version = { attr = "service.__version__" }
 
 [tool.ruff]
 line-length = 100
@@ -95,3 +108,9 @@ ignore_missing_imports = true  # mcp / asyncua may lack stubs
 testpaths = ["service/tests"]
 addopts = "-ra"
 asyncio_mode = "strict"
+markers = [
+    "live: tests that drive a real Studio / bridge; the unit-suite NetLogic template-wait speed-up (conftest) is not applied",
+    "real_project_resolution: run/restart/status tests that need the real project_not_found refusal (the conftest default resolves any name)",
+    "real_studio_attribution: run_emulator tests that exercise the real Studio-to-project attribution instead of the pinned fake pid",
+    "slow_live: slow live-bridge tests (NetLogic race / re-create, 57-81 s each); excluded from the default live run with -m \"not slow_live\", run separately with -m slow_live",
+]

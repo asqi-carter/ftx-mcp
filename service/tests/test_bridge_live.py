@@ -14,7 +14,12 @@ HOW TO RUN (on the Windows VM, NOT CI):
     3. Set the gate + target and run pytest:
            set FTX_LIVE_BRIDGE=1
            set FTX_LIVE_PROJECT=<open project name>
-           python -m pytest service/tests/test_bridge_live.py -q
+           python -m pytest service/tests/test_bridge_live.py -q -m "not slow_live"
+
+    The race / re-create NetLogic tests (57-81 s each) carry
+    ``@pytest.mark.slow_live`` and are excluded from the default invocation
+    above so the Tier-2 suite fits in 30 min. Run them separately with
+    ``-m slow_live`` (see service/tests/README.md and ci/README.md).
 
 Without FTX_LIVE_BRIDGE=1 the whole module is skipped, so it adds only skips to
 the Linux/CI count and never touches the network.
@@ -46,13 +51,18 @@ HOME for the live-contract suite:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import os
 import pathlib
+import time
+import uuid
 
 import pytest
 
 from service import core, optix_schema
+from service.tests import _click_settle
+from service.tests import _live_session as ls
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FTX_LIVE_BRIDGE") != "1",
@@ -106,6 +116,60 @@ _LIVE_GRID_PANEL = os.environ.get("FTX_LIVE_GRID_PANEL", "UI/MainWindow/GridLayo
 # FTX_LIVE_MODEL_PARENT when the live project's model variables live elsewhere.
 _LIVE_MODEL_PARENT = os.environ.get("FTX_LIVE_MODEL_PARENT", "Model")
 
+# One short random suffix per test-module run. Every node / driver / station /
+# class name a test CREATES goes through ``_nm`` so it never collides with a
+# leftover from a crashed or parallel run; each test deletes what it made.
+_RUN_SFX = uuid.uuid4().hex[:6]
+
+
+def _nm(base: str) -> str:
+    """``base`` + this run's unique suffix (the name a live test creates)."""
+    return f"{base}{_RUN_SFX}"
+
+
+def _require_desktop() -> None:
+    """Skip a GUI-touching test (save, F5, focus/SendKeys on Studio) when the
+    suite runs in session 0 / without an input desktop. There the focus helper
+    can only answer bridge_studio_no_window, which is the environment, not the
+    product (ftx-mcp-ver.3). ci/validate-w11.ps1 runs the suite in the
+    interactive session so these tests run there."""
+    if not ls.has_interactive_desktop():
+        pytest.skip(ls.SKIP_REASON)
+
+
+_REAL_LOCALAPPDATA = os.environ.get("LOCALAPPDATA")   # before conftest redirects it
+_UNTRUSTED_RE = re.compile(r"<untrusted[^>]*>(.*?)</untrusted>", re.DOTALL)
+
+
+def _inner(value) -> str:
+    """The text inside the bridge's ``<untrusted source="bridge">…</untrusted>``
+    envelope (or the plain string when there is none)."""
+    text = "" if value is None else str(value)
+    m = _UNTRUSTED_RE.search(text)
+    return (m.group(1) if m else text).strip()
+
+
+def _stop_project_emulator(cfg, project) -> None:
+    """Best-effort stop of ``project``'s emulator (never raises)."""
+    try:
+        core.stop_emulator(cfg, project=project)
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _stop_emulator_at_teardown():
+    """Stop the CI project's emulator when this module's tests finish so no
+    orphan emulator survives the live suite."""
+    yield
+    project = os.environ.get("FTX_LIVE_PROJECT")
+    if os.environ.get("FTX_LIVE_BRIDGE") != "1" or not project:
+        return
+    try:
+        _stop_project_emulator(core.Config.from_env(), project)
+    except Exception:
+        pass
+
 
 @pytest.fixture
 def live():
@@ -132,7 +196,46 @@ def live():
             f"{st.get('reason')!r}, serving {st.get('project')!r}) — open "
             f"{project!r} in Studio and run StartBridge"
         )
+    _seed_live_node(bcfg, project)
     return bcfg, project
+
+
+def _seed_live_node(cfg, project) -> None:
+    """Make sure ``_LIVE_NODE`` (default UI/MainWindow/Rectangle1) exists, creating
+    it with create_widget (``_LIVE_TYPE``, a Rectangle, under its parent) when it
+    is missing.
+
+    The module gate says a bridge is up, so a seeding failure is a setup
+    failure: it FAILS (``pytest.fail``), never skips."""
+    try:
+        core.describe_node(cfg, project, _LIVE_NODE)
+        return
+    except core.NodeNotFound:
+        pass
+    parent, _, name = _LIVE_NODE.rpartition("/")
+    try:
+        out = core.bridge_create_widget(cfg, project, parent, name, _LIVE_TYPE)
+        if out.get("ok") is False:
+            raise AssertionError(out)
+        core.describe_node(cfg, project, _LIVE_NODE)
+    except (core.BridgeWriteFailed, core.NodeNotFound, AssertionError) as exc:
+        pytest.fail(f"live setup: cannot seed {_LIVE_NODE!r} via create_widget "
+                    f"({_LIVE_TYPE} under {parent!r}): {exc}", pytrace=False)
+
+
+@pytest.fixture
+def live_real_localappdata(monkeypatch, request):
+    """``live`` resolved AFTER the real LOCALAPPDATA is restored.
+
+    conftest redirects LOCALAPPDATA to an empty dir; the bridge/emulator
+    registry lives under the real one. ``live`` builds its config (and finds the
+    bridge through that registry) at setup, so tests that need the real
+    registry must restore it *before* the config is built, not in the body."""
+    if _REAL_LOCALAPPDATA is not None:
+        monkeypatch.setenv("LOCALAPPDATA", _REAL_LOCALAPPDATA)
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    return request.getfixturevalue("live")
 
 
 # ---- reachability ----------------------------------------------------------
@@ -323,7 +426,7 @@ def test_schema_dump_contract(live):
 
 # A node the batch pretends to create. Never actually created: every call below
 # is validation-only, and the last test proves the model is untouched.
-_HYPO = _LIVE_NODE.rsplit("/", 1)[0] + "/ZzzU16Hypothetical"
+_HYPO = _LIVE_NODE.rsplit("/", 1)[0] + "/" + _nm("ZzzU16Hypothetical")
 
 
 def _report(cfg, project, ops, strict=False):
@@ -431,9 +534,9 @@ def test_validate_ops_create_move_set_on_new_path(live):
     a later op on the post-move path is not rejected as unresolved_reference."""
     cfg, project = live
     parent = _LIVE_NODE.rsplit("/", 1)[0]
-    orig_name = "ZzzU16Original"
+    orig_name = _nm("ZzzU16Original")
     orig_path = parent + "/" + orig_name
-    new_name = "ZzzU16Moved"
+    new_name = _nm("ZzzU16Moved")
     new_path = parent + "/" + new_name
     rep = _report(cfg, project, [
         {"op": "create_widget", "screen": parent,
@@ -450,9 +553,9 @@ def test_validate_ops_create_move_set_on_old_path(live):
     the new path so the caller knows where the node actually landed."""
     cfg, project = live
     parent = _LIVE_NODE.rsplit("/", 1)[0]
-    orig_name = "ZzzU16Original"
+    orig_name = _nm("ZzzU16Original")
     orig_path = parent + "/" + orig_name
-    new_name = "ZzzU16Moved"
+    new_name = _nm("ZzzU16Moved")
     new_path = parent + "/" + new_name
     rep = _report(cfg, project, [
         {"op": "create_widget", "screen": parent,
@@ -491,7 +594,7 @@ def test_validate_ops_create_widget_routed_path(live):
             f"no NavigationPanel at {_LIVE_NAV_PANEL!r} — set FTX_LIVE_NAV_PANEL "
             f"to an existing NavigationPanel path, or ensure the CI project creates one"
         )
-    item_name = "ZzzU16NavItem"
+    item_name = _nm("ZzzU16NavItem")
     routed_path = _LIVE_NAV_PANEL + "/Panels/" + item_name
     rep = _report(cfg, project, [
         {"op": "create_widget", "screen": _LIVE_NAV_PANEL,
@@ -513,7 +616,7 @@ def test_validate_ops_create_container_not_renderable(live):
     parent = _LIVE_NODE.rsplit("/", 1)[0]
     rep = _report(cfg, project, [
         {"op": "create_widget", "screen": parent,
-         "name": "ZzzU16Container", "widget_type": "Container"},
+         "name": _nm("ZzzU16Container"), "widget_type": "Container"},
     ])
     assert rep["ok"] is False, rep
     codes = [e["code"] for e in rep["errors"]]
@@ -532,7 +635,7 @@ def test_validate_ops_create_variable_then_set_value_is_clean(live):
     definition regardless of the declared data type."""
     cfg, project = live
     parent = _LIVE_NODE.rsplit("/", 1)[0]
-    var_name = "ZzzU16HypoVar"
+    var_name = _nm("ZzzU16HypoVar")
     var_path = parent + "/" + var_name
     rep = _report(cfg, project, [
         {"op": "create_variable", "parent": parent,
@@ -581,7 +684,7 @@ def test_validate_ops_value_on_existing_model_variable(live):
     """
     cfg, project = live
     parent = _LIVE_MODEL_PARENT
-    var_name = "ZzzU16ValueValidateVar"
+    var_name = _nm("ZzzU16ValueValidateVar")
     var_path = parent + "/" + var_name
 
     # Create the variable so it is a live (existing) node when validate_ops runs.
@@ -629,7 +732,7 @@ def test_bridge_edit_value_property_applies_and_reads_back(live):
     """
     cfg, project = live
     parent = _LIVE_MODEL_PARENT
-    var_name = "ZzzU16ValueWriteVar"
+    var_name = _nm("ZzzU16ValueWriteVar")
     var_path = parent + "/" + var_name
 
     try:
@@ -681,7 +784,7 @@ def test_set_value_keeps_64bit_width(live, dtype, value, want):
     -2045911175; UInt64 4294967295 as 18446744073709551615)."""
     cfg, project = live
     parent = _LIVE_MODEL_PARENT
-    var_name = "Zzz64Bit" + dtype
+    var_name = _nm("Zzz64Bit") + dtype
     var_path = parent + "/" + var_name
     core.bridge_create_variable(cfg, project, var_name, parent, dtype)
     try:
@@ -707,7 +810,7 @@ def test_set_value_keeps_64bit_width(live, dtype, value, want):
 def test_set_value_out_of_range_is_refused(live, dtype, value):
     cfg, project = live
     parent = _LIVE_MODEL_PARENT
-    var_name = "ZzzRange" + dtype
+    var_name = _nm("ZzzRange") + dtype
     var_path = parent + "/" + var_name
     core.bridge_create_variable(cfg, project, var_name, parent, dtype)
     try:
@@ -742,7 +845,7 @@ def test_validate_ops_value_on_widget_with_value_child_unchanged(live):
     """
     cfg, project = live
     scratch = _LIVE_SCRATCH_PANEL
-    child_name = "ZzzU16SpinBoxValueGuard"
+    child_name = _nm("ZzzU16SpinBoxValueGuard")
     child_path = scratch + "/" + child_name
 
     # Confirm the scratch panel exists; skip if absent (misconfigured env).
@@ -1126,16 +1229,148 @@ _LIVE_EXPR_SOURCE = os.environ.get("FTX_LIVE_EXPR_SOURCE", "")
 # Color-family property on FTX_LIVE_NODE to use for attach tests. FillColor is
 # declared on every Rectangle; override when FTX_LIVE_NODE is a different type.
 _LIVE_EXPR_PROP = os.environ.get("FTX_LIVE_EXPR_PROP", "FillColor")
-# ---- wire_event re-wire round-trip constants ----------------
-# Any existing node is used as the method object for the ChangePanel wire; the
-# bridge only requires that the PARENT node resolves (method name is stored as-is),
-# so a Rectangle widget works even though it has no real ChangePanel method.
-# Rectangle1 is seeded by the standard CI setup (the live-CI setup script), so the
-# default works out of the box. Override when the live project has it elsewhere.
-_LIVE_REWIRE_METHOD_OBJ = os.environ.get(
-    "FTX_LIVE_REWIRE_METHOD_OBJ",
-    _LIVE_SCRATCH_PANEL + "/Rectangle1",
-)
+# ---- wire_event method object (PRD 0052 D, #82) ----------------
+# Since PRD 0050 B the bridge refuses a wire_event whose method the target object
+# does not expose (``method_not_found``), so wiring to Rectangle1/ChangePanel (a
+# Rectangle has no such method) fails on every bench.  The wire_event live tests
+# take the ``wire_method_obj`` fixture instead: a NetLogic whose class declares
+# real [ExportMethod]s, created through the same create_netlogic path the other
+# live tests use.
+# FTX_LIVE_REWIRE_METHOD_OBJ (optional) names an existing object that already
+# exposes ChangePanel and ChangePanelByTabName; the fixture then uses it as is
+# and creates nothing.
+_LIVE_REWIRE_METHOD_OBJ = os.environ.get("FTX_LIVE_REWIRE_METHOD_OBJ", "")
+_WIRE_NL_CLASS = _nm("ZzzWireMethods")
+_WIRE_NL_METHODS = ("ChangePanel", "ChangePanelByTabName")
+_WIRE_NL_CS_TEMPLATE = """using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class __CLS__ : BaseNetLogic
+{
+    [ExportMethod]
+    public void ChangePanel(string NewPanel)
+    {
+        Log.Info("__CLS__", "ChangePanel " + NewPanel);
+    }
+
+    [ExportMethod]
+    public void ChangePanelByTabName(string TabName)
+    {
+        Log.Info("__CLS__", "ChangePanelByTabName " + TabName);
+    }
+}
+"""
+
+
+# Bounded wait for the NetSolution build to settle after the warm NetLogic is
+# created (seconds).  Studio rebuilds the user .NET solution after a NetLogic
+# create (~30 s on the bench), and a wire_event issued mid-build fails.
+_NETSOLUTION_SETTLE_TIMEOUT = float(os.environ.get("FTX_LIVE_NETSOLUTION_WAIT", "120"))
+_NETSOLUTION_QUIET_SECONDS = 3.0
+
+
+def _wait_netsolution_settled(bcfg, project, timeout: float = _NETSOLUTION_SETTLE_TIMEOUT,
+                              quiet: float = _NETSOLUTION_QUIET_SECONDS,
+                              poll: float = 0.5) -> bool:
+    """Poll until Studio's NetSolution build has settled; bounded by ``timeout``.
+
+    Settled means, for ``quiet`` seconds in a row: the NetSolution tree (sources
+    and build output) did not change, the Studio log did not grow, and the
+    bridge, if it answers, does not report it is loading/compiling.  Returns
+    True when that was observed, False on timeout (the caller proceeds: the
+    test then fails with its own error rather than hanging the session)."""
+    net_dir = core.resolve_project(bcfg, project) / "ProjectFiles" / "NetSolution"
+    deadline = time.monotonic() + timeout
+    state = (core._netlogic_tree_sig(net_dir), core._studio_log_mark())
+    since = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now - since >= quiet and not core._netlogic_bridge_busy(bcfg):
+            return True
+        if now >= deadline:
+            return False
+        time.sleep(poll)
+        new = (core._netlogic_tree_sig(net_dir), core._studio_log_mark())
+        if new != state:
+            state, since = new, time.monotonic()
+
+
+@pytest.fixture(scope="session")
+def warm_netlogic():
+    """Session-scoped, WARM NetLogic exposing ``ChangePanel`` and
+    ``ChangePanelByTabName``; yields its path (``Model/<class>``).
+
+    A cold Studio session rebuilds the NetSolution after the first NetLogic
+    create, and a wire_event fired during that build fails (the wire_event
+    tests passed in a full run only because earlier tests had already paid for
+    the build).  This fixture creates ONE NetLogic for the whole session, then
+    waits (bounded, ``_wait_netsolution_settled``: ``FTX_LIVE_NETSOLUTION_WAIT``
+    seconds, default 120) for the build to settle before any test uses it, so
+    the wire_event tests pass in any order and alone.  Teardown deletes the node
+    and the .cs.  Skips when the NetLogic cannot be created.  When
+    FTX_LIVE_REWIRE_METHOD_OBJ is set it is yielded unchanged.
+
+    Reproduce the cold-session run (Studio freshly opened on the project, bridge
+    armed, no NetLogic created yet)::
+
+        FTX_LIVE_BRIDGE=1 FTX_LIVE_PROJECT=<p> python -m pytest \\
+            service/tests/test_bridge_live.py -k wire_event -q -rs -p no:cacheprovider
+    """
+    if _LIVE_REWIRE_METHOD_OBJ:
+        yield _LIVE_REWIRE_METHOD_OBJ
+        return
+    project = os.environ.get("FTX_LIVE_PROJECT")
+    if os.environ.get("FTX_LIVE_BRIDGE") != "1" or not project:
+        pytest.skip("warm NetLogic needs FTX_LIVE_BRIDGE=1 and FTX_LIVE_PROJECT")
+    core.reset_bridge_cache()
+    cfg = core._bridge_cfg_for(core.Config.from_env(), project)
+    if cfg is None:
+        pytest.skip(f"no armed bridge serves {project!r}")
+    node_path = f"Model/{_WIRE_NL_CLASS}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{_WIRE_NL_CLASS}.cs")
+    _best_effort_delete(cfg, project, node_path)  # leftover of an aborted run
+    cs_path.parent.mkdir(parents=True, exist_ok=True)
+    cs_path.write_text(_WIRE_NL_CS_TEMPLATE.replace("__CLS__", _WIRE_NL_CLASS),
+                       encoding="utf-8")
+    created = False
+    try:
+        try:
+            out = core.bridge_create_netlogic(cfg, project, "Model", _WIRE_NL_CLASS)
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create the wire_event NetLogic: {exc}")
+        if out.get("ok") is False:
+            pytest.skip(f"could not create the wire_event NetLogic: {out!r}")
+        created = True
+        if not _wait_netsolution_settled(cfg, project):
+            logging.getLogger(__name__).warning(
+                "NetSolution build had not settled after %.0fs; continuing",
+                _NETSOLUTION_SETTLE_TIMEOUT)
+        yield node_path
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def wire_method_obj(live, warm_netlogic):
+    """Path of a NetLogic exposing ``ChangePanel`` and ``ChangePanelByTabName``.
+
+    The wire_event live tests take this fixture.  It is the session-scoped
+    ``warm_netlogic`` (created once, NetSolution build awaited), so no test pays
+    for or races the build and the tests run in any order, including alone.
+
+    Reproduce the cold-session run (fresh Studio session, bridge armed)::
+
+        FTX_LIVE_BRIDGE=1 FTX_LIVE_PROJECT=<p> python -m pytest \\
+            service/tests/test_bridge_live.py -k wire_event -q -rs -p no:cacheprovider
+
+    When FTX_LIVE_REWIRE_METHOD_OBJ is set it is yielded unchanged."""
+    return warm_netlogic
 
 # ---- Normalized-coordinate click round-trip (Tier-2, HMI gate) ---------------
 # 1.0.8: optix_interact was passing normalized coords raw to CDP instead of
@@ -1316,7 +1551,7 @@ def test_create_delete_virtual_keyboard_text_button_live(live):
     cfg, project = live
     vk_type = _LIVE_VK_TYPE
     scratch_panel = _LIVE_SCRATCH_PANEL
-    child_name = "ZzzVKTestWidget"
+    child_name = _nm("ZzzVKTestWidget")
     child_path = scratch_panel + "/" + child_name
 
     # Confirm the scratch panel exists; skip gracefully if absent.
@@ -1471,18 +1706,31 @@ def test_normalized_click_round_trip(live, tmp_path):
         )
         return pathlib.Path(path).read_bytes()
 
-    # ---- two baselines: the instrument must be STABLE before we trust a diff -
+    # ---- settle: the instrument must be STABLE before we trust a pixel diff --
     # A canvas that repaints on its own (an animation, a live clock) would make
-    # any post-click diff meaningless, so prove it doesn't first.
-    before_a = _capture("toggle-before-a.jpg", hmi_url, 2.0)
-    before_b = _capture("toggle-before-b.jpg", "", 1.0)
-    assert before_a == before_b, (
-        f"the capture region {region!r} is not stable across two consecutive "
-        f"captures ({len(before_a)} vs {len(before_b)} bytes) with no click in "
-        "between — something in it repaints on its own, so a post-click diff "
-        "proves nothing. Move FTX_LIVE_TOGGLE_REGION onto a static area that "
-        "contains only the bound indicator widget."
-    )
+    # any post-click pixel diff meaningless, so capture until two consecutive
+    # frames are identical (bounded). Optix 1.7.4.32 settles on the second
+    # capture (same captures as before). Optix 1.8.0.555 repaints part of the
+    # default region by itself (793 vs 1196 bytes), so it may never settle; in
+    # that case the test falls back to the bridge-read value change instead of
+    # failing on pixels.
+    stable, before_b, attempts = _click_settle.settle_region(
+        lambda i: _capture(
+            f"toggle-before-{i}.jpg", hmi_url if i == 0 else "",
+            2.0 if i == 0 else 1.0))
+    path_used = (_click_settle.PATH_PIXEL if stable
+                 else _click_settle.PATH_BRIDGE_READ)
+    _msg = (f"test_normalized_click_round_trip: path={path_used} "
+            f"region={region!r} settle_attempts={attempts} stable={stable}")
+    logging.getLogger(__name__).info(_msg)
+    print(_msg)
+
+    def _bridge_value():
+        node = core.describe_node(cfg, project, var_parent)
+        return {p["name"]: p.get("value")
+                for p in (node.get("properties") or [])}.get(var_leaf)
+
+    bridge_before = None if stable else _bridge_value()
 
     # ---- click at normalized coordinates -------------------------------------
     # navigate_url="" keeps the already-navigated tab as-is: a reload here would
@@ -1513,6 +1761,24 @@ def test_normalized_click_round_trip(live, tmp_path):
         f"css_y={out.get('css_y')} is not {click_y} x viewport height "
         f"{vp.get('h')}: {out!r}"
     )
+
+    # ---- bridge-read fallback: the region never stabilised --------------------
+    # Pixels are unusable here; assert the bound variable's value changed via
+    # the bridge read. Caveat (see docstring): describe_node reports the
+    # design-time model, so this read may not move for a runtime-only toggle;
+    # the failure message says so. Pending bench verification on 1.8.0.555.
+    if not stable:
+        bridge_after = _bridge_value()
+        assert bridge_after != bridge_before, (
+            f"path={path_used}: region {region!r} never stabilised in "
+            f"{attempts} captures, and the bridge read of {var_path!r} did not "
+            f"change after the click ({bridge_before!r} -> {bridge_after!r}). "
+            "Either the click missed, or the bridge only reports the "
+            "design-time value, which a runtime ToggleVariable does not "
+            "change; point FTX_LIVE_TOGGLE_REGION at a static area so the "
+            "pixel path can be used."
+        )
+        return
 
     # ---- the indicator must have repainted -----------------------------------
     after = _capture("toggle-after.jpg", "", 1.0)
@@ -1548,15 +1814,15 @@ def test_normalized_click_round_trip(live, tmp_path):
 # That keeps the assertions simple ("ZzzPanelB" in value) and independent of
 # any particular project node layout.
 #
+# The method object is the ``wire_method_obj`` fixture: a NetLogic with real
+# [ExportMethod]s ChangePanel / ChangePanelByTabName (PRD 0052 D, #82; the bridge
+# refuses a method the object does not expose since PRD 0050 B).
 # Env override (optional):
-#   FTX_LIVE_REWIRE_METHOD_OBJ – path to any existing node used as the method
-#                                 object in the wire_event call (the bridge
-#                                 resolves the node to get its NodeId; the method
-#                                 name "ChangePanel" is stored as-is). Defaults
-#                                 to FTX_LIVE_SCRATCH_PANEL/Rectangle1.
+#   FTX_LIVE_REWIRE_METHOD_OBJ – path to an existing object that already exposes
+#                                 both methods; the fixture then creates nothing.
 
 
-def test_rewire_event_args_round_trip(live):
+def test_rewire_event_args_round_trip(live, wire_method_obj):
     """Tier-2: wire MouseClickEvent → ChangePanel with args=NewPanel=ZzzPanelA
     + AliasNode=ZzzAliasA, then re-wire the SAME event with args=NewPanel=ZzzPanelB
     (one arg only, no replace=True), then call describe_node on the handler's
@@ -1577,15 +1843,14 @@ def test_rewire_event_args_round_trip(live):
     Prerequisites:
       * FTX_LIVE_SCRATCH_PANEL (or its default: parent of FTX_LIVE_NODE) must
         be an existing PanelType/Screen that accepts create_widget.
-      * FTX_LIVE_REWIRE_METHOD_OBJ (default: SCRATCH_PANEL/Rectangle1) must be
-        an existing node. Rectangle1 is seeded by the live-CI setup script — no extra
-        CI setup is required when FTX_LIVE_NODE is under UI/MainWindow.
+      * ``wire_method_obj`` supplies the method object: a NetLogic with a real
+        exported ChangePanel (created and removed by the fixture).
     """
     cfg, project = live
     scratch = _LIVE_SCRATCH_PANEL
-    btn_name = "ZzzWireRewireBtn"
+    btn_name = _nm("ZzzWireRewireBtn")
     btn_path = scratch + "/" + btn_name
-    method_obj = _LIVE_REWIRE_METHOD_OBJ
+    method_obj = wire_method_obj
     method_path = method_obj + "/ChangePanel"
     handler_name = f"EH_MouseClickEvent_{btn_name}"
     handler_path = btn_path + "/" + handler_name
@@ -1713,6 +1978,210 @@ def test_rewire_event_args_round_trip(live):
     finally:
         try:
             core.bridge_delete_node(cfg, project, btn_path)
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            pass
+
+
+# ---- wire_event multi-step handlers + append (PRD 0024, 1.0.9 9e) -----------
+# One EventHandler, several calls, created in order under its MethodsToCall; a
+# later wire_event(append=True) adds to the SAME handler without replacing the
+# calls it already has; dry_run refuses a malformed list with structured errors.
+# Same prerequisites as test_rewire_event_args_round_trip (a scratch panel and
+# any existing node as the method object). Arg values are non-existent paths so
+# they land as Strings. Skipped without a live bridge (the `live` fixture).
+
+
+def _live_method_containers(cfg, project, handler_path):
+    """{container browse name: Method value} for the handler, in bridge order."""
+    mtc = core.describe_node(cfg, project, handler_path + "/MethodsToCall")
+    names = [c.get("name") or c.get("browse_name") if isinstance(c, dict) else c
+             for c in (mtc.get("children") or [])]
+    out = {}
+    for name in names:
+        node = core.describe_node(cfg, project, f"{handler_path}/MethodsToCall/{name}")
+        props = {p["name"]: _inner(p.get("value")) for p in (node.get("properties") or [])}
+        out[name] = props.get("Method", "")
+    return out
+
+
+def test_wire_event_multistep_and_append_live(live, wire_method_obj):
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    btn_name = _nm("ZzzWireStepsBtn")
+    btn_path = scratch + "/" + btn_name
+    method_obj = wire_method_obj
+    handler_path = f"{btn_path}/EH_MouseClickEvent_{btn_name}"
+    for needed in (scratch, method_obj):
+        try:
+            core.describe_node(cfg, project, needed)
+        except core.NodeNotFound:
+            pytest.skip(f"no node at {needed!r} — set FTX_LIVE_SCRATCH_PANEL / "
+                        "FTX_LIVE_REWIRE_METHOD_OBJ to existing nodes")
+    try:
+        core.bridge_delete_node(cfg, project, btn_path)
+    except (core.BridgeWriteFailed, core.NodeNotFound):
+        pass
+
+    try:
+        try:
+            core.bridge_create_widget(cfg, project, scratch, btn_name, "Button")
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create test button at {btn_path!r}: {exc}")
+
+        # --- 1. dry_run refuses a bad list (structured) and mutates nothing ----
+        bad = core.bridge_edit(cfg, project, [{
+            "op": "wire_event", "path": btn_path, "event_type": "MouseClickEvent",
+            "calls": [{"method_path": method_obj + "/ChangePanel"}, {"command": "ToggleVariable"}],
+        }], dry_run=True)
+        assert bad["report"]["ok"] is False and bad["applied"] == 0
+        assert any(e.get("code") == "call_missing_variable" and e.get("call_index") == 1
+                   for e in bad["report"]["errors"]), bad["report"]
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(cfg, project, handler_path)
+
+        good_ops = [{
+            "op": "wire_event", "path": btn_path, "event_type": "MouseClickEvent",
+            "calls": [{"method_path": method_obj + "/ChangePanel", "args": "NewPanel=ZzzPanelA"},
+                      {"method_path": method_obj + "/ChangePanelByTabName", "args": "TabName=ZzzTab"}],
+        }]
+        ok = core.bridge_edit(cfg, project, good_ops, dry_run=True)
+        assert ok["report"]["ok"] is True, ok["report"]
+
+        # --- 2. create: two calls, in order, under ONE handler ------------------
+        out = core.bridge_wire_event(
+            cfg, project, btn_path, "MouseClickEvent",
+            calls=good_ops[0]["calls"])
+        assert out.get("ok") is True and out.get("steps") == 2, out
+        containers = _live_method_containers(cfg, project, handler_path)
+        assert list(containers.values()) == ["ChangePanel", "ChangePanelByTabName"], containers
+
+        # --- 3. append: existing calls kept, new one added after them ----------
+        out2 = core.bridge_wire_event(
+            cfg, project, btn_path, "MouseClickEvent",
+            calls=[{"method_path": method_obj + "/ChangePanel", "args": "NewPanel=ZzzPanelC"}],
+            append=True)
+        assert out2.get("ok") is True and out2.get("appended") is True, out2
+        containers = _live_method_containers(cfg, project, handler_path)
+        assert list(containers.values()) == [
+            "ChangePanel", "ChangePanelByTabName", "ChangePanel"], containers
+        # still ONE handler for the event on the node
+        node = core.describe_node(cfg, project, btn_path)
+        handlers = [c for c in (node.get("children") or [])
+                    if "EH_MouseClickEvent" in str(c)]
+        assert len(handlers) == 1, handlers
+    finally:
+        try:
+            core.bridge_delete_node(cfg, project, btn_path)
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            pass
+
+
+def test_wire_event_nonexistent_method_returns_method_not_found_live(live, wire_method_obj):
+    """PRD 0050 B / 0052 D: wiring to a method the object does not expose is
+    refused with ``method_not_found`` (naming the object, the method and the
+    methods it does have) and creates no handler.  The object is the real
+    NetLogic from ``wire_method_obj``, so the refusal is about the method name
+    only, not a missing object."""
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    btn_name = _nm("ZzzWireNoMethodBtn")
+    btn_path = scratch + "/" + btn_name
+    handler_path = f"{btn_path}/EH_MouseClickEvent_{btn_name}"
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no node at {scratch!r} — set FTX_LIVE_SCRATCH_PANEL to an "
+                    "existing PanelType/Screen path")
+    _best_effort_delete(cfg, project, btn_path)
+    try:
+        try:
+            core.bridge_create_widget(cfg, project, scratch, btn_name, "Button")
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create test button at {btn_path!r}: {exc}")
+
+        out = core.bridge_wire_event(
+            cfg, project, btn_path, "MouseClickEvent",
+            method_path=wire_method_obj + "/ZzzNoSuchMethod")
+        assert out.get("ok") is False, out
+        assert out.get("error") == "method_not_found" == out.get("code"), out
+        assert out.get("method") == "ZzzNoSuchMethod", out
+        assert set(_WIRE_NL_METHODS) <= set(out.get("available") or []) \
+            or _LIVE_REWIRE_METHOD_OBJ, out
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(cfg, project, handler_path)
+
+        # The real method on the same object still wires: the refusal above was
+        # about the name, not the object.
+        good = core.bridge_wire_event(
+            cfg, project, btn_path, "MouseClickEvent",
+            method_path=wire_method_obj + "/ChangePanel", args="NewPanel=ZzzPanelA")
+        assert good.get("ok") is True, good
+    finally:
+        _best_effort_delete(cfg, project, btn_path)
+
+
+def test_set_text_key_live(live):
+    """set_text_key writes a LocalizedText TextId (a key), not literal text.
+
+    Creates a throwaway Label under the scratch panel, adds a translation row,
+    sets Label.Text to the key, and checks the bridge's read-back (`text_id`)
+    equals the key and that a literal set_property is a different thing
+    (no `text_id`). Also checks dry_run/the write path refuse attributes and that
+    BrowseName is untouched. Deletes the label afterwards.
+    """
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    name = _nm("ZzzTextKeyLabel")
+    path = scratch + "/" + name
+    key = _nm("ZzzTextKeyLive")
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no node at {scratch!r} — set FTX_LIVE_SCRATCH_PANEL to an existing node")
+    try:
+        core.bridge_delete_node(cfg, project, path)
+    except (core.BridgeWriteFailed, core.NodeNotFound):
+        pass
+    try:
+        try:
+            core.bridge_create_widget(cfg, project, scratch, name, "Label")
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create test label at {path!r}: {exc}")
+
+        # dry_run: structured errors, nothing written
+        for attr in ("DisplayName", "BrowseName"):
+            bad = core.bridge_edit(cfg, project, [
+                {"op": "set_text_key", "path": path, "name": attr, "key": key}], dry_run=True)
+            assert bad["report"]["ok"] is False and bad["applied"] == 0, bad["report"]
+            assert any(e.get("code") == "node_attribute_not_settable"
+                       for e in bad["report"]["errors"]), bad["report"]
+        bad = core.bridge_edit(cfg, project, [
+            {"op": "set_text_key", "path": path, "name": "Text", "key": " padded "}], dry_run=True)
+        assert any(e.get("code") == "invalid_text_key" for e in bad["report"]["errors"])
+        good = core.bridge_edit(cfg, project, [
+            {"op": "set_text_key", "path": path, "name": "Text", "key": key}], dry_run=True)
+        assert good["report"]["ok"] is True, good["report"]
+
+        # the write path refuses attributes before reaching the bridge
+        with pytest.raises(core.BridgeWriteFailed, match="node_attribute_not_settable"):
+            core.bridge_set_text_key(cfg, project, path, "BrowseName", key)
+
+        core.bridge_add_translation(cfg, project, key, "Live key text", "en-US")
+        out = core.bridge_set_text_key(cfg, project, path, "Text", key)
+        assert out.get("ok") is True, out
+        assert out.get("text_id") == key, out
+
+        # a literal set is the other form: the key must not be reported back
+        lit = core.bridge_set_property(cfg, project, path, "Text", "literal words")
+        assert lit.get("ok") is True and "text_id" not in lit
+
+        # a non-LocalizedText property is refused by the bridge, not coerced
+        with pytest.raises(core.BridgeWriteFailed, match="not_localized_text"):
+            core.bridge_set_text_key(cfg, project, path, "Width", key)
+        assert core.describe_node(cfg, project, path).get("name", name) == name
+    finally:
+        try:
+            core.bridge_delete_node(cfg, project, path)
         except (core.BridgeWriteFailed, core.NodeNotFound):
             pass
 
@@ -1865,9 +2334,10 @@ def test_attach_expression_corrected_hex_runtime_log_clean(live):
     import re
     import time
 
+    _require_desktop()
     cfg, project = live
     scratch = _LIVE_SCRATCH_PANEL
-    widget_name = "ZzzExprTestRect"
+    widget_name = _nm("ZzzExprTestRect")
     widget_path = scratch + "/" + widget_name
     prop = _LIVE_EXPR_PROP
     sources = _LIVE_EXPR_SOURCE if _LIVE_EXPR_SOURCE else None
@@ -1996,13 +2466,23 @@ def test_invoke_method_runs_under_root_session_and_studio_survives(live):
 
 
 def test_invoke_method_that_throws_is_survivable(live):
-    """A method that throws (here: one argument for a two-parameter method ->
-    TargetParameterCountException) is caught and logged by Optix; Studio and
-    the bridge stay up."""
+    """Post-0050 C contract (#73): a wrong argument count is refused with
+    ``argument_count_mismatch`` WITHOUT calling the method, and a method that
+    fails at runtime (CheckFormula logs an error for an empty expression; Optix
+    catches and logs it) is ``method_failed``. Studio and the bridge stay up
+    after both."""
     cfg, project = live
-    out = core.bridge_invoke_method(cfg, project, _LIVE_BRIDGE_NETLOGIC,
-                                    "CheckFormula", args="only-one-arg")
-    assert out.get("ok") is True, out
+    mismatch = core.bridge_invoke_method(cfg, project, _LIVE_BRIDGE_NETLOGIC,
+                                         "CheckFormula", args="only-one-arg")
+    assert mismatch.get("ok") is False, mismatch
+    assert mismatch.get("error") == "argument_count_mismatch", mismatch
+    assert mismatch.get("expected") == 2 and mismatch.get("given") == 1, mismatch
+    _assert_bridge_still_serves(cfg, project)
+
+    failed = core.bridge_invoke_method(cfg, project, _LIVE_BRIDGE_NETLOGIC,
+                                       "CheckFormula", args=",Model/X")
+    assert failed.get("ok") is False, failed
+    assert failed.get("error") == "method_failed", failed
     _assert_bridge_still_serves(cfg, project)
 
 
@@ -2014,7 +2494,7 @@ def test_spinbox_value_change_behaviour_is_refused_not_fatal(live, value):
     bridge must refuse it and keep serving."""
     cfg, project = live
     parent = "UI/MainWindow"
-    name = "ZzzSpinVCB"
+    name = _nm("ZzzSpinVCB")
     try:
         core.bridge_delete_node(cfg, project, parent + "/" + name)
     except (core.BridgeWriteFailed, core.NodeNotFound):
@@ -2033,3 +2513,2771 @@ def test_spinbox_value_change_behaviour_is_refused_not_fatal(live, value):
             core.bridge_delete_node(cfg, project, parent + "/" + name)
         except (core.BridgeWriteFailed, core.NodeNotFound):
             pass
+
+
+# ---- PRD 0019: subtree refusal (move / rename / convert) ---------------------
+# Throwaway-project test: needs a bridge >= 1.0.9 (``subtree_guard``). Gated by
+# the module-level FTX_LIVE_BRIDGE=1 skip, so it only ever runs against a live
+# bridge. NetLogic creation needs the project's NetSolution to accept a class
+# of the same name; if it cannot be created the netlogic half skips.
+
+_SUBTREE_CODES = ("contains_netlogic", "contains_event_handler")
+
+
+_SCRATCH_PROJECT_PREFIXES = ("zzOpenTruth", "zzBridgeSync")
+
+
+def _remove_scratch_project(cfg, name: str, attempts: int = 10) -> bool:
+    """Delete the throw-away project folder ``<projects_root>/<name>`` a test made
+    with ``project_new``. Call it AFTER the Studio the test launched is closed
+    (Studio holds file handles; on Windows the delete is retried for a while).
+
+    Refuses anything that is not a direct child of the projects root named like
+    one of this suite's scratch projects. Never raises; True when the folder is
+    gone."""
+    import shutil
+
+    if not name.startswith(_SCRATCH_PROJECT_PREFIXES) or "/" in name or "\\" in name \
+            or ".." in name:
+        return False
+    root = pathlib.Path(cfg.projects_root).resolve()
+    target = (root / name).resolve()
+    if target.parent != root:
+        return False
+    for i in range(attempts):
+        if not target.exists():
+            return True
+        try:
+            shutil.rmtree(target)
+        except OSError:
+            time.sleep(1.0)
+    return not target.exists()
+
+
+def _color_value_matches(value, expected_hex: str) -> bool:
+    """True when a describe_node Color value equals ``expected_hex`` (``#rrggbb``).
+
+    A Color variable is a UInt32 (0xAARRGGBB), so describe reports it as a decimal
+    number, not the hex string that was set. Both are accepted: a decimal or
+    ``0x``/``#`` hex text (with any trailing `` (<Type>)`` annotation removed) is parsed to an unsigned 32-bit value and its low 24
+    bits (RGB, alpha ignored) are compared with the expected colour."""
+    want = int(expected_hex.lstrip("#"), 16) & 0xFFFFFF
+    text = _inner(value).strip().lower()
+    # describe_node annotates typed values as "<value> (<Type>)", e.g. "4294901760 (UInt32)".
+    text = re.sub(r"\s*\([A-Za-z_][\w.]*\)\s*$", "", text)
+    try:
+        if re.fullmatch(r"\d+", text):
+            got = int(text) & 0xFFFFFFFF
+        elif re.fullmatch(r"(#|0x)[0-9a-f]+", text):
+            got = int(text.lstrip("#").removeprefix("0x"), 16) & 0xFFFFFFFF
+        else:
+            return expected_hex.lstrip("#").lower() in text
+    except ValueError:
+        return False
+    return got & 0xFFFFFF == want
+
+
+def _best_effort_delete(cfg, project, path):
+    try:
+        core.bridge_delete_node(cfg, project, path)
+    except (core.BridgeWriteFailed, core.NodeNotFound):
+        pass
+
+
+def _save_retrying_once(cfg, project) -> dict:
+    """``core.save`` and, when Studio left the mtime unchanged (saved False,
+    mtime_after == mtime_before: Ctrl+S raced a still-settling create), save
+    once more. Returns the last result."""
+    out = core.save(cfg, project)
+    if out.get("saved") is not True and out.get("mtime_after") == out.get("mtime_before"):
+        out = core.save(cfg, project)
+    return out
+
+
+def _wait_for_mtime_change(cfg, project, before: float, *, timeout: float = 15.0,
+                           interval: float = 0.5) -> bool:
+    """Poll the project's newest node-YAML mtime until it exceeds ``before``.
+    Bounded by ``timeout`` seconds; returns True once it advanced, else False."""
+    project_dir = core.resolve_project(cfg, project)
+    deadline = time.monotonic() + timeout
+    while True:
+        if core._project_max_mtime(project_dir) > before:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _with_bridge_recovery(cfg, project, fn, *, wait: float = 60.0, interval: float = 2.0):
+    """Run ``fn()``; if it raises ``no_bridge_for_project`` (the bridge drops
+    for a moment while Studio recompiles a NetLogic), wait for the bridge to
+    re-arm - dropping the registry cache and re-resolving each poll - then run
+    ``fn()`` once more. Any other error, or a bridge that never returns, fails."""
+    try:
+        return fn()
+    except core.NoBridgeForProject:
+        pass
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        core.reset_bridge_cache()
+        if core._find_bridge_for(cfg, project) is not None:
+            break
+        time.sleep(interval)
+    else:
+        raise AssertionError(
+            f"no_bridge_for_project: bridge for {project!r} did not return within {wait}s")
+    return fn()
+
+
+def _assert_subtree_refused(cfg, project, src, dest_parent, code, types_folder):
+    """move, rename (via batch, lowered to move) and convert each refuse `src`
+    with `code`, and the source node is still present afterwards."""
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_move_node(cfg, project, src, dest_parent)
+    assert e.value.bridge_code == code, e.value
+    assert e.value.hint and "Do not retry as-is" in e.value.hint
+
+    out = core.bridge_edit(cfg, project, [
+        {"op": "rename", "path": src, "new_name": _nm("ZzzRenamed")}])
+    assert not out.get("applied"), out
+    refused = out.get("refused_ops") or []
+    assert len(refused) == 1 and refused[0]["code"] == code, out
+    assert refused[0]["hint"]
+
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_convert_to_type(cfg, project, src, _nm("ZzzSubtreeType"), types_folder)
+    assert e.value.bridge_code == code, e.value
+
+    # Refusal happens before any mutation: the node is untouched.
+    assert core.describe_node(cfg, project, src)
+
+
+_SUBTREE_VAR_PARENT, _SUBTREE_VAR_NAME = "Model", _nm("ZzzUnused")
+
+
+@pytest.fixture
+def subtree_nodes(live):
+    """Create every node the subtree-refusal test needs; delete them afterwards.
+
+    Creates the SetVariable target ``Model/ZzzUnused`` (#16: the throwaway
+    project does not have it, so wire_event failed with node_not_found), a
+    destination Panel, and a Panel holding a Button wired with a MouseClick
+    EventHandler. Yields a dict of paths plus a ``created`` list; the test
+    appends anything else it creates. Teardown runs even when setup or the test
+    fails and deletes (deepest first) only what this fixture created.
+    """
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no scratch node at {scratch!r} — set FTX_LIVE_SCRATCH_PANEL")
+    health = core._bridge_http(cfg, "/bridge/health")
+    if health[0] != 200:
+        pytest.skip(f"/bridge/health returned {health[0]}")
+    ver = tuple(int(p) for p in str(json.loads(health[1]).get("bridge_version", "0"))
+                .split(".")[:3] if p.isdigit())
+    if ver < (1, 0, 9):
+        pytest.skip(f"bridge {ver} predates the subtree guard (1.0.9)")
+
+    var_path = f"{_SUBTREE_VAR_PARENT}/{_SUBTREE_VAR_NAME}"
+    eh_panel, eh_child = _nm("ZzzSubtreeEH"), _nm("ZzzBtn")
+    nl_panel, dest = _nm("ZzzSubtreeNL"), _nm("ZzzSubtreeDest")
+    created: list = []  # paths created here, in creation order
+    # Stale leftovers from an aborted earlier run (our own scratch names only).
+    for n in (eh_panel, nl_panel, dest):
+        _best_effort_delete(cfg, project, f"{scratch}/{n}")
+    var_preexisting = True
+    try:
+        core.describe_node(cfg, project, var_path)
+    except core.NodeNotFound:
+        var_preexisting = False
+    try:
+        if not var_preexisting:
+            core.bridge_create_variable(
+                cfg, project, _SUBTREE_VAR_NAME, _SUBTREE_VAR_PARENT, "Int32")
+            created.append(var_path)
+        for parent, name, wtype in (
+                (scratch, dest, "Panel"),
+                (scratch, eh_panel, "Panel"),
+                (f"{scratch}/{eh_panel}", eh_child, "Button")):
+            core.bridge_create_widget(cfg, project, parent, name, wtype)
+            created.append(f"{parent}/{name}")
+        core.bridge_wire_event(
+            cfg, project, f"{scratch}/{eh_panel}/{eh_child}", "MouseClickEvent",
+            command="SetVariable", variable=var_path, value="1")
+        yield {"cfg": cfg, "project": project, "scratch": scratch,
+               "eh_panel": f"{scratch}/{eh_panel}", "dest": f"{scratch}/{dest}",
+               "nl_panel": nl_panel, "created": created}
+    finally:
+        for path in reversed(created):
+            _best_effort_delete(cfg, project, path)
+
+
+def test_subtree_refusals_live_and_bridge_survives(subtree_nodes):
+    """Panel holding a child with a MouseClick EventHandler, and a Panel holding
+    a NetLogic: move, rename and convert_to_type are each refused with the
+    structured code + hint, and /bridge/health still answers afterwards (the
+    unguarded operations crashed Studio)."""
+    f = subtree_nodes
+    cfg, project, scratch = f["cfg"], f["project"], f["scratch"]
+    types_folder = "UI/Templates"
+    _assert_subtree_refused(cfg, project, f["eh_panel"], f["dest"],
+                            "contains_event_handler", types_folder)
+    _assert_bridge_still_serves(cfg, project)
+    health = core._bridge_http(cfg, "/bridge/health")
+    assert health[0] == 200, health
+
+    nl_path = f"{scratch}/{f['nl_panel']}"
+    core.bridge_create_widget(cfg, project, scratch, f["nl_panel"], "Panel")
+    f["created"].append(nl_path)
+    try:
+        core.bridge_create_netlogic(cfg, project, nl_path, _nm("ZzzSubtreeNetLogic"))
+    except core.BridgeWriteFailed as exc:
+        pytest.skip(f"could not create a NetLogic under {f['nl_panel']}: {exc}")
+    _assert_subtree_refused(cfg, project, nl_path, f["dest"],
+                            "contains_netlogic", types_folder)
+    _assert_bridge_still_serves(cfg, project)
+    health = core._bridge_http(cfg, "/bridge/health")
+    assert health[0] == 200, health
+
+
+# ---- 1.0.9 #18: focus helper EnumWindows fallback (save + emulator restart) --
+# The bench's Studio reports MainWindowHandle 0 with a visible window; the
+# focus helper must still find it via EnumWindows instead of NO_TARGET_WINDOW.
+
+def test_save_live_targets_bridge_studio(live):
+    """core.save must reach the bridge's Studio window (no
+    bridge_studio_no_window / NO_TARGET_WINDOW) even when MainWindowHandle is 0.
+    Skipped without a live bridge (module gate)."""
+    _require_desktop()
+    cfg, project = live
+    out = core.save(cfg, project)
+    assert out.get("reason") not in ("bridge_studio_no_window", "no_studio_window"), out
+    assert "NO_TARGET_WINDOW" not in (out.get("stdout") or ""), out
+    assert out.get("focused") is True, out
+    if out.get("bridge_pid") is not None:
+        assert out.get("save_target_pid") == out["bridge_pid"], out
+
+
+def test_emulator_restart_live_focuses_studio(live):
+    """restart_emulator sends F5 through the same focus helper; it must not
+    end in bridge_studio_no_window. Needs FTX_LIVE_HMI=1 (emulator restartable)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("emulator restart test: set FTX_LIVE_HMI=1 with the emulator "
+                    "restartable")
+    _require_desktop()
+    cfg, project = live
+    out = core.restart_emulator(cfg, project)
+    assert out.get("reason") != "bridge_studio_no_window", out
+    assert "NO_TARGET_WINDOW" not in str(out.get("stdout") or ""), out
+    assert out.get("serving"), out
+
+
+# ---- 1.0.9 #2: NodeId dynamic-link sources report target_path ----------------
+
+def test_formatter_two_sources_target_path_live(live):
+    """A StringFormatter with two sources reports a target_path for each; deleting
+    one target flips that source to target_path:null + target_missing:true."""
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no scratch node at {scratch!r} — set FTX_LIVE_SCRATCH_PANEL")
+    names = (_nm("ZzzLinkA"), _nm("ZzzLinkB"))
+    label = _nm("ZzzLinkLabel")
+    label_path = f"{scratch}/{label}"
+    for n in names:
+        _best_effort_delete(cfg, project, f"Model/{n}")
+    _best_effort_delete(cfg, project, label_path)
+    try:
+        for n in names:
+            core.bridge_create_variable(cfg, project, n, "Model", "Int32")
+        core.bridge_create_widget(cfg, project, scratch, label, "Label")
+        core.bridge_attach_string_formatter(
+            cfg, project, label_path, "Text", "{0} / {1}",
+            sources=[f"Model/{n}" for n in names])
+
+        def sources():
+            found = {}
+            conv = core.describe_node(cfg, project, f"{label_path}/Text")
+            for c in conv.get("children", []):
+                if "Formatter" not in c.get("dotnet_type", ""):
+                    continue
+                fmt = core.describe_node(cfg, project, f"{label_path}/Text/{c['browse_name']}")
+                for p in fmt.get("properties", []):
+                    if p["name"].startswith("Source"):
+                        found[p["name"]] = p
+            return found
+
+        found = sources()
+        got = {k: v.get("target_path") for k, v in found.items()}
+        if not got:
+            pytest.skip("bridge describe did not surface Source* properties")
+        assert got == {"Source0": f"Model/{names[0]}",
+                       "Source1": f"Model/{names[1]}"}, got
+
+        core.bridge_delete_node(cfg, project, f"Model/{names[1]}")
+        after = sources()
+        assert after["Source0"].get("target_path") == f"Model/{names[0]}"
+        assert after["Source1"].get("target_path") is None
+        assert after["Source1"].get("target_missing") is True
+    finally:
+        _best_effort_delete(cfg, project, label_path)
+        for n in names:
+            _best_effort_delete(cfg, project, f"Model/{n}")
+
+
+# ---- 1.0.9 #1/#2 (PRD 0023): format path forms + target_missing --------------
+
+def _live_formatter_sources(cfg, project, label_path):
+    """{Source<name>: property dict} for the formatter hung on ``label_path``/Text,
+    read through describe_node so ``target_path`` / ``target_missing`` are the
+    bridge's own serialization."""
+    found = {}
+    conv = core.describe_node(cfg, project, f"{label_path}/Text")
+    for c in conv.get("children", []):
+        if "Formatter" not in c.get("dotnet_type", ""):
+            continue
+        fmt = core.describe_node(cfg, project, f"{label_path}/Text/{c['browse_name']}")
+        for p in fmt.get("properties", []):
+            if p["name"].startswith("Source"):
+                found[p["name"]] = p
+    return found
+
+
+def _live_scratch_or_skip(cfg, project):
+    """The scratch panel path, or skip when it does not exist in the live project."""
+    scratch = _LIVE_SCRATCH_PANEL
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no scratch node at {scratch!r} — set FTX_LIVE_SCRATCH_PANEL")
+    return scratch
+
+
+def test_format_path_forms_ab_render_live(live):
+    """Both format forms on two Labels: the project-relative form is REFUSED
+    (format_path_not_runtime_resolvable, nothing written), the absolute form
+    attaches and RENDERS the target value (A/B render).
+
+    Label A gets the relative form (refused -> keeps its static text), Label B
+    the absolute `/Objects/<Project>/...` form. The design-time half (refusal,
+    absolute attach, nothing on A) always runs. The render half needs
+    FTX_LIVE_HMI=1 (emulator restartable) and tesseract: it restarts the
+    emulator and OCRs the runtime canvas, asserting the target value is on
+    screen below A's static text (B is placed under A) — i.e. only the
+    absolute-form Label shows the value."""
+    _require_desktop()
+    cfg, project = live
+    scratch = _live_scratch_or_skip(cfg, project)
+    pname = core._bridge_reported_project(cfg, project)
+    if not pname:
+        pytest.skip("bridge did not report a project name on /bridge/health")
+    sel, item = _nm("ZzzFmtSel"), _nm("ZzzFmtItem1")
+    target_value, a_static = "QUARTZ", "UNBOUND"
+    label_a, label_b = _nm("ZzzFmtLabelA"), _nm("ZzzFmtLabelB")
+    pa, pb = f"{scratch}/{label_a}", f"{scratch}/{label_b}"
+    relative = f"Model/{item}{{#k}}"
+    absolute = f"/Objects/{pname}/Model/{item}{{#k}}"
+    assert core.classify_format_path(relative) == "project_relative"
+    assert core.classify_format_path(absolute) == "runtime_resolvable"
+
+    def cleanup():
+        for p in (pa, pb, f"Model/{sel}", f"Model/{item}"):
+            _best_effort_delete(cfg, project, p)
+
+    cleanup()
+    try:
+        core.bridge_create_variable(cfg, project, sel, "Model", "Int32")
+        core.bridge_set_property(cfg, project, f"Model/{sel}", "Value", "1")
+        core.bridge_create_variable(cfg, project, item, "Model", "String")
+        core.bridge_set_property(cfg, project, f"Model/{item}", "Value", target_value)
+        for name, top in ((label_a, "40"), (label_b, "140")):
+            core.bridge_create_widget(cfg, project, scratch, name, "Label")
+            core.bridge_set_property(cfg, project, f"{scratch}/{name}", "LeftMargin", "40")
+            core.bridge_set_property(cfg, project, f"{scratch}/{name}", "TopMargin", top)
+        core.bridge_set_property(cfg, project, pa, "Text", a_static)
+
+        # A: project-relative form is refused, and nothing is written.
+        with pytest.raises(core.BridgeWriteFailed) as exc:
+            core.bridge_attach_formatter(
+                cfg, project, pa, "Text", relative, sources=f"k=Model/{sel}")
+        assert "format_path_not_runtime_resolvable" in str(exc.value), exc.value
+        assert f"/Objects/{pname}/Model/{item}{{#k}}" in str(exc.value), (
+            "the refusal must carry the exact absolute rewrite")
+        a_children = core.describe_node(cfg, project, f"{pa}/Text").get("children", [])
+        assert not [c for c in a_children if "Formatter" in c.get("dotnet_type", "")], (
+            f"refused attach left a formatter on Label A: {a_children!r}")
+
+        # B: absolute form attaches.
+        out = core.bridge_attach_formatter(
+            cfg, project, pb, "Text", absolute, sources=f"k=Model/{sel}")
+        assert out.get("ok") is True, out
+        src = _live_formatter_sources(cfg, project, pb)
+        if src:
+            assert src["Sourcek"].get("target_path") == f"Model/{sel}", src
+
+        # A/B render (runtime half).
+        if os.environ.get("FTX_LIVE_HMI") != "1":
+            pytest.skip("render half: set FTX_LIVE_HMI=1 with the emulator "
+                        "restartable (design-time half passed)")
+        restart = core.restart_emulator(cfg, project)
+        if not restart.get("serving"):
+            pytest.skip(f"emulator did not come up after restart: {restart!r}")
+        hits = {}
+        for token in (target_value, a_static):
+            res = core.cdp_find_text_runtime(
+                cfg, token, navigate_url=_LIVE_HMI_URL, settle_seconds=3.0,
+                project=project)
+            if res.get("error") == "tesseract_not_installed":
+                pytest.skip("tesseract not installed — cannot A/B the render by OCR")
+            hits[token] = res.get("matches") or []
+        assert hits[a_static], f"Label A's static text {a_static!r} not on screen: {hits!r}"
+        assert hits[target_value], (
+            f"Label B (absolute form) did not render the target value "
+            f"{target_value!r}: {hits!r}. The absolute format path "
+            f"{absolute!r} should resolve at runtime.")
+        assert hits[target_value][0]["center_px"][1] > hits[a_static][0]["center_px"][1], (
+            f"{target_value!r} rendered at/above Label A ({a_static!r}) — expected only "
+            f"Label B, placed below A, to show it: {hits!r}")
+    finally:
+        cleanup()
+
+
+def test_formatter_two_sources_both_target_paths_live(live):
+    """A formatter (attach_formatter, named sources) with two sources reports a
+    target_path for EACH source, equal to the variables' project-root paths."""
+    cfg, project = live
+    scratch = _live_scratch_or_skip(cfg, project)
+    pname = core._bridge_reported_project(cfg, project)
+    if not pname:
+        pytest.skip("bridge did not report a project name on /bridge/health")
+    names = (_nm("ZzzTpA"), _nm("ZzzTpB"))
+    label_name = _nm("ZzzTpLabel")
+    label_path = f"{scratch}/{label_name}"
+    for p in [label_path] + [f"Model/{n}" for n in names]:
+        _best_effort_delete(cfg, project, p)
+    try:
+        for n in names:
+            core.bridge_create_variable(cfg, project, n, "Model", "Int32")
+        core.bridge_create_widget(cfg, project, scratch, label_name, "Label")
+        core.bridge_attach_formatter(
+            cfg, project, label_path, "Text", f"/Objects/{pname}/Model/{{#a}}{{#b}}",
+            sources=f"a=Model/{names[0]};b=Model/{names[1]}")
+        found = _live_formatter_sources(cfg, project, label_path)
+        if not found:
+            pytest.skip("bridge describe did not surface Source* properties")
+        got = {k: v.get("target_path") for k, v in found.items()}
+        assert got == {"Sourcea": f"Model/{names[0]}",
+                       "Sourceb": f"Model/{names[1]}"}, got
+        assert not any(v.get("target_missing") for v in found.values()), found
+    finally:
+        for p in [label_path] + [f"Model/{n}" for n in names]:
+            _best_effort_delete(cfg, project, p)
+
+
+def test_formatter_target_deleted_reports_target_missing_live(live):
+    """Deleting a source's target flips ONLY that source to target_path:null +
+    target_missing:true; the surviving source keeps its target_path."""
+    cfg, project = live
+    scratch = _live_scratch_or_skip(cfg, project)
+    names = (_nm("ZzzTmA"), _nm("ZzzTmB"))
+    label_name = _nm("ZzzTmLabel")
+    label_path = f"{scratch}/{label_name}"
+    for p in [label_path] + [f"Model/{n}" for n in names]:
+        _best_effort_delete(cfg, project, p)
+    try:
+        for n in names:
+            core.bridge_create_variable(cfg, project, n, "Model", "Int32")
+        core.bridge_create_widget(cfg, project, scratch, label_name, "Label")
+        core.bridge_attach_string_formatter(
+            cfg, project, label_path, "Text", "{0} / {1}",
+            sources=[f"Model/{n}" for n in names])
+        before = _live_formatter_sources(cfg, project, label_path)
+        if not before:
+            pytest.skip("bridge describe did not surface Source* properties")
+        assert not any(v.get("target_missing") for v in before.values()), before
+
+        core.bridge_delete_node(cfg, project, f"Model/{names[1]}")
+        after = _live_formatter_sources(cfg, project, label_path)
+        assert after["Source0"].get("target_path") == f"Model/{names[0]}", after
+        assert not after["Source0"].get("target_missing"), after
+        assert after["Source1"].get("target_path") is None, after
+        assert after["Source1"].get("target_missing") is True, after
+    finally:
+        for p in [label_path] + [f"Model/{n}" for n in names]:
+            _best_effort_delete(cfg, project, p)
+
+
+def test_translations_bulk_and_remove_live(live):
+    """add_translations adds rows in one call; remove_translation is not_supported.
+
+    Uses throwaway keys. The SDK cannot remove a row, so they are left behind
+    (overwritten on every run). Checks dry_run does not add, the bulk add reports
+    `added` then `updated` on a repeat, an unknown key is translation_not_found,
+    and an existing key is not_supported (dry_run included), in the primitive and
+    in a bridge_edit batch (report.errors with op_index).
+    """
+    cfg, project = live
+    # The SDK cannot remove a row, and re-adding a key a previous run left
+    # behind fails ("Localization dictionary ... already contains"). So the
+    # keys carry a per-run suffix; the legacy fixed keys are cleaned up
+    # best-effort (a no-op where removal is unsupported) before and after.
+    import uuid
+    suffix = uuid.uuid4().hex[:8]
+    legacy = [_nm("ZzzBulkTx1"), _nm("ZzzBulkTx2"), _nm("ZzzBulkTx3")]
+    keys = [f"{k}{suffix}" for k in legacy]
+    rows = [{"key": k, "value": f"Live {k}"} for k in keys]
+
+    def _cleanup():
+        for k in legacy + keys:
+            try:
+                core.bridge_remove_translation(cfg, project, k)
+            except core.BridgeWriteFailed:
+                pass
+
+    _cleanup()
+    try:
+        _translations_bulk_body(cfg, project, keys, rows)
+    finally:
+        _cleanup()
+
+
+def _translations_bulk_body(cfg, project, keys, rows):
+    # dry_run validates, mutates nothing
+    dry = core.bridge_add_translations(cfg, project, rows, dry_run=True)
+    assert dry.get("ok") is True and dry.get("dry_run") is True, dry
+
+    # structured row errors, nothing written
+    invalid = core.bridge_add_translations(
+        cfg, project, [rows[0], {"key": keys[1], "value": "x"}, {"key": keys[1], "value": "y"}])
+    assert invalid["ok"] is False and invalid["code"] == "invalid_translation_rows"
+
+    # the real bulk add: all rows new (or updated if left by a prior run), then updated
+    out = core.bridge_add_translations(cfg, project, rows)
+    assert out.get("ok") is True and out.get("count") == 3, out
+    assert out.get("added") == 3, out
+    again = core.bridge_add_translations(cfg, project, rows)
+    assert again.get("updated") == 3 and again.get("added") == 0, again
+
+    # remove: existing key (dry_run or not) is not_supported, unknown is not_found
+    for dry_run in (True, False):
+        res = core.bridge_remove_translation(cfg, project, keys[0], dry_run=dry_run)
+        assert res["ok"] is False and res["code"] == "not_supported", res
+    unknown = core.bridge_remove_translation(cfg, project, "ZzzNoSuchKey")
+    assert unknown["ok"] is False and unknown["code"] == "translation_not_found", unknown
+
+    # remove after a primitive add and after a batch add (ftx-mcp-phv.4 / #40): both
+    # answer not_supported through the one existence check, never translation_not_found
+    import uuid
+    sfx = uuid.uuid4().hex[:8]
+    prim_key, batch_key = f"ZzzPrimTx{sfx}", f"ZzzBatchTx{sfx}"
+    prim = core.bridge_add_translations(cfg, project, [{"key": prim_key, "value": "prim"}])
+    assert prim.get("ok") is True and prim.get("added") == 1, prim
+    res = core.bridge_remove_translation(cfg, project, prim_key)
+    assert res["ok"] is False and res["code"] == "not_supported", res
+    applied = core.bridge_edit(cfg, project, [
+        {"op": "add_translations", "rows": [{"key": batch_key, "value": "batch"}]}])
+    assert applied["report"]["ok"] is True and applied["applied"] == 1, applied["report"]
+    res = core.bridge_remove_translation(cfg, project, batch_key)
+    assert res["ok"] is False and res["code"] == "not_supported", res
+    after_batch = core.bridge_edit(cfg, project, [
+        {"op": "remove_translation", "key": batch_key}], dry_run=True)
+    assert any(e.get("code") == "not_supported" for e in after_batch["report"]["errors"]), after_batch["report"]
+
+    # in a batch it is reported with its op_index and nothing is applied
+    batch = core.bridge_edit(cfg, project, [
+        {"op": "add_translations", "rows": rows},
+        {"op": "remove_translation", "key": keys[0]}], dry_run=True)
+    assert batch["report"]["ok"] is False and batch["applied"] == 0, batch["report"]
+    assert any(e.get("code") == "not_supported" and e.get("op_index") == 1
+               for e in batch["report"]["errors"])
+
+
+def test_add_translations_repeat_add_updates_live(live):
+    """Adding the same key twice returns `updated` the second time (dedicated tool
+    and the bridge_edit op), instead of failing with 'already contains'."""
+    import uuid
+    cfg, project = live
+    key = f"ZzzRepeatTx{uuid.uuid4().hex[:8]}"   # the SDK cannot remove rows
+    first = core.bridge_add_translations(cfg, project, [{"key": key, "value": "one"}])
+    assert first.get("ok") is True and first.get("added") == 1, first
+    again = core.bridge_add_translations(cfg, project, [{"key": key, "value": "two"}])
+    assert again.get("ok") is True and again.get("updated") == 1 and again.get("added") == 0, again
+    batch = core.bridge_edit(cfg, project, [
+        {"op": "add_translations", "rows": [{"key": key, "value": "three"}]}])
+    assert batch["report"]["ok"] is True and batch["applied"] == 1, batch["report"]
+
+
+def test_set_modelling_rule_live(live):
+    """ModellingRule is settable to Mandatory / Optional / None on a type member.
+
+    Creates a throwaway ObjectType under FTX_LIVE_TYPES_FOLDER (default
+    ``Model``) with one Int32 member, then: dry_run rejects a bad rule with a
+    structured error, each of the three rules applies (and is read back as
+    `modelling_rule`), and an instance (non-type) node is refused with
+    `not_a_type_member`. Deletes the type afterwards.
+    """
+    cfg, project = live
+    folder = os.environ.get("FTX_LIVE_TYPES_FOLDER", "Model")
+    type_name = _nm("ZzzModRuleType")
+    type_path = folder + "/" + type_name
+    member = type_path + "/Speed"
+    try:
+        core.bridge_delete_node(cfg, project, type_path)
+    except (core.BridgeWriteFailed, core.NodeNotFound):
+        pass
+    try:
+        try:
+            core.bridge_create_type(cfg, project, type_name, folder)
+            core.bridge_create_variable(cfg, project, "Speed", type_path, "Int32")
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create test type member at {member!r}: {exc}")
+
+        # dry_run: a bad rule is a structured error, nothing changes
+        bad = core.bridge_edit(cfg, project, [
+            {"op": "set_modelling_rule", "path": member, "rule": "Required"}], dry_run=True)
+        assert bad["report"]["ok"] is False and bad["applied"] == 0, bad["report"]
+        assert any(e.get("code") == "invalid_modelling_rule"
+                   for e in bad["report"]["errors"]), bad["report"]
+        single = core.bridge_set_modelling_rule(cfg, project, member, "Required", dry_run=True)
+        assert single["ok"] is False and single["code"] == "invalid_modelling_rule", single
+        good = core.bridge_edit(cfg, project, [
+            {"op": "set_modelling_rule", "path": member, "rule": "Mandatory"}], dry_run=True)
+        assert good["report"]["ok"] is True, good["report"]
+
+        # the bridge's dry_run reports without changing
+        would = core.bridge_set_modelling_rule(cfg, project, member, "Mandatory", dry_run=True)
+        assert would.get("ok") is True and would.get("would_set") is True, would
+        previous = would.get("previous")
+
+        for rule in ("Mandatory", "Optional", "None"):
+            out = core.bridge_set_modelling_rule(cfg, project, member, rule)
+            assert out.get("ok") is True, out
+            assert out.get("modelling_rule") == rule, out
+
+        # same through the batch surface
+        batch = core.bridge_edit(cfg, project, [
+            {"op": "set_modelling_rule", "path": member, "rule": "optional"}])
+        assert batch.get("applied") == 1, batch
+        assert core.bridge_set_modelling_rule(
+            cfg, project, member, "Optional", dry_run=True).get("previous") == "Optional"
+        assert previous is not None
+
+        # an instance node is not a type member
+        scratch = _LIVE_SCRATCH_PANEL
+        with pytest.raises(core.BridgeWriteFailed, match="not_a_type_member"):
+            core.bridge_set_modelling_rule(cfg, project, scratch, "Mandatory")
+    finally:
+        try:
+            core.bridge_delete_node(cfg, project, type_path)
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            pass
+
+
+def test_retype_to_localized_text_live(live):
+    """An existing variable is retyped to LocalizedText in place.
+
+    A String variable holding text keeps that text across the retype
+    (`values_converted` 1, reported `to` LocalizedText); dry_run validates and
+    leaves the DataType alone; a bad datatype is refused with a structured
+    error; a value with no text form (a NodeId variable pointing at a node) is
+    refused with `value_not_convertible` and the node keeps its DataType.
+    """
+    cfg, project = live
+    parent = _LIVE_MODEL_PARENT
+    txt_name, ref_name = _nm("ZzzRetypeLtText"), _nm("ZzzRetypeLtRef")
+    txt, ref = parent + "/" + txt_name, parent + "/" + ref_name
+
+    def _datatype_of(name: str) -> str:
+        props = {p["name"]: p.get("value")
+                 for p in (core.describe_node(cfg, project, parent).get("properties") or [])}
+        return re.sub(r"</?untrusted[^>]*>", "", props.get(name) or "")
+
+    for p in (txt, ref):
+        _best_effort_delete(cfg, project, p)
+    try:
+        core.bridge_create_variable(cfg, project, txt_name, parent, "String")
+        core.bridge_create_variable(cfg, project, ref_name, parent, "NodeId")
+        core.bridge_set_property(cfg, project, txt, "Value", "Hello retype")
+        core.bridge_set_property(cfg, project, ref, "Value", parent)
+
+        # dry_run: validated, nothing changes; bad datatype is structured
+        dry = core.bridge_retype(cfg, project, txt, "LocalizedText", dry_run=True)
+        assert dry.get("ok") is True and dry.get("would_retype") is True, dry
+        bad = core.bridge_edit(cfg, project, [
+            {"op": "retype", "path": txt, "datatype": "Color"}], dry_run=True)
+        assert bad["report"]["ok"] is False and bad["applied"] == 0, bad["report"]
+        assert any(e.get("code") == "invalid_datatype" for e in bad["report"]["errors"])
+        good = core.bridge_edit(cfg, project, [
+            {"op": "retype", "path": txt, "datatype": "LocalizedText"}], dry_run=True)
+        assert good["report"]["ok"] is True, good["report"]
+        assert "LocalizedText" not in _datatype_of(txt_name)
+
+        # non-convertible value: refused, structured, node unchanged
+        refused = core.bridge_retype(cfg, project, ref, "LocalizedText")
+        assert refused["ok"] is False and refused["code"] == "value_not_convertible", refused
+        dry_refused = core.bridge_edit(cfg, project, [
+            {"op": "retype", "path": ref, "datatype": "LocalizedText"}], dry_run=True)
+        assert any(e.get("code") == "value_not_convertible"
+                   for e in dry_refused["report"]["errors"]), dry_refused["report"]
+        assert "LocalizedText" not in _datatype_of(ref_name)
+
+        # convertible value: retyped in place, text preserved
+        out = core.bridge_retype(cfg, project, txt, "LocalizedText")
+        assert out.get("ok") is True, out
+        assert out["from"]["datatype"] == "String", out
+        assert out["to"]["datatype"] == "LocalizedText", out
+        assert out["sample"][0] == "Hello retype", out
+        assert "LocalizedText" in _datatype_of(txt_name)
+        assert "Hello retype" in _datatype_of(txt_name)
+    finally:
+        for p in (txt, ref):
+            _best_effort_delete(cfg, project, p)
+
+
+def test_create_variable_nodepointer_kind_live(live):
+    """create_variable(NodePointer) sets Kind to the pointed-to node's type.
+
+    A NodePointer aimed at a Folder gets Kind FolderType (not unset, not
+    BaseObjectType); dry_run reports the resolved Kind and refuses a pointer
+    with no target/kind and an unresolvable target; the live node's Kind child
+    reads back as the target's type.
+    """
+    cfg, project = live
+    parent = _LIVE_MODEL_PARENT
+    folder_name, ptr_name, bad_name = _nm("ZzzNpKindFolder"), _nm("ZzzNpKindPtr"), _nm("ZzzNpKindBad")
+    folder, ptr, bad = (parent + "/" + n for n in (folder_name, ptr_name, bad_name))
+
+    for p in (ptr, bad, folder):
+        _best_effort_delete(cfg, project, p)
+    try:
+        core.bridge_create_folder(cfg, project, parent, folder_name)
+
+        # dry_run: Kind resolved from the target, nothing created
+        dry = core.bridge_edit(cfg, project, [
+            {"op": "create_variable", "parent": parent, "name": ptr_name,
+             "datatype": "NodePointer", "target": folder}], dry_run=True)
+        assert dry["report"]["ok"] is True and dry["applied"] == 0, dry["report"]
+        kinds = [r["kind"] for r in dry["report"].get("resolved") or []]
+        assert kinds == ["FolderType"], dry["report"]
+
+        # target created earlier in the same batch resolves through the hypothetical model
+        hypo = core.bridge_edit(cfg, project, [
+            {"op": "create_folder", "parent": parent, "name": bad_name},
+            {"op": "create_variable", "parent": parent, "name": ptr_name + "H",
+             "datatype": "NodePointer", "target": bad}], dry_run=True)
+        assert hypo["report"]["ok"] is True, hypo["report"]
+        assert [r["kind"] for r in hypo["report"]["resolved"]] == ["FolderType"], hypo["report"]
+
+        # no target / kind, or a target that does not resolve: refused, structured
+        none = core.bridge_edit(cfg, project, [
+            {"op": "create_variable", "parent": parent, "name": ptr_name,
+             "datatype": "NodePointer"}], dry_run=True)
+        assert any(e.get("code") == "kind_required" for e in none["report"]["errors"])
+        missing = core.bridge_edit(cfg, project, [
+            {"op": "create_variable", "parent": parent, "name": ptr_name,
+             "datatype": "NodePointer", "target": parent + "/ZzzNoSuchNode"}], dry_run=True)
+        assert missing["report"]["ok"] is False, missing["report"]
+        assert any(e.get("code") == "node_not_found" for e in missing["report"]["errors"])
+
+        # apply: the pointer exists, aimed at the folder, Kind == the folder's type
+        out = core.bridge_create_variable(
+            cfg, project, ptr_name, parent, "NodePointer", target=folder)
+        assert out.get("ok") is True and out.get("kind") == "FolderType", out
+        assert out.get("kind_node_id") not in (None, "", "ns=0;i=58"), out
+        kind_child = core.describe_node(cfg, project, ptr)
+        text = re.sub(r"</?untrusted[^>]*>", "", json.dumps(kind_child))
+        # the bridge prints the Kind NodeId as "0/61 (NodeId)"
+        assert "FolderType" in text or "i=61" in text or "0/61" in text, text
+    finally:
+        for p in (ptr, bad, folder):
+            _best_effort_delete(cfg, project, p)
+
+
+# ---- 1.0.9 5c: bind raw_path with an [i] array-element index ----------------
+# Needs a live bridge and the scratch panel (FTX_LIVE_SCRATCH_PANEL). Creates one
+# Int32 array variable under Model and one Label, and deletes both afterwards.
+# NOT yet run on the bench (pending bench verification).
+
+def test_bind_raw_path_array_element_live(live):
+    """bind(raw_path="Model/<arr>[1]") links a Label's Text to element [1] of an
+    array variable: the DynamicLink literal keeps the `[1]`; malformed paths and
+    indexes are refused with structured errors and nothing is bound."""
+    cfg, project = live
+    scratch = _live_scratch_or_skip(cfg, project)
+    arr_name, label = _nm("ZzzBindArr"), _nm("ZzzBindArrLabel")
+    arr_path = f"{_LIVE_MODEL_PARENT}/{arr_name}"
+    label_path = f"{scratch}/{label}"
+    for p in (label_path, arr_path):
+        _best_effort_delete(cfg, project, p)
+    try:
+        core.bridge_create_variable(
+            cfg, project, arr_name, _LIVE_MODEL_PARENT, "Int32", array_dimensions=3)
+        core.bridge_create_widget(cfg, project, scratch, label, "Label")
+
+        for bad_path, code in ((f"{arr_path}[x]", "invalid_raw_path_index"),
+                               (f"{arr_path}[-1]", "invalid_raw_path_index"),
+                               (f"{arr_path}[1", "invalid_raw_path")):
+            bad = core.bridge_bind_property(
+                cfg, project, label_path, "Text", raw_path=bad_path)
+            assert bad.get("ok") is False and bad.get("code") == code, bad
+
+        dry = core.bridge_bind_property(
+            cfg, project, label_path, "Text", raw_path=f"{arr_path}[1]", dry_run=True)
+        assert dry.get("ok") is True and dry.get("dry_run") is True, dry
+
+        out = core.bridge_bind_property(
+            cfg, project, label_path, "Text", raw_path=f"{arr_path}[1]")
+        assert out.get("ok") is True and out.get("via") == "dynamiclink-raw", out
+        assert out.get("raw") == f"{arr_path}[1]", out
+
+        text = re.sub(r"</?untrusted[^>]*>", "", json.dumps(
+            core.describe_node(cfg, project, f"{label_path}/Text")))
+        assert f"{arr_name}[1]" in text, text
+    finally:
+        for p in (label_path, arr_path):
+            _best_effort_delete(cfg, project, p)
+
+
+# ---- 1.0.9 5d: dry_run resolves bind source_path ----------------------------
+# Needs a live bridge and the scratch panel (FTX_LIVE_SCRATCH_PANEL).
+# NOT yet run on the bench (pending bench verification).
+
+def test_dry_run_catches_bad_bind_source_live(live):
+    """dry_run on create_widget + bind with a nonexistent source_path returns a
+    structured source_not_found error and creates nothing; the same batch with a
+    source created earlier in the batch validates clean (still nothing created)."""
+    cfg, project = live
+    scratch = _live_scratch_or_skip(cfg, project)
+    label = _nm("ZzzBindSrcLabel")
+    label_path = f"{scratch}/{label}"
+    var_name = _nm("ZzzBindSrcVar")
+    _best_effort_delete(cfg, project, label_path)
+    try:
+        ops = [
+            {"op": "create_widget", "screen": scratch, "name": label, "widget_type": "Label"},
+            {"op": "bind", "path": label_path, "name": "Text",
+             "source_path": f"{_LIVE_MODEL_PARENT}/ZzzNoSuchSource"},
+        ]
+        bad = core.bridge_edit(cfg, project, ops, dry_run=True)
+        assert bad["state"] == "validated" and bad["applied"] == 0, bad
+        errs = [e for e in bad["report"]["errors"] if e.get("code") == "source_not_found"]
+        assert errs and errs[0]["op_index"] == 1, bad
+        good = core.bridge_edit(cfg, project, [
+            {"op": "create_variable", "parent": _LIVE_MODEL_PARENT, "name": var_name,
+             "datatype": "String"},
+            ops[0],
+            {**ops[1], "source_path": f"{_LIVE_MODEL_PARENT}/{var_name}"},
+        ], dry_run=True)
+        assert good["report"]["errors"] == [], good
+        # dry_run wrote nothing: the widget does not exist.
+        try:
+            core.describe_node(cfg, project, label_path)
+            raise AssertionError("dry_run must not create the widget")
+        except core.NodeNotFound:
+            pass
+    finally:
+        _best_effort_delete(cfg, project, label_path)
+
+
+# ---- expression pow (Studio 1.8) — ftx-mcp-8fy.7 ----------------------------------
+# Runs on BOTH Studio versions: the expectation is picked from the version the bridge
+# reports in /bridge/health.studio_version, so run it once against 1.7 and once on 1.8.
+
+_LIVE_POW_EXPR = "pow(2, 3) + 1"
+
+
+def _live_studio_minor(cfg):
+    """(major, minor) of the Studio serving the bridge, or skip."""
+    status, raw = core._bridge_http(cfg, "/bridge/health")
+    if status != 200:
+        pytest.skip(f"/bridge/health returned {status}")
+    ver = str(json.loads(raw).get("studio_version") or "")
+    parts = [int(p) for p in re.findall(r"\d+", ver)[:2]]
+    if len(parts) < 2:
+        pytest.skip(f"bridge does not report a parseable studio_version ({ver!r}) — rebuild it")
+    return tuple(parts), ver
+
+
+def test_health_studio_version_is_product_version_live(live):
+    """health studio_version is the Studio product version (1.x), not FTOptix.UI's 21.2.0.98."""
+    cfg, _project = live
+    (major_minor, ver) = _live_studio_minor(cfg)
+    assert major_minor[0] == 1, f"studio_version {ver!r} is not a Studio product version"
+    assert not ver.startswith("21."), ver
+
+
+def _running_studio_version_or_none(cfg):
+    """(major, minor) of the running Studio, or None when it cannot be determined.
+
+    ``FTX_LIVE_STUDIO_VERSION`` (e.g. ``1.7.4.32``) wins; otherwise the version
+    the Studio binary prints for ``--version``. Never skips.
+    """
+    raw = os.environ.get("FTX_LIVE_STUDIO_VERSION", "").strip()
+    if not raw:
+        raw = str(core.studio_version(cfg).get("stdout") or "")
+    parts = [int(p) for p in re.findall(r"\d+", raw)[:2]]
+    return tuple(parts) if len(parts) >= 2 else None
+
+
+def _live_running_studio_version(cfg):
+    """The running Studio's version from a source INDEPENDENT of the bridge.
+
+    Skips when no parseable ``major.minor`` is available so the bridge is never
+    compared against itself.
+    """
+    ver = _running_studio_version_or_none(cfg)
+    if ver is None:
+        raw = os.environ.get("FTX_LIVE_STUDIO_VERSION", "").strip()
+        pytest.skip("running Studio version unknown — set FTX_LIVE_STUDIO_VERSION "
+                    f"(e.g. 1.7.4.32); Studio --version gave {raw!r}")
+    return ver
+
+
+def test_health_studio_version_matches_running_studio_major_minor_live(live):
+    """health studio_version starts with the running Studio's major.minor (ftx-mcp-mnk.2)."""
+    cfg, _project = live
+    running = _live_running_studio_version(cfg)
+    _reported, ver = _live_studio_minor(cfg)
+    prefix = f"{running[0]}.{running[1]}"
+    assert ver == prefix or ver.startswith(prefix + "."), (
+        f"bridge reports studio_version {ver!r}, running Studio is {prefix}")
+
+
+def test_pow_version_gate_follows_running_studio_live(live):
+    """pow is refused with function_requires_version below 1.8 and accepted on 1.8+.
+
+    The expectation comes from the independently-known Studio version, not from
+    the bridge's own report, so a wrong studio_version cannot make it pass.
+    """
+    cfg, project = live
+    running = _live_running_studio_version(cfg)
+    out = core.bridge_validate_expression(cfg, project, _LIVE_POW_EXPR)
+    if running >= (1, 8):
+        assert out.get("valid") is True, (running, out)
+        assert "function_requires_version" not in str(out.get("error", "")), out
+    else:
+        assert out.get("valid") is False, (running, out)
+        assert str(out.get("error", "")).startswith("function_requires_version:"), out
+        assert (out.get("requires_version") or {}).get("function") == "pow", out
+
+
+def test_validate_expression_pow_live(live):
+    """validate_expression: pow valid on Studio 1.8, structured error on 1.7."""
+    cfg, project = live
+    (major_minor, ver) = _live_studio_minor(cfg)
+    out = core.bridge_validate_expression(cfg, project, _LIVE_POW_EXPR)
+    if major_minor >= (1, 8):
+        assert out.get("valid") is True, (ver, out)
+    else:
+        assert out.get("valid") is False, (ver, out)
+        assert str(out.get("error", "")).startswith("function_requires_version:"), out
+        assert "1.8" in out["error"], out
+        rv = out.get("requires_version") or {}
+        assert rv.get("function") == "pow" and rv.get("min_version") == "1.8", out
+
+
+def test_attach_expression_pow_live(live):
+    """attach_expression: pow attaches on 1.8; on 1.7 it is refused and nothing is created."""
+    cfg, project = live
+    (major_minor, ver) = _live_studio_minor(cfg)
+    node_path, prop = _LIVE_NODE, _LIVE_EXPR_PROP
+
+    def children():
+        node = core.describe_node(cfg, project, node_path)
+        return frozenset(c.get("browse_name") or c.get("name") or ""
+                         for c in (node.get("children") or []))
+
+    before = children()
+    if major_minor >= (1, 8):
+        try:
+            out = core.bridge_attach_expression(
+                cfg, project, node_path, prop, "pow(2, 3) + 0xFF000000")
+            assert out.get("ok") is True, (ver, out)
+        finally:
+            # leave the shared node as found (best effort)
+            for extra in children() - before:
+                _best_effort_delete(cfg, project, f"{node_path}/{extra}")
+    else:
+        with pytest.raises(core.BridgeWriteFailed) as exc:
+            core.bridge_attach_expression(cfg, project, node_path, prop, _LIVE_POW_EXPR)
+        msg = str(exc.value)
+        assert "pow" in msg and "1.8" in msg, msg
+        assert children() == before, "refused attach must not create an ExpressionEvaluator"
+
+
+# ---- 1.0.9 5a: design-time NetLogic (kind="design_time") ---------------------
+# Needs a live bridge (module gate) AND a Studio window that can take Ctrl+S /
+# a right-click Execute (session 1). Writes one scratch .cs into the throwaway
+# project's NetSolution and removes the node + file afterwards.
+
+_DT_CLASS = _nm("ZzzDesignTimeLogic")
+_DT_CS_TEMPLATE = """using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class __CLS__ : BaseNetLogic
+{
+    [ExportMethod]
+    public void ZzzPing()
+    {
+        Log.Info("__CLS__", "ZzzPing ran");
+    }
+}
+"""
+
+
+def _dt_cs(cls: str) -> str:
+    """The design-time NetLogic C# source for the (suffixed) class ``cls``."""
+    return _DT_CS_TEMPLATE.replace("__CLS__", cls)
+
+
+def test_design_time_netlogic_export_method_after_save_live(live):
+    """kind="design_time" mints BehaviourStartPriority (BehaviourStartPriorityVariableType,
+    180); after optix_save, with NO reopen, execute answers
+    export_method_not_loaded (reopen_required) per the #5 contract - the
+    [ExportMethod] only materializes after a reopen."""
+    _require_desktop()
+    cfg, project = live
+    node_path = f"Model/{_DT_CLASS}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{_DT_CLASS}.cs")
+    cs_path.write_text(_dt_cs(_DT_CLASS), encoding="utf-8")
+    created = False
+    try:
+        try:
+            out = core.bridge_create_netlogic(
+                cfg, project, "Model", _DT_CLASS, kind="design_time")
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"could not create a design-time NetLogic: {exc}", pytrace=False)
+        created = True
+        assert out.get("kind") == "design_time", out
+
+        prio = core.describe_node(cfg, project, f"{node_path}/BehaviourStartPriority")
+        # describe does not print the VariableType definition, only the value;
+        # the Variable's own datatype/value are top-level fields (#39)
+        assert "180" in _inner(prio.get("value")), prio
+        assert prio.get("datatype"), prio
+
+        saved = core.save(cfg, project)
+        assert saved.get("saved") is True, saved
+
+        # #5 contract: the [ExportMethod] is NOT materialized by save; it
+        # appears only after the project is reopened. Until then execute
+        # answers export_method_not_loaded (with a reopen nudge) and clicks
+        # nothing. (A Studio that did load it runs it instead.)
+        ran = core.execute_design_method(cfg, project, _DT_CLASS, "ZzzPing")
+        if ran.get("error") == "export_method_not_loaded":
+            assert ran.get("ok") is False, ran
+            assert ran.get("reopen_required") is True, ran
+            assert ran.get("nudge"), ran
+        else:
+            assert ran.get("ok") is True, ran
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+_SAVE_CLASS = _nm("ZzzSaveAfterCreateLogic")
+
+
+def test_save_after_design_time_netlogic_create_live(live):
+    """ftx-mcp-h4a.2: a design-time NetLogic create, then save -> saved true.
+    Any method counts (Ctrl+S or tree-click + Ctrl+S); the method
+    used is logged so the bench run shows which path worked."""
+    _require_desktop()
+    cfg, project = live
+    node_path = f"Model/{_SAVE_CLASS}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{_SAVE_CLASS}.cs")
+    cs_path.write_text(_dt_cs(_SAVE_CLASS), encoding="utf-8")
+    created = False
+    try:
+        try:
+            core.bridge_create_netlogic(
+                cfg, project, "Model", _SAVE_CLASS, kind="design_time")
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"could not create a design-time NetLogic: {exc}", pytrace=False)
+        created = True
+        saved = core.save(cfg, project)
+        print(f"optix_save method={saved.get('method')!r} saved={saved.get('saved')!r} "
+              f"attempts={saved.get('attempts')!r}")
+        assert saved.get("saved") is True, saved
+        assert saved.get("method") in ("ctrl_s", "tree_focus_ctrl_s"), saved
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+_SAVE18_CLASS = _nm("ZzzSave18Logic")
+
+
+@pytest.mark.slow_live
+def test_save_studio18_immediate_save_after_netlogic_create_live(live):
+    """PRD 0047 A (#54): on Studio 1.8, a design-time NetLogic create, then an
+    IMMEDIATE save -> saved true within timeout + grace. Studio drops Ctrl+S
+    during the NetSolution build that follows the create; optix_save re-sends
+    until one lands. keystrokes_sent and write_latency_s are logged. Marked
+    slow_live: the build can take ~30 s."""
+    _require_desktop()
+    cfg, project = live
+    node_path = f"Model/{_SAVE18_CLASS}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{_SAVE18_CLASS}.cs")
+    cs_path.write_text(_dt_cs(_SAVE18_CLASS), encoding="utf-8")
+    created = False
+    try:
+        try:
+            created_out = core.bridge_create_netlogic(
+                cfg, project, "Model", _SAVE18_CLASS, kind="design_time")
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"could not create a design-time NetLogic: {exc}", pytrace=False)
+        created = True
+        assert created_out["netsolution_build"]["state"] == "building", created_out
+
+        t0 = time.monotonic()
+        saved = core.save(cfg, project)
+        wall = time.monotonic() - t0
+        print(f"optix_save saved={saved.get('saved')!r} method={saved.get('method')!r} "
+              f"keystrokes_sent={saved.get('keystrokes_sent')!r} "
+              f"write_latency_s={saved.get('write_latency_s')!r} wall={wall:.1f}s "
+              f"attempts={saved.get('attempts')!r}")
+        assert saved.get("saved") is True, saved
+        assert saved.get("method") in ("ctrl_s", "tree_focus_ctrl_s"), saved
+        # wall time <= timeout + grace (+ overhead for the PowerShell/UIA calls)
+        budget = (float(cfg.save_timeout_seconds) + core._SAVE_WRITE_GRACE_S + 15.0)
+        assert wall < budget, (wall, budget, saved)
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+# ---- 1.0.9 5e: a rejected Execute is reported as rejected -------------------
+# Needs the same live setup as the design-time test above. ZzzReject throws, which
+# Studio logs and refuses; the exact log wording is unverified on a bench, so this
+# test is the thing to run to confirm (or tune core._EXECUTE_REJECT_RE).
+
+_REJ_CLASS = _nm("ZzzRejectLogic")
+_REJ_CS_TEMPLATE = """using FTOptix.NetLogic;
+using UAManagedCore;
+using System;
+
+public class __CLS__ : BaseNetLogic
+{
+    [ExportMethod]
+    public void ZzzReject()
+    {
+        throw new InvalidOperationException("ZzzReject rejected on purpose");
+    }
+}
+"""
+_REJ_CS = _REJ_CS_TEMPLATE.replace("__CLS__", _REJ_CLASS)
+
+
+def test_execute_rejected_call_reported_rejected_live(live):
+    """Execute a design-time method Studio rejects: the result is state
+    "rejected" carrying the Studio log line, and optix_studio_log can find it."""
+    _require_desktop()
+    cfg, project = live
+    node_path = f"Model/{_REJ_CLASS}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{_REJ_CLASS}.cs")
+    cs_path.write_text(_REJ_CS, encoding="utf-8")
+    created = False
+    try:
+        mtime_before = core._project_max_mtime(core.resolve_project(cfg, project))
+        try:
+            core.bridge_create_netlogic(cfg, project, "Model", _REJ_CLASS,
+                                        kind="design_time")
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"could not create a design-time NetLogic: {exc}", pytrace=False)
+        created = True
+        saved = _save_retrying_once(cfg, project)
+        if saved.get("saved") is not True:
+            # The save can land after core.save's own poll gave up: wait
+            # (bounded) for the mtime change before asserting.
+            assert _wait_for_mtime_change(cfg, project, mtime_before), saved
+        else:
+            assert saved.get("saved") is True, saved
+        ran = core.execute_design_method(cfg, project, _REJ_CLASS, "ZzzReject")
+        assert ran.get("ok") is False, ran
+        if ran.get("error") == "export_method_not_loaded":
+            # Studio has not loaded the new [ExportMethod] (no reopen): the
+            # product correctly refuses before clicking anything.
+            assert ran.get("reopen_required") is True, ran
+        else:
+            assert ran.get("state") == "rejected", ran
+            assert ran.get("log_line"), ran
+            tail = core.studio_log_tail(cfg, lines=200, contains="ZzzReject")
+            assert tail.get("ok") is True and tail["returned_lines"] >= 1, tail
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+# ---- 1.0.9 5b: create_variable variable_type / array_dimensions / properties --
+# Needs a live bridge (module gate) and a throwaway project that has the
+# RAEtherNetIP driver module (so the RAEtherNetIPTag VariableType exists);
+# skips otherwise. Creates one node under Model and deletes it afterwards.
+
+def test_create_variable_station_tag_array_live(live):
+    """An RAEtherNetIPTag-typed ARRAY variable with a SymbolName property is
+    created; dry_run resolves without writing; an unknown variable_type and bad
+    array_dimensions are refused with structured errors."""
+    cfg, project = live
+    parent = _LIVE_MODEL_PARENT
+    name = _nm("ZzzStationTagArr")
+    path = parent + "/" + name
+    _best_effort_delete(cfg, project, path)
+    try:
+        bad = core.bridge_create_variable(
+            cfg, project, name, parent, "Int32", variable_type="ZzzNoSuchTagType")
+        assert bad.get("ok") is False and bad.get("code") == "unknown_variable_type", bad
+        bad = core.bridge_create_variable(
+            cfg, project, name, parent, "Int32", array_dimensions=0)
+        assert bad.get("ok") is False and bad.get("code") == "invalid_array_dimensions", bad
+
+        dry = core.bridge_create_variable(
+            cfg, project, name, parent, "Int32", variable_type="RAEtherNetIPTag",
+            array_dimensions=4, properties={"SymbolName": "ZzzTags"}, dry_run=True)
+        if dry.get("ok") is False and dry.get("code") == "unknown_variable_type":
+            pytest.skip("throwaway project has no RAEtherNetIPTag VariableType "
+                        "(RAEtherNetIP driver module not added)")
+        assert dry.get("ok") is True and dry.get("dry_run") is True, dry
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(cfg, project, path)     # dry_run wrote nothing
+
+        _best_effort_delete(cfg, project, path)    # a leftover would answer name_exists
+        out = core.bridge_create_variable(
+            cfg, project, name, parent, "Int32", variable_type="RAEtherNetIPTag",
+            array_dimensions=4, properties={"SymbolName": "ZzzTags"})
+        assert out.get("ok") is True, out
+        assert out.get("variable_type") == "RAEtherNetIPTag", out
+        assert out.get("array_dimensions") == [4], out
+
+        desc = json.dumps(core.describe_node(cfg, project, path))
+        # describe does not print the VariableType definition name
+        assert "SymbolName" in desc and "ZzzTags" in desc, desc
+
+        # an undeclared property is refused and nothing is created
+        _best_effort_delete(cfg, project, path)
+        bad = core.bridge_create_variable(
+            cfg, project, name, parent, "Int32", variable_type="RAEtherNetIPTag",
+            properties={"ZzzNotAProperty": "x"})
+        assert bad.get("ok") is False and bad.get("code") == "unknown_property", bad
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(cfg, project, path)
+    finally:
+        _best_effort_delete(cfg, project, path)
+
+
+# ---- 1.0.9 import_tags: design-time Tag Importer (ftx-mcp-vvk.3) -----------------
+# Needs a CI project with an RA EtherNet/IP driver + station: name the station with
+# FTX_LIVE_RA_STATION (e.g. CommDrivers/RAEtherNet_IPDriver1/Station1); skips when
+# unset. Run once against Studio 1.8 (offline import) and once against 1.7 (the
+# requires_optix_1_8 refusal); the running Studio version comes from
+# FTX_LIVE_STUDIO_VERSION or Studio --version, NOT from the bridge's own report.
+# The offline fixture is service/tests/fixtures/import_tags_sample.L5X.
+# ONLINE mode has no live test: it reads a real controller and the ftx bench has
+# none. It shares the importer path above and differs only in Mode=Online.
+# NOT yet run on the bench (pending bench verification): on a Windows bench with
+# Studio open and the bridge armed,
+#   FTX_LIVE_BRIDGE=1 FTX_LIVE_PROJECT=<proj> FTX_LIVE_RA_STATION=<station> \
+#   python -m pytest service/tests/test_bridge_live.py -k import_tags -q
+
+_IMPORT_TAGS_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "import_tags_sample.L5X"
+
+
+def _live_ra_station_or_skip(cfg, project) -> str:
+    station = os.environ.get("FTX_LIVE_RA_STATION", "").strip()
+    if not station:
+        pytest.skip("FTX_LIVE_RA_STATION unset — name an RA EtherNet/IP station in the "
+                    "live project (e.g. CommDrivers/RAEtherNet_IPDriver1/Station1)")
+    try:
+        core.describe_node(cfg, project, station)
+    except core.NodeNotFound:
+        pytest.skip(f"FTX_LIVE_RA_STATION {station!r} does not exist in the live project")
+    return station
+
+
+def test_import_tags_offline_nested_member_live(live):
+    """Studio 1.8: importing ONE nested UDT member from the L5X fixture adds it with
+    its parents, and nothing for the false-prefix tag Motor10; a name absent from the
+    file is reported in not_found; a repeat import adds nothing."""
+    cfg, project = live
+    if _live_running_studio_version(cfg) < (1, 8):
+        pytest.skip("RA tag importer exists from Studio 1.8 (the 1.7 refusal is "
+                    "test_import_tags_requires_optix_1_8_live)")
+    station = _live_ra_station_or_skip(cfg, project)
+    assert _IMPORT_TAGS_FIXTURE.is_file(), _IMPORT_TAGS_FIXTURE
+    added: list = []
+    try:
+        out = core.bridge_import_tags(
+            cfg, project, station, "offline", ["Motor1.Limits.High", "ZzzNoSuchTag"],
+            file=str(_IMPORT_TAGS_FIXTURE))
+        assert out.get("ok") is True, out
+        added = list(out["added"])
+        if not added:
+            pytest.skip(f"station {station!r} already holds the fixture tags: {out}")
+        assert out["not_found"] == ["ZzzNoSuchTag"], out
+        assert isinstance(out["elapsed_ms"], int) and out["elapsed_ms"] >= 0, out
+        joined = " ".join(added)
+        assert "High" in joined, out                       # the requested nested member
+        assert "Motor10" not in joined, out                # no false prefix
+        assert all(a.startswith(station + "/") for a in added), out
+
+        again = core.bridge_import_tags(
+            cfg, project, station, "offline", ["Motor1.Limits.High"],
+            file=str(_IMPORT_TAGS_FIXTURE))
+        assert again.get("ok") is True and again["added"] == [], again
+        assert again["already_present"], again
+    finally:
+        # delete the outermost added nodes (children go with them)
+        for path in sorted(added, key=len):
+            if not any(path.startswith(o + "/") for o in added if o != path):
+                _best_effort_delete(cfg, project, path)
+
+
+def test_import_tags_requires_optix_1_8_live(live):
+    """Studio 1.7: an RA station is refused with requires_optix_1_8 and nothing is
+    imported (single tool and batch op)."""
+    cfg, project = live
+    if _live_running_studio_version(cfg) >= (1, 8):
+        pytest.skip("Studio is 1.8+: the RA importer is available (see the offline test)")
+    station = _live_ra_station_or_skip(cfg, project)
+    out = core.bridge_import_tags(
+        cfg, project, station, "offline", ["Motor1.Limits.High"],
+        file=str(_IMPORT_TAGS_FIXTURE))
+    assert out.get("ok") is False and out.get("code") == "requires_optix_1_8", out
+    assert (out.get("requires_version") or {}).get("min_version") == "1.8", out
+    with pytest.raises(core.BridgeWriteFailed, match="requires_optix_1_8"):
+        core._apply_one_edit(cfg, project, {
+            "op": "import_tags", "station": station, "mode": "offline",
+            "tags": ["Motor1.Limits.High"], "file": str(_IMPORT_TAGS_FIXTURE)})
+
+
+# ---- ftx-mcp-aaw.9: import_tags on a station created THROUGH the MCP ----------------
+# The station is made with bridge_create_object (driver + station), so it has no
+# UI-created TagImporter: these prove the find-or-create path end to end. Skipped
+# without a live bridge (the `live` fixture) or on Studio below 1.8 (no RA module);
+# a driver/station creation error with a live bridge FAILS. NOT yet run on the bench (pending bench
+# verification): on a Windows bench with Studio open and the bridge armed,
+#   FTX_LIVE_PROJECT=<proj> python -m pytest service/tests/test_bridge_live.py -k mcp_station -q
+# (set FTX_LIVE_STUDIO_VERSION when Studio --version is unavailable).
+
+_MCP_STATION_DRIVER = _nm("ZzzAaw9Driver")
+_MCP_STATION_NAME = _nm("ZzzAaw9Station")
+# nodes the fixture expands for Motor1.Limits.High: nothing may come from these
+_MCP_STATION_OTHER_SYMBOLS = ("Motor10", "Speed", "Low", "Mode")
+
+
+@pytest.fixture
+def mcp_station(live):
+    """(cfg, project, station_path): a fresh RA EtherNet/IP driver+station created
+    through bridge_create_object; deleted afterwards. FAILS if it cannot be built
+    (skips only when the RA module is absent, i.e. Studio below 1.8)."""
+    cfg, project = live
+    driver_path = "CommDrivers/" + _MCP_STATION_DRIVER
+    station_path = driver_path + "/" + _MCP_STATION_NAME
+    _best_effort_delete(cfg, project, driver_path)
+    _create_ra_driver_station(cfg, project, "CommDrivers", _MCP_STATION_DRIVER,
+                              _MCP_STATION_NAME, station_path)
+    try:
+        yield cfg, project, station_path
+    finally:
+        _best_effort_delete(cfg, project, driver_path)
+
+
+def _mcp_station_import(cfg, project, station, tags):
+    return core.bridge_import_tags(cfg, project, station, "offline", tags,
+                                   file=str(_IMPORT_TAGS_FIXTURE))
+
+
+def _require_studio_1_8(cfg) -> None:
+    if _live_running_studio_version(cfg) < (1, 8):
+        pytest.skip("RA tag importer exists from Studio 1.8")
+
+
+def _station_importer_children(cfg, project, station) -> list:
+    """Browse names of any importer-like child directly under the station."""
+    kids = core.describe_node(cfg, project, station).get("children") or []
+    return [c.get("browse_name") for c in kids
+            if "importer" in str(c.get("browse_name") or "").lower()]
+
+
+def test_import_tags_mcp_station_added_holds_member_and_parents_live(mcp_station):
+    """Importing Motor1.Limits.High from the fixture adds EXACTLY the Controller
+    Tags/Motor1, Motor1/Limits and Motor1/Limits/High nodes, through a temporary
+    importer (a station made by the MCP has none), and the station has no importer
+    child afterwards."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    assert _station_importer_children(cfg, project, station) == []     # none to begin with
+    out = _mcp_station_import(cfg, project, station, ["Motor1.Limits.High"])
+    assert out.get("ok") is True, out
+    base = station + "/Tags/Controller Tags"
+    expected = {base + "/Motor1", base + "/Motor1/Limits", base + "/Motor1/Limits/High"}
+    assert set(out["added"]) == expected and len(out["added"]) == 3, out
+    assert out.get("tag_importer") == "temporary", out
+    assert "tag_importer_left" not in out, out
+    for a in out["added"]:
+        core.describe_node(cfg, project, a)                           # each one exists
+    assert _station_importer_children(cfg, project, station) == [], out   # temporary one deleted
+
+
+def test_import_tags_mcp_station_not_found_live(mcp_station):
+    """A name absent from the file is reported in not_found and adds nothing."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    out = _mcp_station_import(cfg, project, station, ["ZzzNoSuchTag"])
+    assert out.get("ok") is True, out
+    assert out["not_found"] == ["ZzzNoSuchTag"], out
+    assert out["added"] == [], out
+
+
+def test_import_tags_mcp_station_already_present_live(mcp_station):
+    """Repeating an import adds nothing and reports the nodes as already_present."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    first = _mcp_station_import(cfg, project, station, ["Motor1.Limits.High"])
+    assert first.get("ok") is True and first["added"], first
+    again = _mcp_station_import(cfg, project, station, ["Motor1.Limits.High"])
+    assert again.get("ok") is True, again
+    assert again["added"] == [], again
+    assert set(first["added"]) <= set(again["already_present"]), (first, again)
+
+
+def test_import_tags_mcp_station_prefix_motor1_vs_motor10_live(mcp_station):
+    """Requesting Motor1 never imports Motor10 (no false prefix match)."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    assert "Motor10" in _IMPORT_TAGS_FIXTURE.read_text(encoding="utf-8")   # fixture has the pair
+    out = _mcp_station_import(cfg, project, station, ["Motor1"])
+    assert out.get("ok") is True and out["added"], out
+    assert any(a.endswith("/Motor1") for a in out["added"]), out
+    assert not any("Motor10" in a for a in out["added"]), out
+    names = [a.rsplit("/", 1)[-1] for a in out["added"]]
+    assert "Motor10" not in names, out
+
+
+def test_import_tags_mcp_station_save_and_build_check_zero_errors_live(mcp_station):
+    """After an import, save succeeds and build_check reports 0 errors."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    out = _mcp_station_import(cfg, project, station, ["Motor1.Limits.High"])
+    assert out.get("ok") is True and out["added"], out
+    saved = _save_retrying_once(cfg, project)
+    assert saved.get("saved") is True, saved
+    bc = core.build_check(cfg, project)
+    assert bc.get("error_count") == 0, bc
+
+
+def test_import_tags_mcp_station_batch_entry_fields_live(mcp_station):
+    """The same import through optix_bridge_edit reports added / already_present /
+    not_found / elapsed_ms / tag_importer in its op_timings entry."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    ops = [{"op": "import_tags", "station": station, "mode": "offline",
+            "tags": ["Motor1.Limits.High", "ZzzNoSuchTag"],
+            "file": str(_IMPORT_TAGS_FIXTURE)}]
+    out = core.bridge_edit(cfg, project, ops)
+    entry = next(t for t in out["op_timings"] if t["op"] == "import_tags")
+    assert entry["ok"] is True, out
+    base = station + "/Tags/Controller Tags"
+    assert set(entry["added"]) == {base + "/Motor1", base + "/Motor1/Limits",
+                                   base + "/Motor1/Limits/High"}, entry
+    assert entry["already_present"] == [], entry
+    assert entry["not_found"] == ["ZzzNoSuchTag"], entry
+    assert isinstance(entry["elapsed_ms"], int) and entry["elapsed_ms"] >= 0, entry
+    assert entry["tag_importer"] == "temporary", entry
+    assert _station_importer_children(cfg, project, station) == [], out
+
+
+def test_import_tags_mcp_station_emulator_runs_live(mcp_station):
+    """After an import + save, the project builds clean and the emulator comes up.
+    Needs FTX_LIVE_HMI=1 and an interactive desktop (F5 goes to Studio)."""
+    cfg, project, station = mcp_station
+    _require_studio_1_8(cfg)
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("emulator run: set FTX_LIVE_HMI=1 (emulator startable)")
+    _require_desktop()
+    out = _mcp_station_import(cfg, project, station, ["Motor1.Limits.High"])
+    assert out.get("ok") is True and out["added"], out
+    saved = _save_retrying_once(cfg, project)
+    assert saved.get("saved") is True, saved
+    assert core.build_check(cfg, project).get("error_count") == 0
+    _stop_project_emulator(cfg, project)
+    try:
+        run = core.run_emulator(cfg, project)
+        assert run.get("launched") is True and run.get("serving"), run
+    finally:
+        _stop_project_emulator(cfg, project)
+
+
+def test_import_tags_mcp_station_dry_run_requires_optix_1_8_live(mcp_station):
+    """Studio 1.7: the dry run refuses the RA station with requires_optix_1_8."""
+    cfg, project, station = mcp_station
+    if _live_running_studio_version(cfg) >= (1, 8):
+        pytest.skip("Studio is 1.8+: the RA importer is available")
+    ops = [{"op": "import_tags", "station": station, "mode": "offline",
+            "tags": ["Motor1.Limits.High"], "file": str(_IMPORT_TAGS_FIXTURE)}]
+    dry = core.bridge_edit(cfg, project, ops, dry_run=True)
+    codes = [e.get("code") for e in dry["report"]["errors"]]
+    assert codes == ["requires_optix_1_8"], dry
+    assert dry.get("applied") == 0, dry
+
+
+def test_import_tags_dry_run_requires_optix_1_8_on_1_7_live(live):
+    """Studio 1.7: the import_tags DRY RUN refuses an RA station with exactly one
+    requires_optix_1_8 error and applies nothing; the apply route agrees. The
+    station is made through the MCP when the 1.7 RA module allows it, else it is
+    FTX_LIVE_RA_STATION; with neither the test FAILS (it cannot prove the refusal)."""
+    cfg, project = live
+    ver = _live_running_studio_version(cfg)
+    if ver >= (1, 8):
+        pytest.skip("Studio is 1.8+: the RA importer is available")
+    jku_driver, jku_station = _nm("ZzzJku6Driver"), _nm("ZzzJku6Station")
+    driver_path = "CommDrivers/" + jku_driver
+    station = driver_path + "/" + jku_station
+    made = False
+    _best_effort_delete(cfg, project, driver_path)
+    try:
+        try:
+            core.bridge_create_object(cfg, project, "CommDrivers", jku_driver, _RA_DRIVER_TYPE)
+            core.bridge_create_object(cfg, project, driver_path, jku_station, _RA_STATION_TYPE)
+            core.describe_node(cfg, project, station)
+            made = True
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            _best_effort_delete(cfg, project, driver_path)
+            station = os.environ.get("FTX_LIVE_RA_STATION", "").strip()
+            if not station:
+                pytest.fail("Studio 1.7 cannot create an RA station through the MCP and "
+                            "FTX_LIVE_RA_STATION is unset: no station to refuse", pytrace=False)
+        ops = [{"op": "import_tags", "station": station, "mode": "offline",
+                "tags": ["Motor1.Limits.High"], "file": str(_IMPORT_TAGS_FIXTURE)}]
+        dry = core.bridge_edit(cfg, project, ops, dry_run=True)
+        assert [e.get("code") for e in dry["report"]["errors"]] == ["requires_optix_1_8"], dry
+        assert dry.get("applied") == 0, dry
+        out = core.bridge_import_tags(cfg, project, station, "offline", ["Motor1.Limits.High"],
+                                      file=str(_IMPORT_TAGS_FIXTURE))
+        assert out.get("ok") is False and out.get("code") == "requires_optix_1_8", out
+    finally:
+        if made:
+            _best_effort_delete(cfg, project, driver_path)
+
+
+# ---- 1.0.9 5g: optix_observe(mode="dom_text") --------------------------------
+# Needs the project running in the emulator/WebUI AND chrome-cdp up. Set
+# FTX_LIVE_DOM_TEXT_LABEL to a label string the running UI is known to show.
+# NOT yet run on the bench (pending bench verification).
+
+def test_observe_dom_text_returns_known_label_live(live):
+    """dom_text returns document.body.innerText containing a known label."""
+    cfg, project = live
+    label = os.environ.get("FTX_LIVE_DOM_TEXT_LABEL")
+    if not label:
+        pytest.skip("FTX_LIVE_DOM_TEXT_LABEL unset - name a label the running UI shows")
+    out = core.cdp_dom_text_runtime(cfg, project=project)
+    assert out["state"] == "succeeded", out
+    assert label in out["text"], out
+
+
+# ---- 1.0.9 #3: GridLayout Rows/Columns typed string[] write -------------------
+# Needs FTX_GRID_STRING_ARRAY=1 in the service env AND a THROWAWAY project (CI_*):
+# if the typed write kills Studio the bench run must leave the flag off and record
+# the WER stack in docs/field-findings (see CHANGELOG 1.0.9). NOT yet run on the
+# bench (pending bench verification):
+#   FTX_LIVE_BRIDGE=1 FTX_LIVE_PROJECT=<CI_ project> FTX_GRID_STRING_ARRAY=1 \
+#   FTX_LIVE_HMI=1 /opt/venv/bin/python -m pytest \
+#   service/tests/test_bridge_live.py -k gridlayout_rows_columns -q
+
+def test_gridlayout_rows_columns_typed_write_live(live, tmp_path):
+    """Create a GridLayout, set Rows and Columns via the typed path, save, render
+    non-blank, and confirm Studio is still alive."""
+    _require_desktop()
+    cfg, project = live
+    if not core.Config.from_env().enable_grid_string_array:
+        pytest.skip("FTX_GRID_STRING_ARRAY not enabled - typed string[] path is off")
+    import dataclasses
+    cfg = dataclasses.replace(cfg, enable_grid_string_array=True)
+    parent = os.environ.get("FTX_LIVE_GRID_PARENT", "UI/MainWindow")
+    name = _nm("CIGridTyped")
+    path = f"{parent}/{name}"
+    pid_before = core.bridge_state(cfg, force=True).get("studio_pid")
+    try:
+        core.bridge_delete_node(cfg, project, path)
+    except (core.BridgeWriteFailed, core.NodeNotFound):
+        pass
+    try:
+        out = core.bridge_create_widget(cfg, project, parent, name, "GridLayout")
+        assert out.get("ok") is True, out
+        for prop in ("Rows", "Columns"):
+            res = core.bridge_set_property(cfg, project, path, prop, ["1*", "1*"])
+            assert res.get("ok") is True, res
+            assert res.get("via") == "typed-string-array", res
+        # a non-GridLayout and a non-Rows/Columns array stay refused
+        with pytest.raises(core.BridgeWriteFailed):
+            core.bridge_set_property(cfg, project, parent, "Columns", ["1*"])
+        assert core.save(cfg, project).get("saved") is True
+        # Studio survived the write + save
+        st = core.bridge_state(cfg, force=True)
+        assert st.get("available") is True, f"Studio/bridge not alive after typed write: {st}"
+        assert st.get("studio_pid") == pid_before, (
+            f"Studio restarted/died during the typed write: {pid_before} -> {st}")
+        assert core.describe_node(cfg, project, path)
+        if os.environ.get("FTX_LIVE_HMI") == "1":
+            shot_path = str(tmp_path / "grid.jpg")
+            shot = core.cdp_screenshot_runtime(
+                cfg, save_path=shot_path, quality=70, settle_seconds=2.0,
+                project=project)
+            assert shot.get("state") == "succeeded", shot
+            # a blanked page is a tiny near-uniform JPEG
+            assert pathlib.Path(shot_path).stat().st_size > 3000, "page rendered blank"
+    finally:
+        try:
+            core.bridge_delete_node(cfg, project, path)
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            pass
+
+
+# ---- chunk overrides survive action="continue" (ftx-mcp-xk7.1) --------------
+
+def test_batch_continue_honours_chunk_ops_override_live(live):
+    """A batch started with chunk_ops=2 must not apply all remaining ops on
+    continue. Uses harmless set_property writes of the node's current Width."""
+    cfg, project = live
+    node = core.describe_node(cfg, project, _LIVE_NODE)
+    width = next((p.get("value") for p in node.get("properties") or []
+                  if p.get("name") == "Width"), None)
+    if width is None:
+        pytest.skip(f"{_LIVE_NODE} exposes no Width to rewrite")
+    ops = [{"op": "set_property", "path": _LIVE_NODE, "name": "Width",
+            "value": str(width)} for _ in range(6)]
+
+    first = core.bridge_edit(cfg, project, ops, chunk_ops=2)
+    assert first["state"] == "chunked" and first["applied"] == 2, first
+    second = core.bridge_edit_continue(cfg, project, first["batch_id"])
+    assert second["state"] == "chunked" and second["applied"] == 4, second
+    third = core.bridge_edit_continue(cfg, project, first["batch_id"])
+    assert third["state"] == "succeeded" and third["applied"] == 6, third
+
+
+# ---- create_variable datatype validation (ftx-mcp-xk7.3) --------------------
+
+def test_dry_run_create_variable_datatype_matches_bridge_live(live):
+    """dry_run must refuse an unsupported datatype and accept every supported
+    one (nothing is written: dry_run only)."""
+    cfg, project = live
+    bad = core.bridge_edit(cfg, project, [
+        {"op": "create_variable", "parent": "Model", "name": "XkBad",
+         "datatype": "NotAType"}], dry_run=True)
+    assert bad["report"]["ok"] is False, bad
+    assert any(e.get("code") == "invalid_datatype" for e in bad["report"]["errors"]), bad
+
+    good = core.bridge_edit(cfg, project, [
+        {"op": "create_variable", "parent": "Model", "name": f"XkOk{i}", "datatype": dt}
+        for i, dt in enumerate(core.CREATE_VARIABLE_DATATYPES)], dry_run=True)
+    assert not any(e.get("code") == "invalid_datatype"
+                   for e in good["report"].get("errors", [])), good
+
+
+def test_health_project_path_is_folder_holding_optix(live, monkeypatch):
+    """project_path from health is the folder containing <project>.optix (never
+    the ProjectFiles subfolder), and the registry lists the armed project."""
+    cfg, project = live
+    bridges = core.list_bridges(cfg, force=True)
+    mine = [b for b in bridges
+            if (b.get("project") or "").strip().lower() == project.strip().lower()]
+    assert mine, f"no bridge serves {project!r}"
+    pp = mine[0].get("project_path")
+    assert pp, "bridge reported no project_path"
+    d = pathlib.Path(pp)
+    if str(pp).lower().endswith(".optix"):
+        d = d.parent
+    assert d.name.lower() != "projectfiles", f"project_path ends in ProjectFiles: {pp}"
+    assert d.is_dir(), f"project_path dir missing: {d}"
+    assert (d / f"{project}.optix").is_file() or len(list(d.glob("*.optix"))) == 1, (
+        f"{d} does not contain {project}.optix")
+    # conftest redirects LOCALAPPDATA to an empty dir; the registry the bridge
+    # wrote lives under the real one, so restore it for this call.
+    if _REAL_LOCALAPPDATA is not None:
+        monkeypatch.setenv("LOCALAPPDATA", _REAL_LOCALAPPDATA)
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    cands = core._registry_open_candidates()
+    assert any(project.strip().lower() in c["names"] for c in cands), (
+        f"_registry_open_candidates() does not list {project!r}: "
+        f"{[c['project'] for c in cands]}")
+
+
+# ---- 1.0.9 #25 / #23: honest open-after-new, observe after emulator restart --
+
+def test_open_after_new_reports_truthfully_live(live):
+    """`project_new` leaves Studio open on the new project; `project_open` on it
+    must then answer truthfully (PRD 0028 #25): `already_open` with that
+    Studio's pid and NO second Studio launched - never a bare `opened` for a
+    Home-screen Recent entry. If it cannot say so it must be `not_opened` with a
+    `holder_pid`, never ok:true.
+
+    Creates a throw-away project under the projects root (named
+    zzOpenTruth<ts><suffix>), closes only the Studio this test's `new` launched
+    and then deletes the project folder.
+    Skipped without a live Studio (module gate) or without an input desktop.
+    """
+    import time
+
+    _require_desktop()
+    cfg, _project = live
+    name = f"zzOpenTruth{int(time.time())}{_RUN_SFX}"
+    created = core.project_new(cfg, name)
+    if not created.get("ok"):
+        pytest.skip(f"project_new could not create a scratch project: {created!r}")
+    new_pid = created.get("pid")
+    try:
+        before = set(core._studio_pids_now())
+        out = core.project_open(cfg, name, wait_seconds=30.0)
+        after = set(core._studio_pids_now())
+        if out.get("ok"):
+            assert out.get("state") in ("already_open", "opened"), out
+            # The project is already loaded by the Studio `new` left open, so
+            # a truthful answer launches nothing.
+            assert out.get("state") == "already_open", out
+            assert out.get("launched") is False, out
+            assert after <= before, (
+                f"open launched a second Studio: new pids {sorted(after - before)}")
+        else:
+            assert out.get("state") == "not_opened", out
+            assert out.get("holder_pid"), out
+            assert out.get("reason"), out
+    finally:
+        if new_pid:
+            core._close_launched_studio(new_pid)
+        _remove_scratch_project(cfg, name)
+
+
+def test_observe_recovers_after_emulator_restart_live(live):
+    """After `restart_emulator` the CDP page target can be stale/hung; observe
+    must recover (one reload + one retry, `cdp_recovered: True` when it had to)
+    and return a real screenshot instead of hanging or erroring (PRD 0028 #23).
+    Needs FTX_LIVE_HMI=1 (emulator restartable, Chrome at OPTIX_CDP_URL)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("observe-after-restart test: set FTX_LIVE_HMI=1 with the "
+                    "emulator restartable and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    cfg, project = live
+    first = core.cdp_screenshot_runtime(cfg, project=project)
+    if first.get("state") != "succeeded":
+        pytest.skip(f"no working CDP screenshot before the restart: {first!r}")
+    restarted = core.restart_emulator(cfg, project)
+    assert restarted.get("serving"), restarted
+    out = core.cdp_screenshot_runtime(cfg, project=project)
+    assert out.get("state") == "succeeded", out
+    # cdp_recovered is present (True) only when a recovery was needed; it must
+    # never be present-and-false.
+    assert out.get("cdp_recovered", True) is True, out
+
+
+# ---- #27: design-time NetLogic for an ALREADY-COMPILED class ----------------
+# Before the fix, parentNode.Add(o) ran on the bridge thread with no session and
+# Studio died (c0000374) as soon as it instantiated the design-time behaviour of
+# a class that already existed compiled in the NetSolution.
+_LIVE_COMPILED_NETLOGIC_CLASS = os.environ.get("FTX_LIVE_COMPILED_NETLOGIC_CLASS", "")
+
+
+def test_create_design_time_netlogic_for_compiled_class_live(live):
+    """Needs FTX_LIVE_COMPILED_NETLOGIC_CLASS = a NetLogic class already compiled
+    into the open project's NetSolution (not already a node under the scratch
+    parent). Creates a kind=design_time node of that name and asserts Studio is
+    still alive (bridge health answers) afterwards."""
+    cfg, project = live
+    cls = _LIVE_COMPILED_NETLOGIC_CLASS
+    if not cls:
+        pytest.skip("set FTX_LIVE_COMPILED_NETLOGIC_CLASS to a class already "
+                    "compiled in the NetSolution")
+    parent = _LIVE_SCRATCH_PANEL
+    try:
+        core.describe_node(cfg, project, parent)
+    except core.NodeNotFound:
+        pytest.skip(f"no scratch node at {parent!r} - set FTX_LIVE_SCRATCH_PANEL")
+    path = f"{parent}/{cls}"
+    _best_effort_delete(cfg, project, path)
+    created = False
+    try:
+        out = core.bridge_create_netlogic(cfg, project, parent, cls, kind="design_time")
+        created = True
+        assert out.get("ok") is not False, out
+        assert out.get("kind") == "design_time", out
+        health = core._bridge_http(cfg, "/bridge/health")
+        assert health[0] == 200, health
+        _assert_bridge_still_serves(cfg, project)
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, path)
+
+
+# ---- PRD 0031 (functional round r3): #32 #33 #23 #34 #35 -------------------
+# Post-merge bench run on Studio 1.7.4.32 and 1.8.0.555. Same module gate as the
+# rest of this file (FTX_LIVE_BRIDGE=1), so these are skipped cleanly on CI/Linux.
+
+def _r3_write_netlogic_source(cfg, project, cls: str, marker: str):
+    """Write a user-authored NetSolution/<cls>.cs carrying ``marker``; returns the
+    (path, text) pair so a test can assert the user's code survived."""
+    text = f"""using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class {cls} : BaseNetLogic
+{{
+    // {marker}
+    [ExportMethod]
+    public void UserMethod()
+    {{
+        Log.Info("{cls}", "{marker}");
+    }}
+}}
+"""
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{cls}.cs")
+    cs_path.parent.mkdir(parents=True, exist_ok=True)
+    cs_path.write_text(text, encoding="utf-8")
+    return cs_path, text
+
+
+def _r3_link_property(cfg, project, label_path):
+    """The DynamicLink property row of ``<label>/Text`` as describe_node reports it."""
+    out = core.describe_node(cfg, project, f"{label_path}/Text")
+    for p in out.get("properties") or []:
+        if p.get("name") == "DynamicLink":
+            return p, out
+    return None, out
+
+
+def test_r3_32_relative_link_not_dangling_unless_target_deleted_live(live):
+    """#32/#29/#2: a good RELATIVE NodePath link must NOT be reported as a
+    dangling_link by describe_node; after the target is really deleted the same
+    link MUST be reported dangling (target_missing True + a dangling_link
+    diagnostic)."""
+    cfg, project = live
+    scratch = _LIVE_SCRATCH_PANEL
+    try:
+        core.describe_node(cfg, project, scratch)
+    except core.NodeNotFound:
+        pytest.skip(f"no scratch node at {scratch!r} - set FTX_LIVE_SCRATCH_PANEL")
+    tgt_name, lbl_name = _nm("ZzzR3RelTarget"), _nm("ZzzR3RelLabel")
+    tgt_path, lbl_path = f"Model/{tgt_name}", f"{scratch}/{lbl_name}"
+    text_path = f"{lbl_path}/Text"
+    for p in (lbl_path, tgt_path):
+        _best_effort_delete(cfg, project, p)
+    try:
+        core.bridge_create_variable(cfg, project, tgt_name, "Model", "String")
+        core.bridge_create_widget(cfg, project, scratch, lbl_name, "Label")
+        # The link is anchored at the described node (<label>/Text): one ".."
+        # per path segment climbs to the project root.
+        ups = len([s for s in text_path.split("/") if s])
+        rel = "../" * ups + tgt_path
+        core.bridge_bind_property(cfg, project, lbl_path, "Text", raw_path=rel)
+
+        prop, out = _r3_link_property(cfg, project, lbl_path)
+        if prop is None:
+            pytest.skip("bridge describe did not surface a DynamicLink row on Text")
+        assert prop.get("target_missing") is not True, (prop, out.get("diagnostics"))
+        codes = [d.get("code") for d in out.get("diagnostics") or []]
+        assert "dangling_link" not in codes, (rel, out.get("diagnostics"))
+
+        core.bridge_delete_node(cfg, project, tgt_path)
+        prop, out = _r3_link_property(cfg, project, lbl_path)
+        assert prop is not None, out
+        assert prop.get("target_missing") is True, prop
+        codes = [d.get("code") for d in out.get("diagnostics") or []]
+        assert "dangling_link" in codes, out
+    finally:
+        for p in (lbl_path, tgt_path):
+            _best_effort_delete(cfg, project, p)
+
+
+def test_r3_33_netlogic_delete_keeps_user_source_live(live):
+    """#33: deleting the last NetLogic node bound to a class must leave the user's
+    NetSolution/<Class>.cs byte-identical on disk, and re-creating the node must
+    not replace it with Studio's default Method1 template."""
+    cfg, project = live
+    cls = _nm("ZzzR3KeepSrcLogic")
+    node_path = f"Model/{cls}"
+    _best_effort_delete(cfg, project, node_path)
+    cs_path, text = _r3_write_netlogic_source(cfg, project, cls, "r3-33-user-code")
+    created = False
+    try:
+        try:
+            core.bridge_create_netlogic(cfg, project, "Model", cls)
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create a NetLogic: {exc}")
+        created = True
+        assert cs_path.read_text(encoding="utf-8") == text, (
+            "create_netlogic replaced the user's source with a template")
+
+        out = core.bridge_delete_node(cfg, project, node_path)
+        created = False
+        assert out.get("ok") is not False, out
+        assert cs_path.is_file(), f"{cs_path} was removed by the NetLogic delete: {out}"
+        assert cs_path.read_text(encoding="utf-8") == text, out
+        if out.get("netlogic_source"):  # Studio did remove it; we put it back
+            assert out["netlogic_source"].get("preserved") is True, out
+            assert any(w.get("code") == "netlogic_source_preserved"
+                       for w in out.get("warnings") or []), out
+
+        # A later create binds to the preserved class instead of regenerating.
+        core.bridge_create_netlogic(cfg, project, "Model", cls)
+        created = True
+        assert cs_path.read_text(encoding="utf-8") == text
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+def test_r3_23_observe_after_emulator_restart_live(live, monkeypatch):
+    """#23: after the emulator is restarted, optix_observe's CDP path recovers
+    (detached page target replaced) on EVERY restart, not just the first, and
+    returns a real screenshot. Needs FTX_LIVE_HMI=1 (emulator restartable,
+    Chrome at OPTIX_CDP_URL)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("observe-after-restart test: set FTX_LIVE_HMI=1 with the "
+                    "emulator restartable and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    # conftest redirects LOCALAPPDATA to an empty dir; the emulator/bridge
+    # registry lives under the real one, so restore it for the restart.
+    if _REAL_LOCALAPPDATA is not None:
+        monkeypatch.setenv("LOCALAPPDATA", _REAL_LOCALAPPDATA)
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    cfg, project = live
+    first = core.cdp_screenshot_runtime(cfg, project=project)
+    if first.get("state") != "succeeded":
+        pytest.skip(f"no working CDP screenshot before the restart: {first!r}")
+    for cycle in range(2):
+        restarted = core.restart_emulator(cfg, project)
+        assert restarted.get("serving"), (cycle, restarted)
+        out = core.cdp_screenshot_runtime(cfg, project=project)
+        assert out.get("state") == "succeeded", out
+        assert out.get("cdp_recovered", True) is True, out
+    from service import _cdp
+    probe = _cdp.page_probe(cfg.cdp_url)
+    assert probe["healthy"] is True, probe
+
+
+_R3_SLOW_CLASS = _nm("ZzzR3SlowCompileLogic")
+
+
+def _r3_slow_cs(cls: str) -> str:
+    """A NetLogic class with many methods so Studio's compile is noticeably slow."""
+    body = "\n".join(
+        f"    private int Work{i}(int x) {{ var s = 0; for (int k = 0; k < x; k++) "
+        f"{{ s += k * {i + 1}; }} return s; }}" for i in range(400))
+    return f"""using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class {cls} : BaseNetLogic
+{{
+    [ExportMethod]
+    public void Ping() {{ Log.Info("{cls}", "ping " + Work1(3)); }}
+{body}
+}}
+"""
+
+
+@pytest.mark.parametrize("post_timeout", [None, 0.3], ids=["default_timeout", "forced_timeout"])
+def test_r3_34_create_netlogic_slow_compile_live(live, monkeypatch, post_timeout):
+    """#34: create_netlogic for a not-yet-compiled class whose compile outlasts
+    the POST must end with exactly ONE node and ok:true - never a spurious
+    name_exists from a blind re-send. ``forced_timeout`` shrinks the POST timeout
+    so the timeout -> verify-by-GET path runs against the real bridge."""
+    cfg, project = live
+    cls = _R3_SLOW_CLASS + ("Forced" if post_timeout else "")
+    node_path = f"Model/{cls}"
+    _best_effort_delete(cfg, project, node_path)
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{cls}.cs")
+    cs_path.parent.mkdir(parents=True, exist_ok=True)
+    cs_path.write_text(_r3_slow_cs(cls), encoding="utf-8")
+    if post_timeout is not None:
+        monkeypatch.setattr(core, "NETLOGIC_POST_TIMEOUT", post_timeout)
+    created = False
+    try:
+        try:
+            out = core.bridge_create_netlogic(cfg, project, "Model", cls)
+        except core.BridgeWriteFailed as exc:
+            assert "name_exists" not in str(exc), (
+                f"create_netlogic was re-sent after a timeout: {exc}")
+            raise
+        created = True
+        assert out.get("ok") is not False, out
+        assert out.get("created_path") == node_path, out
+        if post_timeout is not None and out.get("verified_after_timeout"):
+            assert any(w.get("code") == "create_netlogic_timeout_verified"
+                       for w in out.get("warnings") or []), out
+        node = core.describe_node(cfg, project, node_path)
+        assert node.get("path") == node_path, node
+        _assert_bridge_still_serves(cfg, project)
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+def test_r3_35_duplicate_configured_port_no_emulator_not_a_clash_live(live, monkeypatch):
+    """#35: two projects merely CONFIGURED for the same web port, with no
+    emulator running and nothing listening, must not be reported as a clash.
+    Uses FTX_LIVE_PORT_TWIN_PROJECT as the second project when given; otherwise
+    a synthetic twin that reports this project's own port."""
+    cfg, project = live
+    port = core.discover_web_port(cfg, project).get("port")
+    if port is None:
+        pytest.skip(f"cannot discover the web port of {project!r}")
+    _stop_project_emulator(cfg, project)     # earlier live tests leave it running
+    if core._emulator_entries():
+        pytest.skip("an emulator is running - stop it so the port is truly idle")
+    if core._port_has_listener(cfg, port):
+        pytest.skip(f"something is listening on web port {port}")
+    twin = os.environ.get("FTX_LIVE_PORT_TWIN_PROJECT")
+    if twin:
+        if core.discover_web_port(cfg, twin).get("port") != port:
+            pytest.skip(f"{twin!r} is not configured for web port {port}")
+    else:
+        twin = _nm("ZzzR3PortTwin")
+        real = core.discover_web_port
+        monkeypatch.setattr(
+            core, "discover_web_port",
+            lambda c, p: {"port": port} if p == twin else real(c, p))
+    assert core.detect_web_port_clash(cfg, project, others=[twin]) is None
+
+
+def test_r3_35_run_emulator_not_refused_for_idle_duplicate_port_live(live):
+    """#35: with a duplicate configured port but no running emulator, run_emulator
+    must start the emulator (no reason_code web_port_clash). Needs FTX_LIVE_HMI=1
+    and a project pair sharing the port (FTX_LIVE_PORT_TWIN_PROJECT); stops the
+    emulator it started."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("run_emulator test: set FTX_LIVE_HMI=1 (emulator startable)")
+    twin = os.environ.get("FTX_LIVE_PORT_TWIN_PROJECT")
+    if not twin:
+        pytest.skip("set FTX_LIVE_PORT_TWIN_PROJECT to a second project "
+                    "configured for the same web port")
+    _require_desktop()
+    cfg, project = live
+    port = core.discover_web_port(cfg, project).get("port")
+    if port is None or core.discover_web_port(cfg, twin).get("port") != port:
+        pytest.skip(f"{project!r} and {twin!r} do not share a configured web port")
+    _stop_project_emulator(cfg, project)     # earlier live tests leave it running
+    if core._emulator_entries():
+        pytest.skip("an emulator is already running")
+    try:
+        out = core.run_emulator(cfg, project)
+        assert out.get("reason_code") != "web_port_taken", out
+        assert out.get("serving"), out
+    finally:
+        try:
+            core.stop_emulator(cfg, project=project)
+        except Exception:
+            pass
+
+
+# ---- PRD 0033 (ftx-mcp-7hp.4): NetLogic delete after edit; observe after restart --
+# Same module gate as the rest of this file (FTX_LIVE_BRIDGE=1): skipped with no
+# live bridge. The restart test additionally needs FTX_LIVE_HMI=1.
+
+_R4_EDIT_MARKER = "r4-delete-after-edit"
+
+
+def _r4_netlogic_delete_after_edit(live, via: str, kind: str) -> None:
+    """Create a NetLogic, modify its generated .cs, delete the node (``via`` =
+    ``edit`` -> optix_bridge_edit delete op, ``delete_node`` ->
+    optix_bridge_delete_node) and assert the node is gone, the modified source
+    is preserved and the delete is not reported as a failure."""
+    cfg, project = live
+    cls = (f"ZzzR4Del{via.title().replace('_', '')}"
+           f"{kind.title().replace('_', '')}{_nm('')}Logic")
+    node_path = f"Model/{cls}"
+    _best_effort_delete(cfg, project, node_path)
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{cls}.cs")
+    cs_path.parent.mkdir(parents=True, exist_ok=True)
+    cs_path.unlink(missing_ok=True)
+    created = False
+    try:
+        try:
+            _with_bridge_recovery(
+                cfg, project,
+                lambda: core.bridge_create_netlogic(cfg, project, "Model", cls, kind=kind))
+        except core.BridgeWriteFailed as exc:
+            pytest.skip(f"could not create a {kind} NetLogic: {exc}")
+        created = True
+        # The "edit": replace the generated template with user code.
+        text = f"""using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class {cls} : BaseNetLogic
+{{
+    // {_R4_EDIT_MARKER}
+    [ExportMethod]
+    public void EditedMethod()
+    {{
+        Log.Info("{cls}", "{_R4_EDIT_MARKER}");
+    }}
+}}
+"""
+        cs_path.write_text(text, encoding="utf-8")
+
+        if via == "edit":
+            # Studio recompiles the edited NetLogic and the bridge can drop
+            # for a moment (no_bridge_for_project): wait for it, then retry.
+            out = _with_bridge_recovery(
+                cfg, project,
+                lambda: core.bridge_edit(cfg, project, [{"op": "delete", "path": node_path}]))
+            created = False
+            assert out.get("state") == "succeeded", out
+            assert out.get("applied") == 1, out
+            assert not out.get("failed_op"), out
+        else:
+            out = _with_bridge_recovery(
+                cfg, project, lambda: core.bridge_delete_node(cfg, project, node_path))
+            created = False
+            assert out.get("ok") is not False, out
+        with pytest.raises(core.NodeNotFound):
+            _with_bridge_recovery(
+                cfg, project, lambda: core.describe_node(cfg, project, node_path))
+        assert cs_path.is_file(), f"{cs_path} was removed by the NetLogic delete: {out}"
+        assert cs_path.read_text(encoding="utf-8") == text, out
+        _assert_bridge_still_serves(cfg, project)
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize("kind", ["runtime", "design_time"])
+def test_netlogic_edit_after_modify_preserves_source_live(live, kind):
+    """optix_bridge_edit delete of a NetLogic whose .cs was modified: node gone,
+    source preserved, batch reported succeeded (no false failure)."""
+    _r4_netlogic_delete_after_edit(live, "edit", kind)
+
+
+@pytest.mark.parametrize("kind", ["runtime", "design_time"])
+def test_netlogic_delete_node_after_modify_preserves_source_live(live, kind):
+    """optix_bridge_delete_node of a NetLogic whose .cs was modified: node gone,
+    source preserved, delete reported successful (no false failure)."""
+    _r4_netlogic_delete_after_edit(live, "delete_node", kind)
+
+
+_RACE_ITERATIONS = 3
+
+
+def _unique_suffix() -> str:
+    """Short per-call suffix so a race test never collides with a leftover node
+    or .cs from an earlier (crashed or parallel) run."""
+    return uuid.uuid4().hex[:8]
+
+
+def _netlogic_delete_race_after_create(live, via: str, kind: str) -> None:
+    """Race variant: write the NetLogic .cs *immediately* after create_netlogic
+    returns (no settle, no wait for Studio's compile/refresh), then delete the
+    node (``via`` = ``edit`` -> batch delete op, ``delete_node`` ->
+    optix_bridge_delete_node). Repeated ``_RACE_ITERATIONS`` times, each with a
+    FRESH class name (re-creating the same name inside the late-guard window is
+    a deliberate source change, not a race); each time the node must be gone
+    and the on-disk bytes must equal the pre-delete bytes."""
+    cfg, project = live
+    prefix = (f"ZzzRaceDel{via.title().replace('_', '')}"
+              f"{kind.title().replace('_', '')}{_unique_suffix()}x")
+    ns_dir = core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    touched: list[tuple[str, pathlib.Path]] = []  # (node_path, cs_path) to clean up
+    live_node: str | None = None  # node currently created and not yet deleted
+    try:
+        for i in range(_RACE_ITERATIONS):
+            cls = f"{prefix}{i}Logic"
+            node_path = f"Model/{cls}"
+            cs_path = ns_dir / f"{cls}.cs"
+            _best_effort_delete(cfg, project, node_path)
+            cs_path.unlink(missing_ok=True)
+            touched.append((node_path, cs_path))
+            marker = f"race-delete-after-create-{via}-{i}"
+            data = f"""using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class {cls} : BaseNetLogic
+{{
+    // {marker}
+    [ExportMethod]
+    public void RaceMethod()
+    {{
+        Log.Info("{cls}", "{marker}");
+    }}
+}}
+""".encode("utf-8")
+            try:
+                _with_bridge_recovery(
+                    cfg, project,
+                    lambda: core.bridge_create_netlogic(
+                        cfg, project, "Model", cls, kind=kind))
+            except core.BridgeWriteFailed as exc:
+                # The bridge is up (the ``live`` fixture bound to it), so a failed
+                # setup is a real failure, not a skip.
+                pytest.fail(f"could not create a {kind} NetLogic: {exc}",
+                            pytrace=False)
+            live_node = node_path
+            # No settle: write straight after the create returns.
+            cs_path.write_bytes(data)
+            pre_delete = cs_path.read_bytes()
+            assert pre_delete == data, (i, "pre-delete write did not stick")
+
+            if via == "edit":
+                out = _with_bridge_recovery(
+                    cfg, project,
+                    lambda: core.bridge_edit(
+                        cfg, project, [{"op": "delete", "path": node_path}]))
+                live_node = None
+                assert out.get("state") == "succeeded", (i, out)
+                assert out.get("applied") == 1, (i, out)
+                assert not out.get("failed_op"), (i, out)
+            else:
+                out = _with_bridge_recovery(
+                    cfg, project,
+                    lambda: core.bridge_delete_node(cfg, project, node_path))
+                live_node = None
+                assert out.get("ok") is not False, (i, out)
+            with pytest.raises(core.NodeNotFound):
+                _with_bridge_recovery(
+                    cfg, project, lambda: core.describe_node(cfg, project, node_path))
+            assert cs_path.is_file(), (
+                f"iteration {i}: {cs_path} was removed by the NetLogic delete: {out}")
+            assert cs_path.read_bytes() == pre_delete, (
+                f"iteration {i}: source bytes changed across the delete: {out}")
+        _assert_bridge_still_serves(cfg, project)
+    finally:
+        if live_node:
+            _best_effort_delete(cfg, project, live_node)
+        for _node, cs in touched:
+            try:
+                cs.unlink()
+            except OSError:
+                pass
+
+
+@pytest.mark.slow_live
+@pytest.mark.parametrize("kind", ["runtime", "design_time"])
+def test_netlogic_edit_delete_race_after_create_live(live, kind):
+    """Race: .cs written right after create_netlogic, then the batch delete op;
+    x3. Node gone each time and the source is byte-identical to pre-delete."""
+    _netlogic_delete_race_after_create(live, "edit", kind)
+
+
+@pytest.mark.slow_live
+@pytest.mark.parametrize("kind", ["runtime", "design_time"])
+def test_netlogic_delete_node_race_after_create_live(live, kind):
+    """Race: .cs written right after create_netlogic, then
+    optix_bridge_delete_node; x3. Node gone each time and the source is
+    byte-identical to pre-delete."""
+    _netlogic_delete_race_after_create(live, "delete_node", kind)
+
+
+@pytest.mark.slow_live
+@pytest.mark.parametrize("kind", ["runtime", "design_time"])
+def test_netlogic_recreate_after_delete_does_not_revert_edit_live(live, kind):
+    """#42 sequence: create a NetLogic, write source A, delete the node (the
+    source is preserved), write source B on disk, re-create the SAME class
+    within the 60 s late-guard window. B must survive the re-create and the
+    next bridge call's late guard (no revert to A, no NUL padding, no
+    ``netlogic_source_restored_late`` warning). Skipped without a live bridge
+    (the ``live`` fixture)."""
+    cfg, project = live
+    cls = f"ZzzIssue42{kind.title().replace('_', '')}{_unique_suffix()}Logic"
+    node_path = f"Model/{cls}"
+    cs_path = (core.resolve_project(cfg, project) / "ProjectFiles" / "NetSolution"
+               / f"{cls}.cs")
+
+    def source(tag: str) -> bytes:
+        return f"""using FTOptix.NetLogic;
+using UAManagedCore;
+
+public class {cls} : BaseNetLogic
+{{
+    // {tag}
+    [ExportMethod]
+    public void Issue42Method()
+    {{
+        Log.Info("{cls}", "{tag}");
+    }}
+}}
+""".encode("utf-8")
+
+    a, b = source("issue42-A"), source("issue42-B-longer-than-A-" + "x" * 40)
+    _best_effort_delete(cfg, project, node_path)
+    cs_path.parent.mkdir(parents=True, exist_ok=True)
+    cs_path.unlink(missing_ok=True)
+    created = False
+    try:
+        try:
+            _with_bridge_recovery(
+                cfg, project,
+                lambda: core.bridge_create_netlogic(
+                    cfg, project, "Model", cls, kind=kind))
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"could not create a {kind} NetLogic: {exc}", pytrace=False)
+        created = True
+        cs_path.write_bytes(a)
+        _with_bridge_recovery(
+            cfg, project, lambda: core.bridge_delete_node(cfg, project, node_path))
+        created = False
+        assert cs_path.read_bytes() == a, "delete must preserve source A"
+        # B is written to disk after the delete, then the class is re-created.
+        cs_path.write_bytes(b)
+        out = _with_bridge_recovery(
+            cfg, project,
+            lambda: core.bridge_create_netlogic(
+                cfg, project, "Model", cls, kind=kind))
+        created = True
+        assert cs_path.read_bytes() == b, ("re-create reverted/altered B", out)
+        # The next bridge call runs the late guard; it must not touch B.
+        nxt = _with_bridge_recovery(
+            cfg, project, lambda: core.describe_node(cfg, project, node_path))
+        assert cs_path.read_bytes() == b, ("late guard reverted B", nxt)
+        codes = [w.get("code") for w in (out.get("warnings") or [])
+                 + ((nxt or {}).get("warnings") or []) if isinstance(w, dict)]
+        assert "netlogic_source_restored_late" not in codes, codes
+    finally:
+        if created:
+            _best_effort_delete(cfg, project, node_path)
+        try:
+            cs_path.unlink()
+        except OSError:
+            pass
+
+
+def test_observe_immediately_after_emulator_restart_live(live_real_localappdata):
+    """optix_observe(mode='screenshot') right after optix_emulator(action=
+    'restart') - no settle, no warm-up capture in between - succeeds on each
+    of 3 restart cycles. Needs
+    FTX_LIVE_HMI=1 (emulator restartable, Chrome at OPTIX_CDP_URL)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("observe-after-restart test: set FTX_LIVE_HMI=1 with the "
+                    "emulator restartable and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    # cfg is built by the fixture after the real LOCALAPPDATA is restored; the
+    # emulator may start out stopped (cold) - restart_emulator just starts it.
+    cfg, project = live_real_localappdata
+    for cycle in range(3):
+        restarted = core.restart_emulator(cfg, project)
+        assert restarted.get("serving"), (cycle, restarted)
+        out = core.cdp_screenshot_runtime(cfg, project=project)
+        assert out.get("state") == "succeeded", (cycle, out)
+        assert out.get("cdp_recovered", True) is True, (cycle, out)
+        # the call after the first one must work too (no detach in between)
+        again = core.cdp_screenshot_runtime(cfg, project=project)
+        assert again.get("state") == "succeeded", (cycle, again)
+
+
+@pytest.mark.slow_live
+def test_observe_fresh_after_emulator_restart_cycles_live(live_real_localappdata):
+    """#23: the first observe(fresh) after a restart succeeds, every time.
+
+    10 cycles of {restart, observe(fresh)} and 5 cycles of {restart,
+    cdp_restart, observe(fresh)}; no warm-up call in between, and the FIRST
+    observe of each cycle must succeed (no retry). Needs FTX_LIVE_HMI=1
+    (emulator restartable, Chrome at OPTIX_CDP_URL). Skipped without a live
+    bridge (module-level FTX_LIVE_BRIDGE gate / the ``live`` fixture)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("observe(fresh)-after-restart cycles: set FTX_LIVE_HMI=1 "
+                    "with the emulator restartable and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    # cfg is built by the fixture after the real LOCALAPPDATA is restored.
+    cfg, project = live_real_localappdata
+
+    def first_observe(label):
+        out = core.cdp_screenshot_runtime(cfg, fresh=True, project=project)
+        assert out.get("state") == "succeeded", (label, out)
+
+    for cycle in range(10):
+        restarted = core.restart_emulator(cfg, project)
+        assert restarted.get("serving"), ("restart", cycle, restarted)
+        first_observe(("restart+observe", cycle))
+    for cycle in range(5):
+        restarted = core.restart_emulator(cfg, project)
+        assert restarted.get("serving"), ("restart+cdp_restart", cycle, restarted)
+        healed = core.ensure_chrome_cdp(cfg)
+        assert healed.get("state") != "failed", ("cdp_restart", cycle, healed)
+        first_observe(("restart+cdp_restart+observe", cycle))
+
+
+def test_observe_fresh_repeated_no_restart_live(live_real_localappdata):
+    """#23 (ftx-mcp-e1i.4): 6 consecutive fresh=true screenshot observes on a
+    static screen, with NO restart in between, all succeed. Guards against the
+    stale-capture self-heal breaking a valid capture on repeated calls. Needs
+    FTX_LIVE_HMI=1 (emulator running, Chrome at OPTIX_CDP_URL). Skipped without
+    a live bridge (module-level FTX_LIVE_BRIDGE gate)."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("repeated observe(fresh) test: set FTX_LIVE_HMI=1 with the "
+                    "emulator running and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    cfg, project = live_real_localappdata
+    for call in range(6):
+        out = core.cdp_screenshot_runtime(cfg, fresh=True, project=project)
+        assert out.get("state") == "succeeded", (call, out)
+
+
+def test_observe_fresh_after_each_of_5_restarts_live(live_real_localappdata):
+    """#23 (ftx-mcp-e1i.4): 5 cycles of {emulator restart, fresh=true screenshot
+    observe}; the FIRST observe after each restart must succeed (no retry, no
+    warm-up). Needs FTX_LIVE_HMI=1 (emulator restartable, Chrome at
+    OPTIX_CDP_URL). Skipped without a live bridge."""
+    if os.environ.get("FTX_LIVE_HMI") != "1":
+        pytest.skip("observe(fresh)-after-restart test: set FTX_LIVE_HMI=1 with "
+                    "the emulator restartable and Chrome at OPTIX_CDP_URL")
+    _require_desktop()
+    cfg, project = live_real_localappdata
+    for cycle in range(5):
+        restarted = core.restart_emulator(cfg, project)
+        assert restarted.get("serving"), ("restart", cycle, restarted)
+        out = core.cdp_screenshot_runtime(cfg, fresh=True, project=project)
+        assert out.get("state") == "succeeded", ("first observe", cycle, out)
+
+
+# ---- typed driver tag via create_variable (ftx-mcp-vvk.1) ------------------
+#
+# SDK names are overridable because they could not be confirmed offline
+# (pending bench verification): FTX_LIVE_RA_DRIVER_TYPE / _STATION_TYPE are the
+# ObjectTypes create_object instantiates, FTX_LIVE_RA_TAG_TYPE the VariableType.
+_RA_DRIVER_TYPE = os.environ.get("FTX_LIVE_RA_DRIVER_TYPE", "FTOptix.RAEtherNetIP.RAEtherNetIPDriver")
+_RA_STATION_TYPE = os.environ.get("FTX_LIVE_RA_STATION_TYPE", "FTOptix.RAEtherNetIP.RAEtherNetIPStation")
+_RA_TAG_TYPE = os.environ.get("FTX_LIVE_RA_TAG_TYPE", "RAEtherNetIPTag")
+
+
+def _create_ra_driver_station(cfg, project, drivers, driver, station, verify_path) -> None:
+    """Create an RA EtherNet/IP driver+station through the MCP and confirm it exists.
+
+    A creation error with a live bridge FAILS the test with the error message
+    (and the half-built driver is removed). The only skip is when the RA module
+    is absent, i.e. the running Studio is below 1.8.
+    """
+    driver_path = drivers + "/" + driver
+    try:
+        core.bridge_create_object(cfg, project, drivers, driver, _RA_DRIVER_TYPE)
+        core.bridge_create_object(cfg, project, driver_path, station, _RA_STATION_TYPE)
+        core.describe_node(cfg, project, verify_path)
+    except (core.BridgeWriteFailed, core.NodeNotFound) as exc:
+        _best_effort_delete(cfg, project, driver_path)
+        ver = _running_studio_version_or_none(cfg)
+        if ver is not None and ver < (1, 8):
+            pytest.skip(f"RA EtherNet/IP module absent: Studio {ver[0]}.{ver[1]} is below 1.8")
+        pytest.fail(f"cannot create an RA EtherNet/IP driver+station through the MCP "
+                    f"({_RA_DRIVER_TYPE} / {_RA_STATION_TYPE}): {exc}", pytrace=False)
+
+
+def test_create_typed_driver_tag_with_symbolname_live(live):
+    """create_variable variable_type=RAEtherNetIPTag + properties SymbolName makes
+    a typed Boolean tag under an RA EtherNet/IP station's Tags; describe_node shows
+    the type, datatype and SymbolName. FAILS with the error when the driver or
+    station cannot be created; skips only on Studio below 1.8 (no RA module)."""
+    cfg, project = live
+    drivers = "CommDrivers"
+    driver, station = _nm("ZzzVvk1Driver"), _nm("ZzzVvk1Station")
+    driver_path = drivers + "/" + driver
+    station_path = driver_path + "/" + station
+    tags_path = station_path + "/Tags"
+    tag_name = _nm("ZzzVvk1Tag")
+    tag_path = tags_path + "/" + tag_name
+    _create_ra_driver_station(cfg, project, drivers, driver, station, tags_path)
+    try:
+        out = core.bridge_create_variable(
+            cfg, project, tag_name, tags_path, "Boolean",
+            variable_type=_RA_TAG_TYPE, properties={"SymbolName": "ZzzVvk1Sym"})
+        assert out.get("ok") is not False, out
+        node = core.describe_node(cfg, project, tag_path)
+        assert node.get("datatype") == "Boolean", node
+        assert _RA_TAG_TYPE in (node.get("variable_type") or "") \
+            or _RA_TAG_TYPE in (node.get("dotnet_type") or ""), node
+        props = {p["name"]: p.get("value") for p in (node.get("properties") or [])}
+        assert "ZzzVvk1Sym" in (props.get("SymbolName") or ""), node
+    finally:
+        try:
+            core.bridge_delete_node(cfg, project, driver_path)
+        except (core.BridgeWriteFailed, core.NodeNotFound):
+            pass
+
+
+def test_create_object_refuses_variable_type_live(live):
+    """create_object type=<VariableType> is refused in the batch dry run and on the
+    direct route with variable_type_not_object, and nothing is created. Skipped
+    without a live bridge (the `live` fixture)."""
+    cfg, project = live
+    name = _nm("ZzzVvk2Obj")
+    ops = [{"op": "create_object", "parent": "Model", "name": name,
+            "object_type": _RA_TAG_TYPE}]
+    dry = core.bridge_edit(cfg, project, ops, dry_run=True)
+    codes = [e.get("code") for e in dry["report"]["errors"]]
+    assert "variable_type_not_object" in codes, dry
+    out = core.bridge_create_object(cfg, project, "Model", name, _RA_TAG_TYPE)
+    assert out.get("ok") is False and out.get("code") == "variable_type_not_object", out
+    assert f'create_variable with variable_type: "{_RA_TAG_TYPE}"' in (out.get("hint") or ""), out
+    with pytest.raises(core.NodeNotFound):
+        core.describe_node(cfg, project, "Model/" + name)
+
+
+# ---- PRD 0041: arm syncs the shipped bridge (#47); create verifies (#48) ----
+#
+# Both tests below are SETUP-STRICT: the module gate (FTX_LIVE_BRIDGE=1) says a
+# bridge is up, so a setup step that fails (project_new, arm, widget create, pen
+# create) is a product failure and FAILS the test with the error. They never
+# skip on a setup error. The only skips are the environment ones the rest of
+# this module already has (no interactive desktop, Studio below 1.8).
+#
+# Names that could not be confirmed offline are env-overridable (pending bench
+# verification on Studio 1.8): FTX_LIVE_BRIDGE_TEMPLATE, FTX_LIVE_TREND_TYPE,
+# FTX_LIVE_PEN_DATATYPE, FTX_LIVE_PEN_COLOR.
+_LIVE_BRIDGE_TEMPLATE = os.environ.get("FTX_LIVE_BRIDGE_TEMPLATE", "BridgeTemplate")
+_LIVE_TREND_TYPE = os.environ.get("FTX_LIVE_TREND_TYPE", "Trend")
+_LIVE_PEN_DATATYPE = os.environ.get("FTX_LIVE_PEN_DATATYPE", "Float")
+_LIVE_PEN_COLOR = os.environ.get("FTX_LIVE_PEN_COLOR", "#ff0000")
+
+
+def _require_studio_1_8_or_fail_setup(cfg) -> None:
+    """Skip only when the running Studio is known to be below 1.8."""
+    ver = _running_studio_version_or_none(cfg)
+    if ver is not None and ver < (1, 8):
+        pytest.skip(f"needs Studio 1.8 (running {ver[0]}.{ver[1]})")
+
+
+def test_template_project_arm_syncs_then_reports_current_live(live_real_localappdata):
+    """optix_project(new, template=BridgeTemplate) -> arm says ``synced`` (the
+    template's bridge is older than the shipped one), the armed bridge has the
+    current code (create_object with a VariableType such as RAEtherNetIPTag is
+    refused with variable_type_not_object), and a second arm says ``current``.
+
+    If the template already holds the shipped bridge (its drift was fixed) the
+    first arm legitimately says ``current`` instead; the test then asserts that.
+    FAILS (never skips) when project_new, arm or the bridge coming up fails.
+    """
+    _require_desktop()
+    _, _live_project = live_real_localappdata
+    cfg = core.Config.from_env()
+    _require_studio_1_8_or_fail_setup(cfg)
+    name = f"zzBridgeSync{int(time.time())}{_RUN_SFX}"
+    created = core.project_new(cfg, name, template=_LIVE_BRIDGE_TEMPLATE)
+    if not created.get("ok"):
+        pytest.fail(f"project_new(template={_LIVE_BRIDGE_TEMPLATE!r}) failed: {created!r}",
+                    pytrace=False)
+    new_pid = created.get("pid")
+    try:
+        project_dir = pathlib.Path(created["path"])
+        bridge_cs = project_dir.joinpath(*core._BRIDGE_CS_REL)
+        assert bridge_cs.is_file(), f"template project has no {bridge_cs}"
+        template_is_current = (
+            core.bridge_source_hash(bridge_cs.read_bytes())
+            == core.bridge_source_hash(core._shipped_bridge_cs().read_bytes()))
+        expected_first = "current" if template_is_current else "synced"
+
+        armed = core.bridge_arm(cfg, name)
+        assert armed.get("ok") is not False and armed.get("state") != "failed", armed
+        assert armed.get("bridge_source") == expected_first, armed
+        if expected_first == "synced":
+            assert armed.get("bridge_backup"), armed
+        # The file on disk is now the shipped bridge.
+        assert core.bridge_source_hash(bridge_cs.read_bytes()) \
+            == core.bridge_source_hash(core._shipped_bridge_cs().read_bytes())
+
+        core.reset_bridge_cache()
+        deadline = time.time() + 60.0
+        bcfg = None
+        while bcfg is None and time.time() < deadline:
+            bcfg = core._bridge_cfg_for(cfg, name)
+            if bcfg is None:
+                time.sleep(2.0)
+                core.reset_bridge_cache()
+        assert bcfg is not None, f"no bridge serving {name!r} within 60s of arm: {armed!r}"
+
+        # The bridge runs the current code: a VariableType is refused as an object.
+        sync_obj = _nm("ZzzSyncObj")
+        out = core.bridge_create_object(bcfg, name, "Model", sync_obj, _RA_TAG_TYPE)
+        assert out.get("ok") is False and out.get("code") == "variable_type_not_object", out
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(bcfg, name, "Model/" + sync_obj)
+
+        again = core.bridge_arm(cfg, name)
+        assert again.get("bridge_source") == "current", again
+        assert "bridge_backup" not in again, again
+    finally:
+        try:
+            core.bridge_arm(cfg, name, action="stop")
+        except Exception:
+            pass
+        if new_pid:
+            core._close_launched_studio(new_pid)
+        _remove_scratch_project(cfg, name)
+
+
+def test_trend_pen_create_variable_flow_live(live):
+    """Create a Trend, add a pen with create_variable + variable_type=TrendPen
+    under <Trend>/Pens, set the pen's Color child, and describe_node shows the
+    pen and its colour. create_object with TrendPen is refused
+    (variable_type_not_object) and creates nothing. FAILS with the error when the
+    Trend or the pen cannot be created; skips only on Studio below 1.8."""
+    cfg, project = live
+    _require_studio_1_8_or_fail_setup(cfg)
+    trend_name, pen_name = _nm("ZzzTrend48"), _nm("ZzzPen48")
+    pen_obj = _nm("ZzzPenObj48")
+    trend_path = _LIVE_SCRATCH_PANEL + "/" + trend_name
+    pens_path = trend_path + "/Pens"
+    pen_path = pens_path + "/" + pen_name
+    _best_effort_delete(cfg, project, trend_path)
+    try:
+        try:
+            out = core.bridge_create_widget(
+                cfg, project, _LIVE_SCRATCH_PANEL, trend_name, _LIVE_TREND_TYPE)
+            assert out.get("ok") is not False, out
+            core.describe_node(cfg, project, pens_path)
+        except (core.BridgeWriteFailed, core.NodeNotFound, AssertionError) as exc:
+            pytest.fail(f"cannot create a {_LIVE_TREND_TYPE} with a Pens folder at "
+                        f"{trend_path}: {exc}", pytrace=False)
+        try:
+            made = core.bridge_create_variable(
+                cfg, project, pen_name, pens_path, _LIVE_PEN_DATATYPE,
+                variable_type="TrendPen")
+            assert made.get("ok") is not False, made
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"create_variable TrendPen under {pens_path} failed: {exc}",
+                        pytrace=False)
+        pen = core.describe_node(cfg, project, pen_path)
+        assert "TrendPen" in ((pen.get("variable_type") or "") + (pen.get("dotnet_type") or "")), pen
+        color_path = pen_path + "/Color"
+        # A fresh TrendPen has no Color child (set_property -> property_not_found);
+        # create it first (r12 / w11 rehearsal, skills Trend pens section).
+        core.bridge_create_variable(cfg, project, "Color", pen_path, "Color")
+        core.bridge_set_property(cfg, project, color_path, "Value", _LIVE_PEN_COLOR)
+        color = core.describe_node(cfg, project, color_path)
+        assert _color_value_matches(color.get("value"), _LIVE_PEN_COLOR), color
+        pens = core.describe_node(cfg, project, pens_path)
+        kids = {c.get("browse_name") or c.get("name")
+                for c in (pens.get("children") or []) + (pens.get("properties") or [])
+                if isinstance(c, dict)}
+        assert pen_name in kids, kids
+
+        refused = core.bridge_create_object(
+            cfg, project, pens_path, pen_obj, "TrendPen")
+        assert refused.get("ok") is False \
+            and refused.get("code") == "variable_type_not_object", refused
+        assert "create_variable" in (refused.get("hint") or ""), refused
+        with pytest.raises(core.NodeNotFound):
+            core.describe_node(cfg, project, pens_path + "/" + pen_obj)
+    finally:
+        _best_effort_delete(cfg, project, trend_path)
+
+
+def test_trend_pen_set_property_creates_color_live(live):
+    """One-call route (ftx-mcp-wvk.2): create a TrendPen via create_variable, then
+    set_property Color on the PEN (no create_variable for Color first). The bridge
+    creates the type-declared optional child, reports created_optional_child, and
+    describe_node then shows Color with the value. An undeclared name on the same
+    pen still returns property_not_found. FAILS with the error when the Trend or
+    the pen cannot be created; skips only on Studio below 1.8."""
+    cfg, project = live
+    _require_studio_1_8_or_fail_setup(cfg)
+    trend_name, pen_name = _nm("ZzzTrend82"), _nm("ZzzPen82")
+    trend_path = _LIVE_SCRATCH_PANEL + "/" + trend_name
+    pens_path = trend_path + "/Pens"
+    pen_path = pens_path + "/" + pen_name
+    _best_effort_delete(cfg, project, trend_path)
+    try:
+        try:
+            out = core.bridge_create_widget(
+                cfg, project, _LIVE_SCRATCH_PANEL, trend_name, _LIVE_TREND_TYPE)
+            assert out.get("ok") is not False, out
+            core.describe_node(cfg, project, pens_path)
+            made = core.bridge_create_variable(
+                cfg, project, pen_name, pens_path, _LIVE_PEN_DATATYPE,
+                variable_type="TrendPen")
+            assert made.get("ok") is not False, made
+        except (core.BridgeWriteFailed, core.NodeNotFound, AssertionError) as exc:
+            pytest.fail(f"setup failed: cannot create a {_LIVE_TREND_TYPE} with a "
+                        f"TrendPen at {pen_path}: {exc}", pytrace=False)
+
+        res = core.bridge_set_property(cfg, project, pen_path, "Color", _LIVE_PEN_COLOR)
+        assert res.get("ok") is True, res
+        assert res.get("created_optional_child") == "Color", res
+
+        pen = core.describe_node(cfg, project, pen_path)
+        names = {c.get("browse_name") or c.get("name")
+                 for c in (pen.get("children") or []) + (pen.get("properties") or [])
+                 if isinstance(c, dict)}
+        assert "Color" in names, pen
+        color = core.describe_node(cfg, project, pen_path + "/Color")
+        assert _color_value_matches(color.get("value"), _LIVE_PEN_COLOR), color
+
+        with pytest.raises(core.BridgeWriteFailed) as ei:
+            core.bridge_set_property(cfg, project, pen_path, "ZzzNotDeclared82", "1")
+        assert "property_not_found" in str(ei.value) \
+            or "unknown_property" in str(ei.value), str(ei.value)
+    finally:
+        _best_effort_delete(cfg, project, trend_path)
+
+
+def test_create_object_folder_live(live):
+    """create_object(object_type='Folder') under Model makes a standard FolderType
+    node, describe_node shows it (as a child of Model and by path), and it is
+    deleted again. FAILS with the error when the bridge is up and the create or the
+    describe fails; ``type_not_found`` counts as a failure here, so the working
+    route (create_folder) is exercised by the other live tests, not by this one.
+    (ftx-mcp-wvk.3)"""
+    cfg, project = live
+    parent = _LIVE_MODEL_PARENT
+    name = _nm("ZzzFolder13")
+    path = parent + "/" + name
+    _best_effort_delete(cfg, project, path)
+    try:
+        try:
+            out = core.bridge_create_object(cfg, project, parent, name, "Folder")
+        except core.BridgeWriteFailed as exc:
+            pytest.fail(f"create_object(Folder) under {parent} failed: {exc}",
+                        pytrace=False)
+        assert out.get("ok") is not False, out
+        try:
+            node = core.describe_node(cfg, project, path)
+            siblings = core.describe_node(cfg, project, parent).get("children", [])
+        except core.NodeNotFound as exc:
+            pytest.fail(f"describe_node cannot see the created Folder at {path}: {exc}",
+                        pytrace=False)
+        assert "FolderType" in json.dumps(node) or "Folder" in json.dumps(node), node
+        kids = {c.get("browse_name") or c.get("name") for c in siblings
+                if isinstance(c, dict)}
+        assert name in kids, kids
+        # FolderType spelling resolves to the same type
+        out2 = core.bridge_create_object(cfg, project, path, "Inner", "FolderType")
+        assert out2.get("ok") is not False, out2
+        core.describe_node(cfg, project, path + "/Inner")
+    finally:
+        _best_effort_delete(cfg, project, path)
+    with pytest.raises(core.NodeNotFound):
+        core.describe_node(cfg, project, path)

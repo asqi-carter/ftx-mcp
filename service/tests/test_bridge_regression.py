@@ -175,29 +175,13 @@ def test_require_bridge_for_different_project_error_format(
 
     msg = str(exc_info.value)
 
-    # Must contain per-port project information.
-    assert "ports_probed=" in msg, f"ports_probed missing from: {msg!r}"
+    # Must be the structured no_bridge_for_project error, listing each bridge
+    # found with its port and the project it serves.
+    assert isinstance(exc_info.value, core.NoBridgeForProject)
+    assert exc_info.value.code == "no_bridge_for_project"
+    assert "no_bridge_for_project" in msg, f"code missing from: {msg!r}"
     assert "port=8768" in msg, f"port= qualifier missing from: {msg!r}"
-    assert "serving='OtherProj'" in msg or 'serving="OtherProj"' in msg, (
-        f"per-port project name missing from: {msg!r}"
-    )
-
-    # Must NOT contain a bare "serving=" that is not preceded by "port=".
-    import re
-    bare_serving = re.search(r"(?<!port=\d{4} )(?<!port=\d )serving=", msg)
-    # More robust: verify every "serving=" occurrence is preceded by "port=<digits>"
-    # within the same entry string by checking the ports_probed section structure.
-    # The format is: port=N serving='X' source='Y' available=B
-    # So "serving=" should always come after "port=…" in the entry.
-    entries_section = re.search(r"ports_probed=\[(.+)\]", msg)
-    if entries_section:
-        entries_text = entries_section.group(1)
-        # Each "serving=" must be preceded by "port=" in its entry.
-        for m in re.finditer(r"serving=", entries_text):
-            preceding = entries_text[max(0, m.start() - 30):m.start()]
-            assert "port=" in preceding, (
-                f"bare 'serving=' found without preceding 'port=': {entries_text!r}"
-            )
+    assert "project='OtherProj'" in msg, f"per-port project name missing from: {msg!r}"
 
 
 # ===========================================================================

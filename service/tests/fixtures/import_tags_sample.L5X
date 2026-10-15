@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Hand-written minimal L5X for the import_tags live tests (ftx-mcp-vvk.3).
+  NOT an export from a real controller. Shape: one controller, one UDT
+  (Motor_UDT) whose Limits member is a nested struct (Motor_Limits), and two
+  controller tags, Motor1 and Motor10 (the pair also proves the filter does not
+  treat Motor1 as a prefix of Motor10). Symbols the importer sees include
+  Motor1, Motor1.Speed, Motor1.Limits, Motor1.Limits.Low, Motor1.Limits.High,
+  Motor1.Mode and the same set for Motor10.
+-->
+<RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="32.00" TargetName="FtxImportFixture" TargetType="Controller" ContainsContext="false" ExportDate="Mon Jan 01 00:00:00 2024" ExportOptions="NoRawData L5KData DecoratedData ForceProtectedEncoding AllProjDocTrans">
+<Controller Use="Target" Name="FtxImportFixture" ProcessorType="1756-L83E" MajorRev="32" MinorRev="11" TimeSlice="20" ShareUnusedTimeSlice="1" ProjectCreationDate="Mon Jan 01 00:00:00 2024" LastModifiedDate="Mon Jan 01 00:00:00 2024" SFCExecutionControl="CurrentActive" SFCRestartPosition="MostRecentlyActive" SFCLastScan="DontScan" ProjectSN="16#0000_0000" MatchProjectToController="false" CanUseRPIFromProducer="false" InhibitAutomaticFirmwareUpdate="0" PassThroughConfiguration="EnabledWithAppend" DownloadProjectDocumentationAndExtendedProperties="true" DownloadProjectCustomProperties="true" ReportMinorOverflow="false">
+<DataTypes Use="Context">
+<DataType Name="Motor_Limits" Family="NoFamily" Class="User">
+<Members>
+<Member Name="Low" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" ExternalAccess="Read/Write"/>
+<Member Name="High" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" ExternalAccess="Read/Write"/>
+</Members>
+</DataType>
+<DataType Name="Motor_UDT" Family="NoFamily" Class="User">
+<Members>
+<Member Name="Speed" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" ExternalAccess="Read/Write"/>
+<Member Name="Limits" DataType="Motor_Limits" Dimension="0" Hidden="false" ExternalAccess="Read/Write"/>
+<Member Name="Mode" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" ExternalAccess="Read/Write"/>
+</Members>
+</DataType>
+</DataTypes>
+<Tags Use="Context">
+<Tag Name="Motor1" TagType="Base" DataType="Motor_UDT" Constant="false" ExternalAccess="Read/Write">
+<Data Format="L5K">
+<![CDATA[[1500,[0,3000],1]]]>
+</Data>
+<Data Format="Decorated">
+<Structure DataType="Motor_UDT">
+<DataValueMember Name="Speed" DataType="DINT" Radix="Decimal" Value="1500"/>
+<StructureMember Name="Limits" DataType="Motor_Limits">
+<DataValueMember Name="Low" DataType="DINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="High" DataType="DINT" Radix="Decimal" Value="3000"/>
+</StructureMember>
+<DataValueMember Name="Mode" DataType="DINT" Radix="Decimal" Value="1"/>
+</Structure>
+</Data>
+</Tag>
+<Tag Name="Motor10" TagType="Base" DataType="Motor_UDT" Constant="false" ExternalAccess="Read/Write">
+<Data Format="L5K">
+<![CDATA[[900,[0,1800],2]]]>
+</Data>
+<Data Format="Decorated">
+<Structure DataType="Motor_UDT">
+<DataValueMember Name="Speed" DataType="DINT" Radix="Decimal" Value="900"/>
+<StructureMember Name="Limits" DataType="Motor_Limits">
+<DataValueMember Name="Low" DataType="DINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="High" DataType="DINT" Radix="Decimal" Value="1800"/>
+</StructureMember>
+<DataValueMember Name="Mode" DataType="DINT" Radix="Decimal" Value="2"/>
+</Structure>
+</Data>
+</Tag>
+</Tags>
+</Controller>
+</RSLogix5000Content>

@@ -145,6 +145,8 @@ hang `/health`). All process discovery is now in-process psutil:
 
 ## Upgrading
 
+> Superseded, see [1.0.9 Upgrading](release-notes-v1.0.9.md#upgrading).
+
 `pip install --upgrade ftx-mcp` updates the service. The bridge changes
 require re-arming: paste the new `studio-bridge/StudioMCPBridge.cs` into the
 `StudioMCPBridge` NetLogic node, then StopBridge/StartBridge (once per

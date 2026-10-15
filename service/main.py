@@ -1,4 +1,4 @@
-"""Process entrypoint: serves FastAPI HTTP on :8765 and FastMCP HTTP/SSE on :8766.
+"""Process entrypoint: serves FastAPI HTTP on :8765 and FastMCP streamable-HTTP on :8766 (path ``MCP_PATH``).
 
 Both surfaces share `core.Config` (one source of truth) and run in the same
 asyncio event loop via uvicorn.
@@ -32,6 +32,10 @@ from . import __version__, _cdp, _client_registry, core
 from .auth import AuthMiddleware, TokenStore
 from .http_app import make_app
 from .mcp_app import make_mcp
+
+
+# URL path the FastMCP streamable-HTTP app is served on (also declared in server.json).
+MCP_PATH = "/mcp"
 
 
 def _port_holder(host: str, port: int) -> str | None:
@@ -347,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"ftx-mcp v{__version__}", flush=True)
     print(f"  HTTP  http://{cfg.bind_host}:{cfg.bind_http_port}", flush=True)
-    print(f"  MCP   http://{cfg.bind_host}:{cfg.bind_mcp_port}/mcp", flush=True)
+    print(f"  MCP   http://{cfg.bind_host}:{cfg.bind_mcp_port}{MCP_PATH} (streamable-HTTP)", flush=True)
     print(f"  UI    http://{cfg.bind_host}:{cfg.bind_http_port}/ui", flush=True)
     print(f"  state {cfg.state_dir}", flush=True)
     if cfg.auth_required:

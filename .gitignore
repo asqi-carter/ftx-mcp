@@ -93,3 +93,12 @@ dev/
 ci/
 Dockerfile.*
 tests/fixtures/
+# 1.0.9: build-time bundle of skills/ and the bridge source (setup.py); never in a checkout.
+service/_bundled/
+# 1.0.9: private bench harness and its Pester test; planning docs.
+scripts/bench/
+tests/bootstrap/init-ftx.Tests.ps1
+docs/prd/
+docs/slated-*.md
+.gitea/
+.qmd_last_embed_hash

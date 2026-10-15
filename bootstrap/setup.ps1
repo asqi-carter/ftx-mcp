@@ -7,7 +7,7 @@
     Run from the repo root or from an extracted release tarball.
 
     Two deploy paths ship: the UpdateSvc deploy verb (the primary ship
-    step; needs the deploy env configured -- run optix_doctor) and the
+    step; needs the deploy env configured -- run optix_status action=doctor) and the
     export-based tree swap (Studio must be closed). Deploy integration is
     not wired in this distribution.
 
@@ -234,6 +234,11 @@ if ($conflicts.Count -gt 0) {
                 Write-Host "  :9222 is held by pid $($c.Pid) (not ftx-mcp's CDP chrome)." -ForegroundColor Yellow
                 Write-Host "  Close that app (often a browser started with remote debugging), or re-run with -NoCdp to skip canvas verify." -ForegroundColor Yellow
             }
+        } elseif (($c.Port -eq [int]$httpPort -or $c.Port -eq [int]$mcpPort) -and
+                  (Test-FtxOwnServiceProcess -ProcId $c.Pid -RepoRoot $RepoRoot)) {
+            # ftx-mcp's own service (re-run over a live install), not a foreign
+            # holder. Never auto-stop it: the operator stops it explicitly.
+            Write-Host "  :$($c.Port) ftx-mcp service is running; run ``bootstrap\services.ps1 stop``, then re-run setup" -ForegroundColor Yellow
         } else {
             Write-Host "  :$($c.Port) - override with OPTIX_HTTP_PORT (8765) / OPTIX_MCP_PORT (8766) / OPTIX_RUNTIME_TEST_PORT (8081) and re-run." -ForegroundColor Yellow
         }
@@ -354,7 +359,7 @@ if (-not (Test-Path $venvDir)) {
 
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 & $venvPython -m pip install --quiet --upgrade pip
-# [visual] extra = Pillow, the pixel gate for optix_cdp_diff. Cheap pure
+# [visual] extra = Pillow, the pixel gate for optix_observe(mode="diff"). Cheap pure
 # wheel; installed by default in the full local setup (the lean base matters
 # for pip consumers of the package, not for this repo install).
 & $venvPython -m pip install --quiet -e "$RepoRoot[visual]"
@@ -476,7 +481,7 @@ if ($NoCdp) {
     Ok "skipped (-NoCdp)"
     Write-Host "  To install the CDP-Chrome verify task later:" -ForegroundColor DarkGray
     Write-Host "    powershell -File bootstrap\install-chrome-cdp.ps1 -RepoRoot $RepoRoot" -ForegroundColor DarkGray
-    Write-Host "  Canvas verify (optix_cdp_screenshot/click) is disabled until then;" -ForegroundColor DarkGray
+    Write-Host "  Canvas verify (optix_observe/optix_interact) is disabled until then;" -ForegroundColor DarkGray
     Write-Host "  deploy / runtime_start still work via HTTP + MCP." -ForegroundColor DarkGray
 } else {
     & (Join-Path $PSScriptRoot "install-chrome-cdp.ps1") -RepoRoot $RepoRoot
@@ -502,7 +507,7 @@ if ($NoServiceRegister) {
         if ($resp.StatusCode -eq 200) { $ok = $true }
     } catch { }
     if (-not $ok) {
-        Ok "service not started (expected). Start it: .\bootstrap\services.ps1 start - then verify via /health or optix_doctor."
+        Ok "service not started (expected). Start it: .\bootstrap\services.ps1 start - then verify via /health or optix_status action=doctor."
     } else {
         Ok "/health returned 200"
         $health = $resp.Content | ConvertFrom-Json
@@ -560,7 +565,7 @@ if ($authOn) {
     Write-Host "  claude mcp add --transport http ftx-mcp http://127.0.0.1:$mcpPort/mcp" -ForegroundColor Cyan
 }
 Write-Host ""
-Write-Host "Verify your setup: ask your AI assistant to run the 'optix_doctor' tool" -ForegroundColor Cyan
+Write-Host "Verify your setup: ask your AI assistant to run 'optix_status action=doctor'" -ForegroundColor Cyan
 Write-Host "  (or GET /doctor): it checks every dependency (Studio, projects root," -ForegroundColor Cyan
 Write-Host "  cdp, deploy account/cert, interactive session) and prints a plain-" -ForegroundColor Cyan
 Write-Host "  English fix for anything red. Run it first if a later step doesn't work." -ForegroundColor Cyan

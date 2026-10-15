@@ -16,7 +16,7 @@ Test cases:
   7. Guard asymmetry — studio RUNNING → read_netlogic succeeds (studio_open=True),
      core.read_file on same project raises StudioOpen (deliberate asymmetry).
   8. Attributed VS Code holding project — EditorProjectOpen.
-  9. Registry — tool in EXPECTED_TOOLS, count == 44, readOnlyHint=True,
+  9. Registry — tool in EXPECTED_TOOLS, count == 45, readOnlyHint=True,
      auth.TOOL_SCOPES['optix_read_netlogic'] == 'read'.
  10. Doc-count — parse tool count from README.md + docs/tool-reference.md;
      both must equal len(EXPECTED_TOOLS).
@@ -466,15 +466,15 @@ class TestEditorAttribution:
 
 
 class TestRegistry:
-    """optix_read_netlogic is in EXPECTED_TOOLS, count == 44, readOnlyHint=True,
+    """optix_read_netlogic is in EXPECTED_TOOLS, count == 45, readOnlyHint=True,
     TOOL_SCOPES == 'read'."""
 
     def test_tool_in_expected_tools(self) -> None:
         assert "optix_read_netlogic" in EXPECTED_TOOLS
 
     def test_expected_tools_count(self) -> None:
-        assert len(EXPECTED_TOOLS) == 44, (
-            f"Expected 44 tools, got {len(EXPECTED_TOOLS)}: {sorted(EXPECTED_TOOLS)}"
+        assert len(EXPECTED_TOOLS) == 45, (
+            f"Expected 45 tools, got {len(EXPECTED_TOOLS)}: {sorted(EXPECTED_TOOLS)}"
         )
 
     def test_read_netlogic_annotation_is_readonly(self, cfg: core.Config) -> None:
@@ -546,6 +546,7 @@ class TestDocCount:
         import subprocess
         out = subprocess.run(["git", "ls-files", "skills/*/SKILL.md"], cwd=self._PROJECT_ROOT,
                              capture_output=True, text=True, check=True).stdout.split()
+        # PRD 0045 D.1: the docs state the full count of tracked skills/*/SKILL.md (23).
         pattern = re.compile(r'(\d+)\s+(?:bundled\s+)?authoring\s+playbooks', re.I)
         for doc in ("README.md", "docs/tool-reference.md"):
             text = (self._PROJECT_ROOT / doc).read_text(encoding="utf-8").replace("*", "")

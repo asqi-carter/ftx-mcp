@@ -67,7 +67,8 @@ CDP tools self-heal once (restart the task, reopen a page) on the next
 call. If it persists:
 
 1. `optix_cdp_restart` forces recovery and reports
-   `{alive, has_page, restarted}`.
+   `{alive, has_page, restarted}`. Its health check evaluates `1+1` on the page, so a Chrome that
+   answers `Not attached to an active page` is restarted, not called healthy.
 2. `bootstrap/services.ps1 status` — expect
    `ftx-mcp-chrome-cdp port:9222 LISTEN`. (Re)install with
    `bootstrap/install-chrome-cdp.ps1`.
@@ -300,6 +301,18 @@ calling it. Rebuild the NetSolution with the current
 report `"invoke_session": "root"`. Until then, `optix_execute_method` runs
 the method through Studio's own right-click Execute (the NetLogic node must
 be saved to disk first with `optix_save`).
+
+## `contains_netlogic` / `contains_event_handler` from move, rename or convert_to_type
+
+Bridge 1.0.9+ refuses (and changes nothing) when the source subtree holds a
+NetLogic (`contains_netlogic`; a top-level NetLogic on move is
+`refused_netlogic_move`) or an EventHandler (`contains_event_handler`), because
+re-authoring those crashes Studio. The code is returned unchanged with a `hint`.
+Move the NetLogic out of the subtree first, or delete the handler and re-create
+it with `wire_event` afterwards, or do the operation in Studio's own UI. In an
+`optix_bridge_edit` batch the refused item is listed in `refused_ops` and the
+other items still run. Older bridges (no `subtree_guard` in `/bridge/health`)
+do not refuse and can crash Studio: rebuild and re-arm first.
 
 ## Got a different error?
 

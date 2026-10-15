@@ -15,7 +15,9 @@
 
 .PARAMETER Action
     One of: start | stop | restart | status | enable-autostart | disable-autostart.
-    start    - Start-ScheduledTask on each registered task.
+    start    - Start-ScheduledTask on each registered task, then wait up to
+               30 s for /health and print "up" or "still starting" (exit 0
+               either way).
                Add -Silent to start the service with its console hidden
                (rewrites the task action to pass --hide-console). A plain
                start clears it again, so the verb you use is the behavior
@@ -23,9 +25,13 @@
     stop     - Stop-ScheduledTask on each registered task.
     restart  - stop, sleep 1s, then start.
     status   - report State, LastRunTime, LastTaskResult, port-listen,
-               and a single /health probe at the end.
-    enable-autostart  - add an at-logon trigger so the service starts
-                        automatically after a reboot (opt-in).
+               and a single /health probe at the end. While the process is
+               alive and its ports listen but /health does not answer yet,
+               prints "starting" (not "/health down").
+    enable-autostart  - add an at-logon trigger to the ftx-mcp service task ONLY,
+                        so the service starts automatically after a reboot
+                        (opt-in). Studio, the emulator and the CDP chrome task
+                        are never autostarted.
     disable-autostart - remove triggers; back to manual start (the default).
 
 .EXAMPLE
@@ -44,7 +50,10 @@ param(
     # console visibility and the task definition always tells the truth about
     # how the service was last started. Deterministic in both directions: a
     # plain start clears the flag, -Silent sets it.
-    [switch]$Silent
+    [switch]$Silent,
+    # Applies to start/restart: wall-clock seconds to wait for /health before
+    # reporting "still starting" (exit 0 either way).
+    [int]$HealthWaitSec = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -111,9 +120,7 @@ function Get-TaskOrNull($name) {
 }
 
 function Test-Port($port) {
-    if ($port -le 0) { return $false }
-    $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-    [bool]$c
+    Test-FtxPortListening -Port $port
 }
 
 # The CDP chrome is identified by its dedicated profile dir, NOT just the
@@ -183,6 +190,7 @@ function Do-Stop($name, $port) {
 }
 
 $hasFault = $false
+$mainTaskStarted = $false
 
 foreach ($t in $tasks) {
     $name = $t.Name
@@ -208,6 +216,7 @@ foreach ($t in $tasks) {
         "start" {
             if (Do-Start $name $t.Port) {
                 Write-Host ("  start {0,-28}" -f $name) -ForegroundColor Green
+                if ($name -eq $Script:FtxTaskName) { $mainTaskStarted = $true }
             }
         }
         "stop" {
@@ -219,11 +228,18 @@ foreach ($t in $tasks) {
             Start-Sleep -Seconds 1
             if (Do-Start $name $t.Port) {
                 Write-Host ("  rstrt {0,-28}" -f $name) -ForegroundColor Green
+                if ($name -eq $Script:FtxTaskName) { $mainTaskStarted = $true }
             }
         }
         "enable-autostart" {
             # Opt-in: add an at-logon trigger so the service comes up in the
             # interactive session after a reboot. Default (no trigger) stays manual.
+            # ONLY the ftx-mcp service autostarts: Studio, the emulator and the
+            # CDP chrome are launched on demand by tools, never at logon.
+            if ($name -ne $Script:FtxTaskName) {
+                Write-Host ("  skip  {0,-28} (not autostarted; manual only)" -f $name) -ForegroundColor DarkGray
+                continue
+            }
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
             Set-ScheduledTask -TaskName $name -Trigger $trigger | Out-Null
             Write-Host ("  auto+ {0,-28} (starts at logon)" -f $name) -ForegroundColor Green
@@ -277,27 +293,41 @@ foreach ($t in $tasks) {
     }
 }
 
+if ($mainTaskStarted) {
+    # Wait up to $HealthWaitSec (default 30) wall-clock seconds for /health. Slow startup is not a failure: both
+    # outcomes exit 0 (use `status` afterwards to see the real state).
+    Write-Host ""
+    $waitSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $healthUp = Wait-FtxHealth -Port $Script:FtxHttpPort -TimeoutSec $HealthWaitSec
+    $waitSw.Stop()
+    if ($healthUp) {
+        Write-Host ("  up    {0,-28} (/health answers on :{1}, after {2:N1} s)" -f $Script:FtxTaskName, $Script:FtxHttpPort, $waitSw.Elapsed.TotalSeconds) -ForegroundColor Green
+    } else {
+        Write-Host ("  still starting {0} (/health not answering after {1:N0} s; run services.ps1 status)" -f $Script:FtxTaskName, $waitSw.Elapsed.TotalSeconds) -ForegroundColor Yellow
+    }
+    exit 0
+}
+
 if ($Action -eq "status") {
     Write-Host ""
-    # /health probe (unauthenticated). The three outcomes worth distinguishing:
+    # /health probe (unauthenticated). Outcomes worth distinguishing:
     #   200 -> service up, auth disabled (or somehow not required for /health)
     #   401 -> service up, auth required (bearer opt-in enabled)
-    #   conn refused / timeout -> service down
-    try {
-        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($Script:FtxHttpPort)/health" `
-            -TimeoutSec 2 -UseBasicParsing
-        $body = $r.Content | ConvertFrom-Json
-        Write-Host ("  /health 200 (auth disabled), version={0}" -f $body.version) -ForegroundColor Green
-    } catch {
-        $resp = $_.Exception.Response
-        if ($resp -and $resp.StatusCode.value__ -eq 401) {
-            Write-Host "  /health 401 (service running, auth required)" -ForegroundColor Green
-        } elseif ($_.Exception.Message -match "actively refused|Unable to connect|timed out") {
-            Write-Host ("  /health down (no listener on :{0})" -f $Script:FtxHttpPort) -ForegroundColor Red
-        } else {
-            $first = ($_.Exception.Message -split "`n")[0]
-            Write-Host ("  /health err ({0})" -f $first) -ForegroundColor Red
-        }
+    #   starting -> process alive and ports listening, /health not answering yet
+    #   conn refused / timeout with no live process/ports -> service down
+    $h = Get-FtxHealth -Port $Script:FtxHttpPort
+    if ($h.State -eq "ok") {
+        Write-Host ("  up    /health 200 (auth disabled), version={0}" -f $h.Detail) -ForegroundColor Green
+    } elseif ($h.State -eq "auth") {
+        Write-Host "  up    /health 401 (service running, auth required)" -ForegroundColor Green
+    } elseif ((Test-FtxServiceProcessAlive) -and
+              (Test-FtxPortListening -Port $Script:FtxHttpPort) -and
+              (Test-FtxPortListening -Port $Script:FtxMcpPort)) {
+        Write-Host ("  starting {0} (process alive, ports listening, /health not answering yet)" -f $Script:FtxTaskName) -ForegroundColor Yellow
+    } elseif ($h.State -eq "down") {
+        Write-Host ("  /health down (no listener on :{0})" -f $Script:FtxHttpPort) -ForegroundColor Red
+    } else {
+        Write-Host ("  /health err ({0})" -f $h.Detail) -ForegroundColor Red
     }
     if ($hasFault) { exit 1 }
 }

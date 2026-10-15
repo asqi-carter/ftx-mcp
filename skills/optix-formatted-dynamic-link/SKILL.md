@@ -26,6 +26,14 @@ NodeId. In Studio this is ONE control: type `{#token}` into a dynamic link's
 path and it becomes a **"Formatted dynamic link"** with a child link per token.
 The StringFormatter is how it SERIALIZES — not a thing to assemble by hand.
 
+Reading a link back: `describe_node` / the project map print a NodeId-valued
+DynamicLink or `Source*` with `target_path` (browse path from the project root) beside
+the raw value, so no GUID matching by hand (the map prints `-> <target_path>`). `target_path` is emitted for NodeId values and for the NodePath STRING values a DynamicLink really
+carries (`{NodeId:ns=103;g=...}` or a browse path; `Source*` rows follow the holder's DynamicLink child);
+a RELATIVE NodePath (`../../Model/X`, `./Y`) is resolved from the node that HOLDS the link (each `..` steps to its owner), so a good relative link is NOT reported dangling; an attribute reference (`...@Value`) is not a node target and gets none. `target_path: null` + `target_missing: true`
+means the link resolves to nothing (a dangling link: its target was deleted); the map and
+describe flag it `[DANGLING LINK: target missing]` and list it under `diagnostics` (`code: dangling_link`).
+
 ## Authoring it — one op
 
 ```
@@ -69,8 +77,13 @@ batch has not landed yet.
    other bridge op accepts (`Model/Folder/{#key}`, as in `sources`) is read
    relative to the property itself, resolves to nothing, and renders BLANK with
    `ok:true`, a correct-looking `describe_node`, and **no runtime log line at
-   all** (1.0.8 battle test). The bridge does not check or rewrite it yet
-   (slated for 1.0.9). Copy the absolute prefix from a stock link that already
+   all** (1.0.8 battle test). Since 1.0.9 the service REFUSES it —
+   `format_path_not_runtime_resolvable`, strict or not, in `bridge_edit` and
+   `attach_formatter` — and the message carries the exact absolute rewrite. The bridge
+   itself refuses it too (backstop for direct callers).
+   Pass `fix_format_paths=true` (per-noun arg, or a field on the op) to rewrite
+   `Model/X/{#k}` to `/Objects/<Project>/Model/X/{#k}` using the project name the
+   bridge reports. `/Objects/`, `../`, `./` and a leading `{#` pass. Copy the absolute prefix from a stock link that already
    renders — e.g. MainWindow's `Caption` shows `/Objects/<Project>@BrowseName`.
 
 ## A CONDITIONAL target — compute the index, don't branch on NodeIds

@@ -181,7 +181,22 @@ def test_observe_invalid_mode_returns_structured_error(cfg):
     assert isinstance(out, dict)
     assert out["error"] == "bad_mode"
     assert set(out["valid_modes"]) == {
-        "screenshot", "ocr", "read_text", "find_text", "diff"}
+        "screenshot", "ocr", "read_text", "find_text", "diff", "dom_text"}
+
+
+def test_observe_dom_text_forwards_to_core(cfg, monkeypatch):
+    seen = {}
+
+    def fake(cfg_, navigate_url=None, settle_seconds=None, project=None):
+        seen.update(navigate_url=navigate_url, settle_seconds=settle_seconds)
+        return {"state": "succeeded", "mode": "dom_text", "text": "x"}
+
+    monkeypatch.setattr(core, "cdp_dom_text_runtime", fake)
+    mcp = make_mcp(cfg)
+    out = _tool_fn(mcp, "optix_observe")(
+        mode="dom_text", navigate_url="http://localhost:8081/", settle_seconds=0.5)
+    assert out["state"] == "succeeded"
+    assert seen == {"navigate_url": "http://localhost:8081/", "settle_seconds": 0.5}
 
 
 # ---- optix_interact action -> core.* parity -----------------------------
@@ -189,7 +204,7 @@ def test_observe_invalid_mode_returns_structured_error(cfg):
 def test_interact_click_forwards_to_core(cfg, monkeypatch):
     seen = {}
 
-    def fake(cfg_, x=None, y=None, navigate_url=None, settle_seconds=None):
+    def fake(cfg_, x=None, y=None, navigate_url=None, settle_seconds=None, project=None):
         seen.update(x=x, y=y, navigate_url=navigate_url,
                     settle_seconds=settle_seconds)
         return {"state": "succeeded", "x": x, "y": y}
@@ -226,7 +241,7 @@ def test_interact_fill_forwards_to_core(cfg, monkeypatch):
 def test_interact_type_forwards_to_core(cfg, monkeypatch):
     seen = {}
 
-    def fake(cfg_, text=None, navigate_url=None, settle_seconds=None):
+    def fake(cfg_, text=None, navigate_url=None, settle_seconds=None, project=None):
         seen.update(text=text, navigate_url=navigate_url,
                     settle_seconds=settle_seconds)
         return {"state": "succeeded", "typed_chars": len(text or "")}
@@ -242,7 +257,7 @@ def test_interact_type_forwards_to_core(cfg, monkeypatch):
 def test_interact_key_forwards_to_core(cfg, monkeypatch):
     seen = {}
 
-    def fake(cfg_, key=None, navigate_url=None, settle_seconds=None):
+    def fake(cfg_, key=None, navigate_url=None, settle_seconds=None, project=None):
         seen.update(key=key, navigate_url=navigate_url,
                     settle_seconds=settle_seconds)
         return {"state": "succeeded", "key": key}

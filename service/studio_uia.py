@@ -174,3 +174,46 @@ def pending_dialog(pid: int) -> list[dict]:
         return hits
     except Exception:
         return []
+
+
+def _is_upgrade_modal(title: str, text: str) -> bool:
+    """True when a dialog's title/text identifies a Studio project upgrade."""
+    blob = f"{title} {text}".casefold()
+    return "upgrade" in blob and "project" in blob
+
+
+def find_upgrade_modal(auto) -> dict | None:
+    """Return {title, text} of a Studio 'Project Upgrade' modal, or None.
+
+    READ-ONLY: only names/static text are read; the dialog is never clicked
+    (upgrading a project is one-way, so it stays an operator decision).
+    Scans the same two places as `pending_dialog` (top-level dialog windows and
+    WindowControl children nested in a Studio window), but is not keyed on a
+    PID: right after `FTOptixStudio open` the launcher's PID is not necessarily
+    the editor's. A match needs both 'upgrade' and 'project' in the dialog's
+    title/text, so unrelated desktop windows do not trigger it.
+    Returns None on ANY failure.
+    """
+    try:
+        for w in auto.GetRootControl().GetChildren():
+            try:
+                if w.ControlTypeName != "WindowControl":
+                    continue
+                cands = []
+                try:
+                    cands = [d for d in w.GetChildren()
+                             if d.ControlTypeName == "WindowControl"
+                             and not _is_app_window(d.Name or "")]
+                except Exception:
+                    pass
+                if not _is_app_window(w.Name or ""):
+                    cands.append(w)
+                for d in cands:
+                    title, text = d.Name or "", _dialog_text(d)
+                    if _is_upgrade_modal(title, text):
+                        return {"title": title, "text": text}
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None

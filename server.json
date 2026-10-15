@@ -7,14 +7,15 @@
     "url": "https://github.com/asqi-carter/ftx-mcp",
     "source": "github"
   },
-  "version": "1.0.8",
+  "version": "1.0.9",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "ftx-mcp",
-      "version": "1.0.8",
+      "version": "1.0.9",
       "transport": {
-        "type": "stdio"
+        "type": "streamable-http",
+        "url": "http://127.0.0.1:8766/mcp"
       }
     }
   ]

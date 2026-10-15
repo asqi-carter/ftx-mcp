@@ -1,6 +1,7 @@
 """Shared fixtures for service tests."""
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,110 @@ def _no_host_processes(monkeypatch: pytest.MonkeyPatch):
     studio_guard.reset_cache()
     yield
     studio_guard.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _emulator_project_resolution_lenient(request: pytest.FixtureRequest,
+                                         monkeypatch: pytest.MonkeyPatch):
+    """run / restart / status resolve the project FIRST and refuse a nonexistent
+    one with ``project_not_found`` (#92). Most emulator tests drive those
+    entry points with a bare project name and no directory on disk, so by
+    default an unresolvable name still resolves (to ``projects_root/<name>``).
+    Tests marked ``real_project_resolution`` get the real refusal."""
+    if request.node.get_closest_marker("real_project_resolution"):
+        return
+    real = core._resolve_emulator_project
+
+    def _lenient(cfg, project):
+        found, missing = real(cfg, project)
+        if missing is not None:
+            return cfg.projects_root / project, None
+        return found, None
+
+    monkeypatch.setattr(core, "_resolve_emulator_project", _lenient)
+
+
+@pytest.fixture
+def f5_target_studio(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Attribute a Studio (pid 4242) to every project so run_emulator reaches
+    its F5 keystroke; the last guard refuses ``no_target_studio`` without one."""
+    monkeypatch.setattr(core, "_studio_pid_for_project",
+                        lambda project_dir, force=False: 4242)
+    return 4242
+
+
+class HostListenerTableAccess(AssertionError):
+    """A unit test read the HOST's real listener table (#91)."""
+
+
+@pytest.fixture(autouse=True)
+def _no_host_listener_table(request: pytest.FixtureRequest,
+                            monkeypatch: pytest.MonkeyPatch):
+    """Guard: ``psutil.net_connections`` raises outside live runs.
+
+    A live run is a test marked ``live`` / ``slow_live`` or any run configured
+    with an ``FTX_LIVE_*`` env var (``_is_live_run``): live tests talk to a real
+    Studio/emulator, so the real listener table is legitimate there.
+
+    The result depends on whatever happens to listen on the host (a dev box
+    often serves 8081), so a unit test that reaches it passes or fails with
+    machine state. Tests must patch ``core._port_owner`` /
+    ``core._port_listener_pids`` / ``core._pids_listening_on`` instead; a test
+    that patches ``psutil.net_connections`` itself wins over this default.
+    """
+    if _is_live_run(request):
+        return
+
+    def _guard(*args: Any, **kwargs: Any):
+        raise HostListenerTableAccess(
+            "psutil.net_connections called from a non-live test: it reads the "
+            "host's listener table. Patch core._port_owner / "
+            "core._port_listener_pids, or mark the test `live`.")
+
+    monkeypatch.setattr(core.psutil, "net_connections", _guard)
+
+
+@pytest.fixture(autouse=True)
+def _no_cdp_activate_http(monkeypatch: pytest.MonkeyPatch):
+    """``_cdp.activate`` (GET /json/activate/<id>) must never touch a real
+    Chrome from unit tests; tests that assert on it patch this seam again."""
+    from service import _cdp
+    monkeypatch.setattr(_cdp, "_http_get_status", lambda url, timeout: 200)
+
+
+@pytest.fixture(autouse=True)
+def _no_edit_type_probe(request, monkeypatch: pytest.MonkeyPatch):
+    """``bridge_edit`` checks widget/object type names against the bridge's type
+    catalog at validate time. Tests that fake only the validate/apply seams must
+    not reach for a real bridge (slow, and it consumes fake clocks), so the
+    check is inert by default; ``test_edit_op_validation`` exercises it."""
+    if request.module.__name__.endswith("test_edit_op_validation"):
+        return
+    monkeypatch.setattr(core, "validate_edit_op_types", lambda cfg, project, ops: [])
+
+
+def _is_live_run(request: pytest.FixtureRequest) -> bool:
+    """True when the test is marked ``live`` / ``slow_live`` or the run is configured
+    for the live suite (any non-empty ``FTX_LIVE_*`` env var). Live tests talk to a
+    real Studio whose NetLogic template write takes real time, so they need the
+    production wait constants."""
+    if request.node.get_closest_marker("live") or request.node.get_closest_marker("slow_live"):
+        return True
+    return any(k.startswith("FTX_LIVE_") and v for k, v in os.environ.items())
+
+
+@pytest.fixture(autouse=True)
+def _fast_netlogic_template_wait(request: pytest.FixtureRequest,
+                                 monkeypatch: pytest.MonkeyPatch):
+    """Keep create_netlogic's bounded template-write wait short in unit tests
+    (most fake projects have no template .cs, so the wait would run to its cap).
+    Live tests (marked ``live`` / ``slow_live`` or run under ``FTX_LIVE_*``) keep the
+    real constants: a real Studio needs the full wait."""
+    if _is_live_run(request):
+        return
+    monkeypatch.setattr(core, "_NETLOGIC_TEMPLATE_MAX_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(core, "_NETLOGIC_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(core, "_NETLOGIC_SETTLE_POLL", 0.01)
 
 
 @pytest.fixture(autouse=True)

@@ -47,6 +47,24 @@ To run a NetLogic `[ExportMethod]` on click, pass `method_path` instead of
 `optix_bridge_edit(project, ops=[{"op": "wire_event", "path": ".../StartBtn", "event_type": "MouseClickEvent", "method_path": "NetLogic/MyLogic/DoThing"}])`.
 (The ExportMethod is authored as an EventHandler.)
 
+## Several actions on one click (multi-step)
+
+An event can run several calls in order — pass `calls` instead of a single
+`command`/`method_path`; they become MethodContainer1..N under ONE EventHandler:
+```
+{"op": "wire_event", "path": ".../StartBtn", "event_type": "MouseClickEvent",
+ "calls": [
+   {"command": "SetVariable", "variable": "Model/Mode", "value": "2"},
+   {"command": "ToggleVariable", "variable": "Model/PowerOn"},
+   {"method_path": "NetLogic/MyLogic/DoThing"}]}
+```
+- **Add to a handler that already exists** without replacing its calls:
+  `append: true` (a single `command`/`method_path` + `append: true` appends one).
+  Without it, the first call updates the handler's existing call in place.
+- A bad list is refused with per-call errors (`call_index`, `code`) and nothing is
+  written; `dry_run` shows the same errors. Do not combine `calls` with top-level
+  `command`/`method_path`, and do not combine `append` with `replace`.
+
 ## Notes
 
 - **Re-wiring an existing handler** — if the event node already has a handler
@@ -59,6 +77,10 @@ To run a NetLogic `[ExportMethod]` on click, pass `method_path` instead of
   When the bridge cannot safely identify the existing handler it returns
   `handler_exists` with the conflicting handler's details; pass `replace=true`
   to force delete-then-create instead.
+- **Wipe-and-rebuild generators discard `wire_event` handlers.** If a generator deletes
+  and recreates the nodes, handlers wired with `wire_event` are lost on the next run;
+  author the EventHandlers in C# in the generator instead (see
+  `optix-netlogic-and-bridge`).
 - **One event, multiple actions is NOT yet supported** — chaining several
   actions in sequence (e.g. ChangeUser→Close) needs the future multi-command
   tool. For a single Set/Toggle this is complete.

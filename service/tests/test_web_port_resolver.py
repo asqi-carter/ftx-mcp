@@ -885,3 +885,68 @@ class TestEnvOverrideRegression:
         result = core.resolve_web_port(cfg, "Bare")
         assert result["source"] == "env_override"
         assert result["source"] != "default"
+
+
+# ===========================================================================
+# Section — project-first default with a warned 8081 fallback (ftx-mcp-xk7.5)
+# ===========================================================================
+
+
+class TestWebPortFallbackWarning:
+    """The project's port wins; with none, 8081 is used and a warning names
+    every place that was searched."""
+
+    def test_project_port_used_without_warning(
+        self, cfg: core.Config, projects_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _make_project_with_engine(projects_root, "MyApp", port=9123)
+        with caplog.at_level("WARNING"):
+            result = core.resolve_web_port(cfg, "MyApp")
+        assert result["port"] == 9123
+        assert result["source"] == "project"
+        assert "warning" not in result
+        assert not [r for r in caplog.records if "fallback" in r.getMessage()]
+
+    def test_fallback_8081_warns_naming_locations_searched(
+        self, cfg: core.Config, projects_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        proj = projects_root / "Bare"
+        proj.mkdir()
+        (proj / "Bare.optix").write_text("fake")
+        with caplog.at_level("WARNING"):
+            result = core.resolve_web_port(cfg, "Bare")
+        assert result["port"] == 8081
+        assert result["source"] == "default"
+        warning = result["warning"]
+        assert "UI/WebPresentationEngine" in warning
+        assert "UI.yaml" in warning
+        assert "OPTIX_RUNTIME_TEST_PORT" in warning
+        assert "8081" in warning
+        assert any("UI.yaml" in r.getMessage() for r in caplog.records)
+
+    def test_no_engine_project_falls_back_to_8081_with_warning(
+        self, cfg: core.Config, projects_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _make_project_no_engine(projects_root, "NoEngine")
+        with caplog.at_level("WARNING"):
+            result = core.resolve_web_port(cfg, "NoEngine")
+        assert result["source"] == "no_engine"
+        assert "UI.yaml" in result["warning"]
+        assert core._project_web_port(cfg, "NoEngine") == cfg.runtime_test_port == 8081
+
+    def test_no_hardcoded_8088_default_in_service_source(self) -> None:
+        src = Path(core.__file__).parent
+        for py in src.glob("*.py"):
+            assert "8088" not in py.read_text(encoding="utf-8"), py.name
+
+
+@pytest.mark.skipif(
+    os.environ.get("FTX_LIVE_BRIDGE") != "1" or not os.environ.get("FTX_LIVE_PROJECT"),
+    reason="needs a live bridge: set FTX_LIVE_BRIDGE=1 and FTX_LIVE_PROJECT",
+)
+def test_resolve_web_port_against_live_bridge() -> None:
+    cfg = core.Config.from_env()
+    r = core.resolve_web_port(cfg, os.environ["FTX_LIVE_PROJECT"])
+    assert r["source"] in ("project", "no_engine", "default", "env_override")
+    if r["source"] in ("default", "no_engine"):
+        assert "warning" in r

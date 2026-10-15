@@ -66,6 +66,7 @@ EXPECTED_TOOLS = {
     "optix_save",
     "optix_emulator",  # consolidated run/restart/stop/status/log
     "optix_bridge_log_tail",
+    "optix_studio_log",  # (1.0.9) tail FTOptixStudio.0.log
     "optix_deploy_updatesvc",
     "optix_add_widget",
     "optix_add_model_variable",
@@ -108,6 +109,12 @@ _BRIDGE_PRIMITIVE_TOOLS = {
     "optix_bridge_create_alias",
     "optix_bridge_create_widget",
     "optix_bridge_add_translation",
+    "optix_bridge_set_text_key",
+    "optix_bridge_add_translations",
+    "optix_bridge_remove_translation",
+    "optix_bridge_set_modelling_rule",
+    "optix_bridge_retype",
+    "optix_bridge_import_tags",
 }
 
 
@@ -203,7 +210,7 @@ def test_mcp_tools_carry_readonly_destructive_annotations(cfg: core.Config) -> N
             # U14 consolidated read-side capture
             "optix_observe",
             # compiles to a throwaway copy / tails a diagnostic log — neither mutates
-            "optix_build_check", "optix_bridge_log_tail",
+            "optix_build_check", "optix_bridge_log_tail", "optix_studio_log",
             "optix_bridge_log_tail",
             "optix_read_netlogic"}
     DESTRUCTIVE = {"optix_deploy","optix_deploy_updatesvc","optix_bridge_delete_node",
@@ -654,7 +661,7 @@ def test_cdp_read_text_tool_registered_and_forwards_to_core(
     seen = {}
 
     def fake_read_text(cfg_, region=None, navigate_url=None, settle_seconds=None,
-                       psm=6, project=None):
+                       psm=6, project=None, target="web"):
         seen.update(region=region, psm=psm)
         return {"state": "succeeded", "text": "SP-101", "region": region,
                 "size_bytes": 10, "navigated": False, "captured_at": "t"}
@@ -685,7 +692,7 @@ def test_cdp_find_text_tool_registered_and_forwards_to_core(
     seen = {}
 
     def fake_find_text(cfg_, text, navigate_url=None, settle_seconds=None,
-                       project=None):
+                       project=None, target="web"):
         seen["text"] = text
         return {"state": "succeeded", "found": True, "matches": [
             {"text": "Start", "confidence": 0.95, "bbox_px": [1, 2, 3, 4],
@@ -954,10 +961,11 @@ def test_with_project_tool_count_and_annotations_unchanged(cfg: core.Config) -> 
     and optix_project (consolidated open/new) add two more (40 + 2 = 42).
     (v1.0.8): optix_execute_method (right-click -> Execute any design-time
     [ExportMethod]) adds one, never gated (42 + 1 = 43).
-    (1.0.8): optix_read_netlogic adds one, never gated (43 + 1 = 44)."""
+    (1.0.8): optix_read_netlogic adds one, never gated (43 + 1 = 44).
+    (1.0.9): optix_studio_log adds one, never gated (44 + 1 = 45)."""
     mcp = make_mcp(cfg)
     by_name = {t.name: t for t in _list_tools(mcp)}
-    assert len(by_name) == 44
+    assert len(by_name) == 45
     assert by_name["optix_list_screens"].annotations.readOnlyHint is True
     write = by_name["optix_bridge_add_bound_widget"].annotations
     assert write.readOnlyHint is False and write.destructiveHint is False

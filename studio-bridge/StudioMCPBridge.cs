@@ -41,8 +41,11 @@ public class StudioMCPBridge : BaseNetLogic
     // wrong about behavior). Last bumped for the 1.0.8 batch: the I31 crash-proof
     // dispatch + enum coercion, the NetLogic move refusal, I35's dotnet_type,
     // relative dynamic links inside an ObjectType, and OpenKeyboard - all real
-    // behavior changes to this file.
-    private const string BridgeVersion = "1.0.8";
+    // behavior changes to this file. 1.0.9: the subtree pre-check
+    // (FindUnsafeSubtree) - move / rename / convert_to_type refuse subtrees that
+    // contain a NetLogic or an EventHandler (contains_netlogic /
+    // contains_event_handler); /bridge/health advertises "subtree_guard".
+    private const string BridgeVersion = "1.0.9";
     // multi-instance support (v1.0.7). Port is no longer a single
     // fixed const - each Studio instance self-assigns the first free port in
     // BasePort..BasePort+PortRangeSize-1, so up to PortRangeSize projects can
@@ -53,6 +56,10 @@ public class StudioMCPBridge : BaseNetLogic
     // Studio instances; raise it if you routinely run more.
     private const int BasePort = 8768;
     private const int PortRangeSize = 4;   // ports 8768..8771
+    // Stable marker at the start of the bind-failure log line. The Python service
+    // (studio_arm.BIND_FAILURE_MARKER) scans the Studio log for it after an arm click
+    // and returns bridge_port_range_full instead of verify_timeout. Do not reword.
+    private const string BindFailureMarker = "bridge_port_range_full";
 
     // Cross-ALC stop signal: at design time Studio runs each [ExportMethod] in an
     // ISOLATED AssemblyLoadContext, so StartBridge and StopBridge share NO managed
@@ -305,22 +312,52 @@ public class StudioMCPBridge : BaseNetLogic
         return System.IO.Path.Combine(RegistryDir(), port.ToString() + ".json");
     }
 
-    // Returns the best available project_path string, or null.
-    // Tries Project.Current first (no FilePath property is exposed in the
-    // current SDK version - BrowseName is the only name-like field used
-    // throughout this file), so falls back to Environment.CurrentDirectory
-    // (the directory Studio was launched from / opened the .optix file from).
+    // Returns the real project location (the .optix file or the project
+    // folder Studio has open), or null when nothing reliable is available.
+    // project_path_v2: the process working directory is deliberately NOT a
+    // fallback - Studio's working directory is typically C:\WINDOWS\system32
+    // (or the install dir), which is not the project and made the service
+    // resolve the wrong folder. Unknown is reported as null.
     private static string GetProjectPath()
+    {
+        return NormalizeToProjectFolder(GetProjectPathRaw());
+    }
+
+    // The path must name the folder holding <project>.optix. The SDK can hand
+    // back the ProjectFiles subfolder (or a folder with no .optix of its own)
+    // instead; in that case report the parent when it holds exactly one .optix.
+    // A .optix file path or an already-correct folder is returned unchanged.
+    private static string NormalizeToProjectFolder(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return path;
+        try
+        {
+            if (path.EndsWith(".optix", StringComparison.OrdinalIgnoreCase)) return path;
+            string dir = path.TrimEnd('\\', '/');
+            string parent = System.IO.Path.GetDirectoryName(dir);
+            if (string.IsNullOrEmpty(parent) || !System.IO.Directory.Exists(parent)) return path;
+            bool isProjectFiles = string.Equals(System.IO.Path.GetFileName(dir), "ProjectFiles",
+                StringComparison.OrdinalIgnoreCase);
+            bool hasOptix = System.IO.Directory.Exists(dir) &&
+                System.IO.Directory.GetFiles(dir, "*.optix").Length > 0;
+            if (!isProjectFiles && hasOptix) return path;
+            if (System.IO.Directory.GetFiles(parent, "*.optix").Length == 1) return parent;
+        }
+        catch { /* keep the original path */ }
+        return path;
+    }
+
+    private static string GetProjectPathRaw()
     {
         try
         {
-            // Attempt 1: reflection probe for a FilePath or StorePath
-            // property that may exist in newer SDK drops without needing
-            // a compile-time reference to the property name.
             var p = Project.Current;
             if (p != null)
             {
-                foreach (var name in new[] { "FilePath", "StorePath", "ProjectFilePath" })
+                // Attempt 1: reflection probe for a path property that may
+                // exist in the SDK without a compile-time reference.
+                foreach (var name in new[] { "FilePath", "StorePath", "ProjectFilePath",
+                                             "ProjectPath", "ProjectDirectory" })
                 {
                     try
                     {
@@ -329,23 +366,163 @@ public class StudioMCPBridge : BaseNetLogic
                         if (pi != null)
                         {
                             var val = pi.GetValue(p) as string;
-                            if (!string.IsNullOrEmpty(val)) return val;
+                            if (IsReliableProjectPath(val)) return val;
                         }
                     }
                     catch { /* property not present in this SDK version */ }
                 }
+                // Attempt 2: resolve the project folder through the SDK's
+                // ResourceUri (ProjectFiles directory resolution).
+                var viaUri = ProjectDirFromResourceUri();
+                if (IsReliableProjectPath(viaUri)) return viaUri;
             }
         }
         catch { /* Project.Current unavailable */ }
-        // Attempt 2: Studio's working directory at launch - typically the
-        // directory containing the .optix file that was opened.
+        return null;
+    }
+
+    // Resolves the project directory by asking ResourceUri for the absolute
+    // location of a project-relative path (reflection: the type's namespace
+    // differs between SDK drops). Returns null on any failure.
+    private static string ProjectDirFromResourceUri()
+    {
         try
         {
-            var cwd = Environment.CurrentDirectory;
-            if (!string.IsNullOrEmpty(cwd)) return cwd;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type t = null;
+                try { t = asm.GetType("FTOptix.Core.ResourceUri", false); } catch { }
+                if (t == null) continue;
+                var m = t.GetMethod("FromProjectRelativePath", BindingFlags.Public | BindingFlags.Static,
+                    null, new[] { typeof(string) }, null);
+                if (m == null) continue;
+                var ru = m.Invoke(null, new object[] { "." });
+                if (ru == null) continue;
+                var uriProp = ru.GetType().GetProperty("Uri", BindingFlags.Public | BindingFlags.Instance);
+                var uri = uriProp == null ? null : uriProp.GetValue(ru) as string;
+                if (!string.IsNullOrEmpty(uri)) return uri;
+            }
         }
         catch { }
         return null;
+    }
+
+    // A project path is reliable only when it is absolute and not under the
+    // Windows directory (e.g. C:\WINDOWS\system32, Studio's usual cwd).
+    private static bool IsReliableProjectPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            if (!System.IO.Path.IsPathRooted(path)) return false;
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (!string.IsNullOrEmpty(win))
+            {
+                string full = System.IO.Path.GetFullPath(path).TrimEnd('\\');
+                win = win.TrimEnd('\\');
+                if (full.Equals(win, StringComparison.OrdinalIgnoreCase) ||
+                    full.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // Studio identity (1.0.9, PRD 0022 9a). The project DIRECTORY is the folder
+    // holding the project, derived from the (reliable) project path: a .optix
+    // file path yields its parent folder, a folder path is used as is. Null
+    // when the project path is unknown. Never Studio's working directory.
+    private static string GetProjectDir()
+    {
+        try
+        {
+            string path = GetProjectPath();
+            if (string.IsNullOrEmpty(path)) return null;
+            if (path.EndsWith(".optix", StringComparison.OrdinalIgnoreCase))
+                return System.IO.Path.GetDirectoryName(path);
+            return path.TrimEnd('\\', '/');
+        }
+        catch { return null; }
+    }
+
+    private static string GetProjectName()
+    {
+        try
+        {
+            var p = Project.Current;
+            if (p != null) return p.BrowseName;
+        }
+        catch { /* Project.Current unavailable */ }
+        return "unknown";
+    }
+
+    private static string JsonStringOrNull(string v)
+    {
+        return v == null ? "null" : "\"" + JsonEscape(v) + "\"";
+    }
+
+    // Idempotent arm per Studio pid: returns the port of a live bridge that
+    // already belongs to THIS Studio process, or -1. The candidate ports come
+    // from BoundPortEnvVar (process-scoped, so it only ever lists ports this
+    // Studio bound - never a sibling Studio's) and each is confirmed with a
+    // real /bridge/health whose studio_pid equals ours, so a stale entry or a
+    // port since taken by another Studio is never mistaken for ours.
+    private static int FindLiveOwnBridgePort()
+    {
+        int myPid = System.Diagnostics.Process.GetCurrentProcess().Id;
+        foreach (var port in ReadBoundPorts())
+        {
+            string body = ProbeHealth(port);
+            if (body == null) continue;
+            if (HealthStudioPid(body) == myPid) return port;
+        }
+        return -1;
+    }
+
+    // Raw loopback GET /bridge/health; null when nothing answers.
+    private static string ProbeHealth(int port)
+    {
+        try
+        {
+            using (var c = new TcpClient())
+            {
+                var ar = c.BeginConnect(IPAddress.Loopback, port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(500)) return null;
+                c.EndConnect(ar);
+                c.ReceiveTimeout = 1500;
+                c.SendTimeout = 1500;
+                var s = c.GetStream();
+                var req = Encoding.ASCII.GetBytes("GET /bridge/health HTTP/1.0\r\n\r\n");
+                s.Write(req, 0, req.Length);
+                var sb = new StringBuilder();
+                var buf = new byte[2048];
+                int n;
+                while ((n = s.Read(buf, 0, buf.Length)) > 0)
+                {
+                    sb.Append(Encoding.UTF8.GetString(buf, 0, n));
+                    if (sb.Length > 16384) break;
+                }
+                string all = sb.ToString();
+                return all.Contains("\"bridge_version\"") ? all : null;
+            }
+        }
+        catch { return null; }
+    }
+
+    // studio_pid out of a health body, or -1 (older bridges report only "pid").
+    private static int HealthStudioPid(string body)
+    {
+        foreach (var key in new[] { "\"studio_pid\":", "\"pid\":" })
+        {
+            int i = body.IndexOf(key, StringComparison.Ordinal);
+            if (i < 0) continue;
+            i += key.Length;
+            int j = i;
+            while (j < body.Length && char.IsDigit(body[j])) j++;
+            int v;
+            if (j > i && int.TryParse(body.Substring(i, j - i), out v)) return v;
+        }
+        return -1;
     }
 
     /// <summary>
@@ -379,9 +556,12 @@ public class StudioMCPBridge : BaseNetLogic
                 ",\"project\":\"" + JsonEscape(project) + "\"" +
                 ",\"project_path\":" + projectPathJson +
                 ",\"pid\":" + pid +
+                ",\"studio_pid\":" + pid +
+                ",\"project_name\":" + JsonStringOrNull(project) +
+                ",\"project_dir\":" + JsonStringOrNull(GetProjectDir()) +
                 ",\"bridge_version\":\"" + BridgeVersion + "\"" +
                 ",\"started_at\":\"" + JsonEscape(startedAt) + "\"}";
-            System.IO.File.WriteAllText(RegistryEntryPath(port), json, Encoding.UTF8);
+            System.IO.File.WriteAllText(RegistryEntryPath(port), json, new UTF8Encoding(false));
         }
         catch (Exception ex)
         {
@@ -446,6 +626,18 @@ public class StudioMCPBridge : BaseNetLogic
 
     private void StartListener(string via)
     {
+        // One bridge listener per Studio process: if this Studio already has a
+        // live bridge (confirmed by its own /bridge/health studio_pid), arming
+        // again returns that bridge instead of binding a second port.
+        int existing = FindLiveOwnBridgePort();
+        if (existing > 0)
+        {
+            Log.Info("StudioBridge", "already armed for this Studio (pid " +
+                     System.Diagnostics.Process.GetCurrentProcess().Id +
+                     ") on http://127.0.0.1:" + existing + " (" + via +
+                     " is a no-op; StopBridge first to restart it)");
+            return;
+        }
         for (int port = BasePort; port < BasePort + PortRangeSize; port++)
         {
             // Clear any prior stop-signal for THIS port so a fresh loop on it
@@ -485,7 +677,7 @@ public class StudioMCPBridge : BaseNetLogic
                      " (started via " + via + ")");
             return;
         }
-        Log.Error("StudioBridge", "cannot bind any port in " + BasePort + "-" +
+        Log.Error("StudioBridge", BindFailureMarker + ": cannot bind any port in " + BasePort + "-" +
             (BasePort + PortRangeSize - 1) + " - " + PortRangeSize +
             " bridges are already running, or a stale one holds a port. StopBridge now sweeps " +
             "EVERY port this process has ever bound (not just the most recent), so clicking it " +
@@ -632,6 +824,22 @@ public class StudioMCPBridge : BaseNetLogic
                 {
                     body = HealthJson();
                     status = "200 OK";
+                }
+                else if (firstLine.StartsWith("GET /bridge/station/tags"))
+                {
+                    // Read-only: the station's tag set as ImportTagsSnapshot sees it,
+                    // [{path, symbol}], so the service and the importer agree (PRD 0054 A).
+                    string stQ = QueryParam(firstLine, "station");
+                    if (string.IsNullOrEmpty(stQ))
+                    {
+                        body = ErrorJson("bad_query", "missing required query param: station");
+                        status = "400 Bad Request";
+                    }
+                    else
+                    {
+                        body = StationTagsJson(stQ);
+                        status = body.StartsWith("{\"ok\":false") ? "404 Not Found" : "200 OK";
+                    }
                 }
                 else if (firstLine.StartsWith("GET /bridge/nodes"))
                 {
@@ -819,6 +1027,30 @@ public class StudioMCPBridge : BaseNetLogic
                     body = SetDisplayNameInline(firstLine);
                     status = "200 OK";
                 }
+                else if (firstLine.StartsWith("POST /bridge/node/text-key"))
+                {
+                    // Text property -> translation KEY (LocalizedText with a TextId,
+                    // not a literal). Its own route, like displayname: the literal
+                    // path (set_property) must keep meaning "literal text".
+                    body = SetTextKeyInline(firstLine);
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/node/modelling-rule"))
+                {
+                    // ModellingRule (Mandatory / Optional / None) on a TYPE MEMBER.
+                    // A node setting, not a UA child variable: its own route so it
+                    // never reaches the property / GetOrCreateVariable path.
+                    body = SetModellingRuleInline(firstLine);
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/station/import-tags"))
+                {
+                    // Design-time Tag Importer (RA EtherNet/IP / TwinCAT). JSON BODY
+                    // {station, mode, file?, tags[], timeout_s?}: the tag list does
+                    // not fit the 4 KB request-line read.
+                    body = ImportTagsInline(firstLine, ReadRequestBody(stream, buf, n, req));
+                    status = "200 OK";
+                }
                 else if (firstLine.StartsWith("POST /bridge/node/property"))
                 {
                     // GENERIC property set - NOT per-component plumbing. Every
@@ -839,6 +1071,19 @@ public class StudioMCPBridge : BaseNetLogic
                     body = CreateAliasInline(firstLine);
                     status = "200 OK";
                 }
+                // Bulk add + remove FIRST: "POST /bridge/i18n/translation" below is a
+                // prefix of both, so the more specific routes must be tested before it.
+                else if (firstLine.StartsWith("POST /bridge/i18n/translations"))
+                {
+                    // Row LIST -> JSON body {"rows":[{key,value,locale}]}, like validate_ops.
+                    body = AddTranslationsInline(firstLine, ReadRequestBody(stream, buf, n, req));
+                    status = "200 OK";
+                }
+                else if (firstLine.StartsWith("POST /bridge/i18n/translation/remove"))
+                {
+                    body = RemoveTranslationInline(firstLine);
+                    status = "200 OK";
+                }
                 else if (firstLine.StartsWith("POST /bridge/i18n/translation"))
                 {
                     body = AddTranslationInline(firstLine);
@@ -851,7 +1096,9 @@ public class StudioMCPBridge : BaseNetLogic
                 }
                 else if (firstLine.StartsWith("POST /bridge/node/event"))
                 {
-                    body = WireEventInline(firstLine);
+                    // Multi-step form (`calls`) carries its list as a JSON BODY, like
+                    // validate_ops; the single-call form has no body (empty read).
+                    body = WireEventInline(firstLine, ReadRequestBody(stream, buf, n, req));
                     status = "200 OK";
                 }
                 // new dispatcher branch, paired with
@@ -910,7 +1157,8 @@ public class StudioMCPBridge : BaseNetLogic
     private static readonly string[] _MutationRoutes = {
         "POST /bridge/model/", "POST /bridge/ui/widget",
         "POST /bridge/i18n/translation", "POST /bridge/setup/web-engine",
-        "POST /bridge/node/property", "POST /bridge/node/bind",
+        "POST /bridge/node/property", "POST /bridge/node/text-key", "POST /bridge/node/bind",
+        "POST /bridge/node/modelling-rule", "POST /bridge/station/import-tags",
         "POST /bridge/node/alias", "POST /bridge/node/move",
         "POST /bridge/node/convert-to-type", "POST /bridge/node/reorder",
         "POST /bridge/node/delete", "POST /bridge/node/event",
@@ -985,11 +1233,30 @@ public class StudioMCPBridge : BaseNetLogic
                ",\"port\":" + _boundPort +
                ",\"project_path\":" + projectPathJson +
                ",\"pid\":" + pid +
+               // Studio identity (1.0.9): which Studio this bridge belongs to.
+               // studio_pid equals pid (kept for older readers); project_name is
+               // the project node's name, project_dir the folder holding it
+               // (null when unknown).
+               ",\"studio_pid\":" + pid +
+               ",\"project_name\":\"" + JsonEscape(project) + "\"" +
+               ",\"project_dir\":" + JsonStringOrNull(GetProjectDir()) +
                // invoke_session tells the service this build runs /bridge/node/invoke
                // under a root session (see InvokeMethodInline). Builds without it
                // run ExecuteMethod session-less, which kills Studio; the service
                // refuses invoke against them.
-               ",\"invoke_session\":\"root\"}";
+               ",\"invoke_session\":\"root\"" +
+               // subtree_guard (1.0.9): move / rename / convert_to_type run
+               // FindUnsafeSubtree before any mutation. A bridge without this
+               // field re-authors NetLogic / EventHandler subtrees and can crash Studio.
+               ",\"subtree_guard\":\"1\"" +
+               // import_tags (1.0.9): POST /bridge/station/import-tags exists.
+               ",\"import_tags\":\"1\"" +
+               // project_path_v2 (1.0.9): project_path is the real project
+               // location or null - never Studio's working directory.
+               ",\"project_path_v2\":\"1\"" +
+               // studio_version (1.0.9): the running Studio's version, so a client can
+               // tell whether 1.8-only features (expression pow) are available.
+               ",\"studio_version\":\"" + JsonEscape(StudioVersionString()) + "\"}";
     }
 
     private string NodeJson(string path, IUANode node)
@@ -1007,7 +1274,8 @@ public class StudioMCPBridge : BaseNetLogic
                 if (propCount++ > 0) props.Append(",");
                 props.Append("{\"name\":\"" + JsonEscape(child.BrowseName) +
                              "\",\"datatype\":\"" + JsonEscape(DataTypeNameFull(v)) +
-                             "\",\"value\":\"" + JsonEscape(ValueString(v)) + "\"}");
+                             "\",\"value\":\"" + JsonEscape(ValueString(v)) + "\"" +
+                             LinkTargetJson(v) + "}");
             }
             else
             {
@@ -1019,13 +1287,35 @@ public class StudioMCPBridge : BaseNetLogic
             }
         }
 
+        // #39: a Variable node reports its OWN datatype/value (+ target_path for
+        // a link) - without this a Variable described as `properties: []`.
+        string selfValue = "";
+        if (node is IUAVariable sv)
+            selfValue = ",\"datatype\":\"" + JsonEscape(DataTypeNameFull(sv)) +
+                        "\",\"value\":\"" + JsonEscape(ValueString(sv)) + "\"" +
+                        LinkTargetJson(sv) + VariableTypeJson(sv);
+
         return "{\"path\":\"" + JsonEscape(path) +
                "\",\"browse_name\":\"" + JsonEscape(node.BrowseName) +
                "\",\"node_class\":\"" + node.NodeClass +
                "\",\"dotnet_type\":\"" + JsonEscape(DotNetTypeName(node)) +
                "\",\"children\":[" + children + "]" +
-               ",\"properties\":[" + props + "]" +
+               ",\"properties\":[" + props + "]" + selfValue +
                ",\"truncated\":" + Bool(childTrunc || propTrunc) + "}";
+    }
+
+    // The variable's VariableType browse name as a ",\"variable_type\":..." JSON
+    // fragment (a typed driver tag reports e.g. RAEtherNetIPTag); "" when the
+    // variable has no type definition or it cannot be read.
+    private static string VariableTypeJson(IUAVariable v)
+    {
+        try
+        {
+            var vt = v.VariableType;
+            if (vt == null) return "";
+            return ",\"variable_type\":\"" + JsonEscape(vt.BrowseName) + "\"";
+        }
+        catch { return ""; }
     }
 
     // I35 (2026-09-04, PopupApp2). node.GetType().Name is the generated CLR PROXY
@@ -1188,13 +1478,7 @@ public class StudioMCPBridge : BaseNetLogic
     // BaseUIObject subtypes is a future nicety.
     private string SchemaDumpJson()
     {
-        string version = "unknown";
-        try
-        {
-            var v = typeof(FTOptix.UI.ObjectTypes).Assembly.GetName().Version;
-            if (v != null && !string.IsNullOrEmpty(v.ToString())) version = v.ToString();
-        }
-        catch { /* keep "unknown" - the Python _version_key sanitizes whatever it gets */ }
+        string version = StudioVersionString();   // "unknown" is sanitized by the Python _version_key
 
         var types = new StringBuilder();
         int typeCount = 0;
@@ -1682,6 +1966,12 @@ public class StudioMCPBridge : BaseNetLogic
         if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(format))
             return ErrorJson("bad_query",
                 "required: path, name, format (+ sources=name=path;name=path, mode=Read|ReadWrite|Write)");
+        // Backstop for direct bridge callers: refuse BEFORE any model write.
+        if (IsProjectRelativeFormatPath(format))
+            return ErrorJson("format_path_not_runtime_resolvable",
+                "format '" + format + "' is not runtime resolvable: a project-relative path " +
+                "resolves against the property itself and renders BLANK. Use the absolute form " +
+                "'/Objects/<Project>/" + format + "' (or a node-relative ../ or ./ path).");
         try
         {
             var node = ResolveNode(path);
@@ -1753,6 +2043,34 @@ public class StudioMCPBridge : BaseNetLogic
         {
             return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
         }
+    }
+
+    // Project-top segments (children of Project.Current). Mirrors
+    // core._PROJECT_TOP_SEGMENTS in the Python service.
+    private static readonly string[] ProjectTopSegments = new[]
+    {
+        "Model", "UI", "Converters", "NetLogic", "Alarms", "DataStores", "Recipes",
+        "Reports", "Retentivity", "CommunicationDrivers", "Security", "Translations",
+        "Loggers", "EventHandlers", "System", "OPCUA", "MQTT", "Nodes"
+    };
+
+    // True when the static prefix of a formatted-link format (text before the
+    // first "{#") starts with a project-top segment ("Model/X/{#k}"). The runtime
+    // resolves a format path relative to the property, so such a link attaches
+    // ok:true and renders BLANK. "/Objects/", "../", "./" and a leading "{#"
+    // are runtime-resolvable. Mirrors core.classify_format_path.
+    private static bool IsProjectRelativeFormatPath(string format)
+    {
+        if (string.IsNullOrEmpty(format)) return false;
+        int hash = format.IndexOf("{#", StringComparison.Ordinal);
+        string prefix = hash < 0 ? format : format.Substring(0, hash);
+        if (prefix.Length == 0 || prefix.StartsWith("/Objects/", StringComparison.Ordinal) ||
+            prefix.StartsWith("../", StringComparison.Ordinal) ||
+            prefix.StartsWith("./", StringComparison.Ordinal))
+            return false;
+        int slash = prefix.IndexOf('/');
+        if (slash <= 0) return false;
+        return Array.IndexOf(ProjectTopSegments, prefix.Substring(0, slash)) >= 0;
     }
 
     // The NetLogic_CheatSheet "formatted dynamic link" recipe, followed exactly
@@ -2130,6 +2448,16 @@ public class StudioMCPBridge : BaseNetLogic
         string name = QueryParam(firstLine, "name");
         string parent = QueryParam(firstLine, "parent") ?? "Model";
         string dtName = QueryParam(firstLine, "datatype") ?? "Boolean";
+        string ptrTarget = QueryParam(firstLine, "target");
+        string ptrKind = QueryParam(firstLine, "kind");
+        // 1.0.9 5b: station tags / arrays. variable_type = any VariableType by name
+        // (e.g. RAEtherNetIPTag); array_dimensions = one positive integer;
+        // properties = JSON object {name: scalar} of child properties the type
+        // declares (e.g. SymbolName); dry_run=true resolves/validates, creates nothing.
+        string vtName = QueryParam(firstLine, "variable_type");
+        string dimsRaw = QueryParam(firstLine, "array_dimensions");
+        string propsRaw = QueryParam(firstLine, "properties");
+        bool dryRunVar = string.Equals(QueryParam(firstLine, "dry_run"), "true", StringComparison.OrdinalIgnoreCase);
         if (string.IsNullOrEmpty(name))
             return ErrorJson("bad_query", "missing required query param: name");
         try
@@ -2137,11 +2465,92 @@ public class StudioMCPBridge : BaseNetLogic
             var parentNode = ResolveNode(parent);
             if (parentNode == null)
                 return ErrorJson("node_not_found", "no parent node at: " + parent);
-            var v = InformationModel.MakeVariable(name, ResolveDataType(dtName));
+
+            // NodePointer: a typed FTOptix.Core.NodePointer whose Kind is the type of
+            // the node it points at. MakeVariable(name, NodeId) alone would make a
+            // plain NodeId variable (no Kind), and a NodePointer left at its default
+            // Kind is BaseObjectType, which makes Studio treat every target as a
+            // bare object. Resolve the Kind BEFORE creating anything so a refusal
+            // leaves the model untouched.
+            if (IsNodePointerDataType(dtName))
+            {
+                if (!string.IsNullOrEmpty(vtName) || !string.IsNullOrEmpty(dimsRaw) || !string.IsNullOrEmpty(propsRaw))
+                    return ErrorJson("variable_type_not_applicable",
+                        "variable_type/array_dimensions/properties do not apply to datatype NodePointer");
+                NodeId ptrKindId; string ptrKindName, kcode, kmsg;
+                IUANode ptrTargetNode;
+                if (!ResolveNodePointerKind(ptrTarget, ptrKind, out ptrTargetNode,
+                        out ptrKindId, out ptrKindName, out kcode, out kmsg))
+                    return ErrorJson(kcode, kmsg);
+                var dupP = DupNameGuard(parentNode, name, parent);
+                if (dupP != null) return dupP;
+                // Typed setter BEFORE parentNode.Add: a detached node is not observed
+                // by the renderer (same reasoning as create_alias).
+                var np = InformationModel.MakeVariable<FTOptix.Core.NodePointer>(
+                    name, OpcUa.DataTypes.NodeId);
+                np.Kind = ptrKindId;
+                if (ptrTargetNode != null) np.Value = ptrTargetNode.NodeId;
+                parentNode.Add(np);
+                return "{\"ok\":true,\"created_path\":\"" + JsonEscape(parent + "/" + name) +
+                       "\",\"datatype\":\"NodePointer\",\"kind\":\"" + JsonEscape(ptrKindName) +
+                       "\",\"kind_node_id\":\"" + JsonEscape(ptrKindId.ToString()) +
+                       "\",\"target\":" + (ptrTargetNode != null ? "\"" + JsonEscape(ptrTarget) + "\"" : "null") +
+                       ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+            }
+            if (!string.IsNullOrEmpty(ptrTarget) || !string.IsNullOrEmpty(ptrKind))
+                return ErrorJson("kind_not_applicable",
+                    "target/kind only apply to datatype NodePointer (got '" + dtName + "')");
+
+            // Resolve + validate every 5b extra BEFORE creating anything so a refusal
+            // leaves the model untouched.
+            NodeId vtId; uint[] newDims; IUANode vtNode;
+            List<KeyValuePair<string, string>> extraProps; List<NodeId> extraPropTypes;
+            string extrasErr = PrepareVariableExtras(vtName, dimsRaw, propsRaw, out vtNode,
+                out vtId, out newDims, out extraProps, out extraPropTypes);
+            if (extrasErr != null) return extrasErr;
+            var dupV = DupNameGuard(parentNode, name, parent);
+            if (dupV != null) return dupV;
+            string extrasJson =
+                (vtId != null ? ",\"variable_type\":\"" + JsonEscape(vtName) + "\"" : "") +
+                (newDims != null ? ",\"array_dimensions\":[" + newDims[0] + "]" : "") +
+                (extraProps.Count > 0 ? ",\"properties_set\":[" +
+                    string.Join(",", extraProps.Select(kv => "\"" + JsonEscape(kv.Key) + "\"")) + "]" : "");
+            if (dryRunVar)
+                return "{\"ok\":true,\"dry_run\":true,\"would_create\":true,\"created_path\":\"" +
+                       JsonEscape(parent + "/" + name) + "\",\"datatype\":\"" + JsonEscape(dtName) + "\"" +
+                       extrasJson + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+
+            var v = vtId != null
+                ? InformationModel.MakeVariable(name, ResolveDataType(dtName), vtId)
+                : InformationModel.MakeVariable(name, ResolveDataType(dtName));
+            if (newDims != null)
+            {
+                // Shape first, then the value (same order as retype).
+                v.ArrayDimensions = newDims;
+                v.ValueRank = ValueRank.OneDimension;
+                Type clrT = RetypeClrType(dtName);
+                if (clrT != null)
+                    v.Value = new UAValue(Array.CreateInstance(clrT, (int)newDims[0]));
+            }
+            for (int pi = 0; pi < extraProps.Count; pi++)
+            {
+                // The type may already have materialized the property child; else
+                // create it with the DataType the type declares (never an undeclared
+                // name - PrepareVariableExtras proved it is declared).
+                var pchild = v.GetVariable(extraProps[pi].Key);
+                if (pchild == null)
+                {
+                    pchild = InformationModel.MakeVariable(extraProps[pi].Key, extraPropTypes[pi]);
+                    v.Add(pchild);
+                }
+                string perr = CoerceAssign(pchild, extraProps[pi].Value, firstLine);
+                if (perr != null)
+                    return ErrorJson("invalid_property_value", "property " + extraProps[pi].Key + ": " + perr);
+            }
             parentNode.Add(v);
             return "{\"ok\":true,\"created_path\":\"" + JsonEscape(parent + "/" + name) +
-                   "\",\"datatype\":\"" + JsonEscape(dtName) +
-                   "\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+                   "\",\"datatype\":\"" + JsonEscape(dtName) + "\"" + extrasJson +
+                   ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
         }
         catch (Exception ex)
         {
@@ -2150,7 +2559,76 @@ public class StudioMCPBridge : BaseNetLogic
         }
     }
 
-    // POST /bridge/node/retype?path=<node>&datatype=String[&dims=10|scalar]
+    // create_variable accepts "NodePointer" (any case) to make a typed NodePointer.
+    private static bool IsNodePointerDataType(string dtName)
+    {
+        return string.Equals(dtName, "NodePointer", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // The type a NodePointer aimed at `n` must carry as its Kind: the node's own
+    // type definition (an Object's ObjectType, a Variable's VariableType). A type
+    // node points at itself. Null when the node has no usable type.
+    private static NodeId KindIdOfNode(IUANode n, out string kindName)
+    {
+        kindName = null;
+        if (n == null) return null;
+        if (n.NodeClass == NodeClass.ObjectType || n.NodeClass == NodeClass.VariableType)
+        { kindName = n.BrowseName; return n.NodeId; }
+        var o = n as IUAObject;
+        if (o != null && o.ObjectType != null)
+        { kindName = o.ObjectType.BrowseName; return o.ObjectType.NodeId; }
+        var uv = n as IUAVariable;
+        if (uv != null && uv.VariableType != null)
+        { kindName = uv.VariableType.BrowseName; return uv.VariableType.NodeId; }
+        return null;
+    }
+
+    // Resolve the Kind for a new NodePointer. An explicit `kind` (a builtin UI type
+    // name, or a path to a type node - same vocabulary as create_alias) wins; else
+    // the Kind is the type of the node at `target`. With neither there is nothing to
+    // derive it from, and the old behaviour (Kind left unset / BaseObjectType) is
+    // exactly the bug, so refuse loud instead (kind_required). The write path and
+    // the dry_run validator share this so they cannot disagree.
+    private bool ResolveNodePointerKind(string target, string kind,
+        out IUANode targetNode, out NodeId kindId, out string kindName,
+        out string code, out string message)
+    {
+        targetNode = null; kindId = null; kindName = null; code = null; message = null;
+        if (!string.IsNullOrEmpty(target))
+        {
+            targetNode = ResolveNode(target);
+            if (targetNode == null)
+            { code = "node_not_found"; message = "no target node at: " + target; return false; }
+        }
+        if (!string.IsNullOrEmpty(kind))
+        {
+            var kf = typeof(FTOptix.UI.ObjectTypes).GetField(kind, BindingFlags.Public | BindingFlags.Static);
+            if (kf != null && kf.GetValue(null) is NodeId knid) { kindId = knid; kindName = kind; return true; }
+            var kn = ResolveNode(kind);
+            if (kn != null && (kn.NodeClass == NodeClass.ObjectType || kn.NodeClass == NodeClass.VariableType))
+            { kindId = kn.NodeId; kindName = kn.BrowseName; return true; }
+            code = "type_not_found";
+            message = "kind '" + kind + "' is neither a builtin UI type nor a path to a type node";
+            return false;
+        }
+        if (targetNode == null)
+        {
+            code = "kind_required";
+            message = "a NodePointer needs `target` (the node it points at; its type becomes the Kind) " +
+                      "or an explicit `kind`; refusing to leave Kind unset/BaseObjectType";
+            return false;
+        }
+        kindId = KindIdOfNode(targetNode, out kindName);
+        if (kindId == null)
+        {
+            code = "kind_unresolved";
+            message = "cannot determine the type of '" + target + "'; pass an explicit `kind`";
+            return false;
+        }
+        return true;
+    }
+
+    // POST /bridge/node/retype?path=<node>&datatype=String[&dims=10|scalar][&dry_run=true]
     // Change a VARIABLE's DataType in place - optionally its array shape too -
     // while KEEPING the node: its NodeId, its children (DynamicLink, converters,
     // Mode) and every inbound reference survive, which delete+create cannot
@@ -2170,17 +2648,32 @@ public class StudioMCPBridge : BaseNetLogic
     //
     // dims: omitted keeps the current shape; "scalar" (or "0") collapses to a
     // scalar; "N" (or "N,M") sets the array dimensions.
+    //
+    // LocalizedText target: text/number/bool/DateTime values carry over as text
+    // (an existing LocalizedText is kept as-is, TextId included). A value with
+    // no text form, or an array that would lose elements when collapsed to a
+    // scalar, is REFUSED with value_not_convertible BEFORE any write.
+    // dry_run=true runs every check (including that refusal) and reports
+    // would_retype without touching the node.
+    //
+    // #73 value loss: a current value that cannot be converted (e.g. "true" ->
+    // Int32) used to be reset to the type's default while the response still said
+    // ok. It now REFUSES with {ok:false, error:"value_unconvertible", count,
+    // samples:[...]} before any write, unless allow_value_loss=true; then the
+    // result carries values_reset:n (would_reset:n under dry_run) and a warning.
     private string RetypeVariableInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
         string dtName = QueryParam(firstLine, "datatype");
         string dimsRaw = QueryParam(firstLine, "dims");
+        bool dryRun = string.Equals(QueryParam(firstLine, "dry_run"), "true", StringComparison.OrdinalIgnoreCase);
+        bool allowLoss = string.Equals(QueryParam(firstLine, "allow_value_loss"), "true", StringComparison.OrdinalIgnoreCase);
         if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(dtName))
             return ErrorJson("bad_query", "required query params: path, datatype");
         if (RetypeClrType(dtName) == null)
             return ErrorJson("bad_datatype", "unsupported datatype '" + dtName +
                 "' - one of Boolean, Int16, Int32, Int64, UInt16, UInt32, UInt64, " +
-                "Float, Double, String, DateTime");
+                "Float, Double, String, DateTime, LocalizedText");
         try
         {
             var node = ResolveNodeLoose(path);
@@ -2221,9 +2714,28 @@ public class StudioMCPBridge : BaseNetLogic
             object oldVal = null;
             try { var uv = v.Value; oldVal = uv == null ? null : uv.Value; } catch { }
 
+            if (dtName == "LocalizedText")
+            {
+                string refusal = LocalizedTextRetypeRefusal(oldDt, oldVal, toArray);
+                if (refusal != null)
+                    return "{\"error\":{\"code\":\"value_not_convertible\",\"message\":\"" +
+                           JsonEscape("'" + path + "' (" + oldDt + ") cannot be retyped to LocalizedText: " + refusal) +
+                           "\",\"field\":\"datatype\",\"from\":\"" + JsonEscape(oldDt) +
+                           "\",\"to\":\"LocalizedText\"}}";
+            }
+
             Type clr = RetypeClrType(dtName);
             object newVal;
             int converted = 0;
+            // #73: a value that cannot be carried into the new type used to land
+            // silently on the type's default. Count those (reset) and remember a few.
+            int reset = 0;
+            var resetSamples = new List<string>();
+            Action<object> noteLoss = (raw) =>
+            {
+                reset++;
+                if (resetSamples.Count < 3) resetSamples.Add(RetypeSampleText(raw is UAValue u ? u.Value : raw));
+            };
             if (toArray)
             {
                 int n = (int)newDims[0];
@@ -2232,7 +2744,10 @@ public class StudioMCPBridge : BaseNetLogic
                 for (int i = 0; i < n; i++)
                 {
                     object e = (src != null && i < src.Length) ? src.GetValue(i) : null;
-                    if (e != null) converted++;
+                    if (e != null)
+                    {
+                        if (RetypeConvertible(e, dtName, clr)) converted++; else noteLoss(e);
+                    }
                     arr.SetValue(RetypeScalar(e, dtName, clr), i);
                 }
                 newVal = arr;
@@ -2242,24 +2757,56 @@ public class StudioMCPBridge : BaseNetLogic
                 object e = oldVal;
                 var src = oldVal as Array;
                 if (src != null) e = src.Length > 0 ? src.GetValue(0) : null;
-                if (e != null) converted++;
+                if (e != null)
+                {
+                    if (RetypeConvertible(e, dtName, clr)) converted++; else noteLoss(e);
+                }
                 newVal = RetypeScalar(e, dtName, clr);
+            }
+
+            if (reset > 0 && !allowLoss)
+            {
+                var rsb = new StringBuilder();
+                rsb.Append("{\"ok\":false,\"error\":\"value_unconvertible\",\"path\":\"").Append(JsonEscape(path)).Append("\"");
+                rsb.Append(",\"from\":\"").Append(JsonEscape(oldDt)).Append("\",\"to\":\"").Append(JsonEscape(dtName)).Append("\"");
+                rsb.Append(",\"count\":").Append(reset).Append(",\"samples\":[");
+                for (int i = 0; i < resetSamples.Count; i++)
+                {
+                    if (i > 0) rsb.Append(",");
+                    rsb.Append("\"").Append(JsonEscape(resetSamples[i])).Append("\"");
+                }
+                rsb.Append("],\"message\":\"").Append(JsonEscape(
+                    reset + " value(s) of '" + path + "' (" + oldDt + ") cannot be converted to " + dtName +
+                    " and would be reset to its default. Nothing was changed. Pass allow_value_loss=true to accept."))
+                   .Append("\"}");
+                return rsb.ToString();
             }
 
             // Shape first, then type, then value - the value assignment is what
             // Studio checks against the declared shape/type.
-            v.ArrayDimensions = toArray ? newDims : new uint[0];
-            v.ValueRank = toArray ? ValueRank.OneDimension : ValueRank.Scalar;
-            v.DataType = ResolveDataType(dtName);
-            v.Value = new UAValue(newVal);
+            if (!dryRun)
+            {
+                v.ArrayDimensions = toArray ? newDims : new uint[0];
+                v.ValueRank = toArray ? ValueRank.OneDimension : ValueRank.Scalar;
+                v.DataType = ResolveDataType(dtName);
+                v.Value = new UAValue(newVal);
+            }
 
             var sb = new StringBuilder();
             sb.Append("{\"ok\":true,\"path\":\"").Append(JsonEscape(path)).Append("\"");
+            sb.Append(",\"dry_run\":").Append(Bool(dryRun)).Append(",\"would_retype\":").Append(Bool(dryRun));
             sb.Append(",\"from\":{\"datatype\":\"").Append(JsonEscape(oldDt)).Append("\",\"dims\":");
             sb.Append(wasArray ? "[" + string.Join(",", oldDims) + "]" : "null").Append("}");
             sb.Append(",\"to\":{\"datatype\":\"").Append(JsonEscape(dtName)).Append("\",\"dims\":");
             sb.Append(toArray ? "[" + string.Join(",", newDims) + "]" : "null").Append("}");
             sb.Append(",\"values_converted\":").Append(converted);
+            if (reset > 0)
+            {
+                sb.Append(dryRun ? ",\"would_reset\":" : ",\"values_reset\":").Append(reset);
+                sb.Append(",\"warning\":\"").Append(JsonEscape(
+                    (dryRun ? "would reset " : "reset ") + reset + " value(s) that cannot be converted from " +
+                    oldDt + " to " + dtName + " to the type's default (allow_value_loss=true)")).Append("\"");
+            }
             sb.Append(",\"sample\":[");
             var sample = newVal as Array;
             int shown = 0;
@@ -2268,17 +2815,22 @@ public class StudioMCPBridge : BaseNetLogic
                 for (int i = 0; i < sample.Length && i < 3; i++)
                 {
                     if (i > 0) sb.Append(",");
-                    sb.Append("\"").Append(JsonEscape(Convert.ToString(sample.GetValue(i), CultureInfo.InvariantCulture))).Append("\"");
+                    sb.Append("\"").Append(JsonEscape(RetypeSampleText(sample.GetValue(i)))).Append("\"");
                     shown++;
                 }
             }
             else
-                sb.Append("\"").Append(JsonEscape(Convert.ToString(newVal, CultureInfo.InvariantCulture))).Append("\"");
+                sb.Append("\"").Append(JsonEscape(RetypeSampleText(newVal))).Append("\"");
             sb.Append("],\"mode\":\"inline\",\"thread\":\"http-bg\"");
-            sb.Append(",\"nudge\":\"DataType changed on the LIVE node; children and inbound links kept. ");
-            sb.Append("A StoreColumn retype changes what the table is CREATED with - an existing ");
-            sb.Append("database file keeps its old column affinity until the table is recreated. ");
-            sb.Append("Save (optix_save) and restart the emulator to see it.\"}");
+            if (dryRun)
+                sb.Append(",\"nudge\":\"dry_run: nothing was changed.\"}");
+            else
+            {
+                sb.Append(",\"nudge\":\"DataType changed on the LIVE node; children and inbound links kept. ");
+                sb.Append("A StoreColumn retype changes what the table is CREATED with - an existing ");
+                sb.Append("database file keeps its old column affinity until the table is recreated. ");
+                sb.Append("Save (optix_save) and restart the emulator to see it.\"}");
+            }
             return sb.ToString();
         }
         catch (Exception ex)
@@ -2303,8 +2855,101 @@ public class StudioMCPBridge : BaseNetLogic
             case "Double": return typeof(double);
             case "String": return typeof(string);
             case "DateTime": return typeof(DateTime);
+            case "LocalizedText": return typeof(LocalizedText);
             default: return null;
         }
+    }
+
+    // Sample text for the retype response; a LocalizedText shows its Text.
+    private static string RetypeSampleText(object o)
+    {
+        var lt = o as LocalizedText;
+        if (lt != null) return lt.Text ?? "";
+        return Convert.ToString(o, CultureInfo.InvariantCulture) ?? "";
+    }
+
+    // Declared DataTypes whose value has a lossless-enough text form.
+    private static readonly string[] _TextConvertibleDataTypes = {
+        "Boolean", "Byte", "SByte", "Int16", "Int32", "Int64", "UInt16", "UInt32",
+        "UInt64", "Float", "Double", "String", "DateTime", "LocalizedText",
+        "BaseDataType", "Number", "Integer", "UInteger",
+    };
+
+    private static bool HasTextForm(object e)
+    {
+        return e is string || e is LocalizedText || e is bool || e is DateTime ||
+               e is sbyte || e is byte || e is short || e is ushort || e is int ||
+               e is uint || e is long || e is ulong || e is float || e is double ||
+               e is decimal;
+    }
+
+    // null when the current value can be carried into a LocalizedText variable,
+    // else why not. Decided from the declared DataType and the actual elements,
+    // before anything is written. Mirrors the contract in core.bridge_retype.
+    private static string LocalizedTextRetypeRefusal(string oldDt, object oldVal, bool toArray)
+    {
+        if (oldDt != "?" && Array.IndexOf(_TextConvertibleDataTypes, oldDt) < 0)
+            return "its DataType " + oldDt + " has no text form";
+        var src = oldVal as Array;
+        var elems = new List<object>();
+        if (src != null) { foreach (var x in src) elems.Add(x); }
+        else if (oldVal != null) elems.Add(oldVal);
+        int nonNull = 0;
+        foreach (var raw in elems)
+        {
+            object e = raw;
+            var uav = e as UAValue;
+            if (uav != null) e = uav.Value;
+            if (e == null) continue;
+            nonNull++;
+            if (!HasTextForm(e))
+                return "its value is a " + e.GetType().Name + ", which has no text form";
+        }
+        if (!toArray && src != null && nonNull > 1)
+            return "collapsing an array of " + nonNull + " values to a scalar would drop " +
+                   (nonNull - 1) + " of them (retype with dims matching the array, or clear it first)";
+        return null;
+    }
+
+    // True when RetypeScalar carries `e` into `dtName` without falling back to the
+    // type's default: text that does not parse ("true" -> Int32), a boolean word
+    // that is not 0/1/true/false, a non-DateTime into DateTime, an overflow or an
+    // impossible cast. Null and empty text have nothing to lose. Text targets
+    // (String, LocalizedText) always have a form - LocalizedText is gated by
+    // LocalizedTextRetypeRefusal.
+    private static bool RetypeConvertible(object e, string dtName, Type clr)
+    {
+        var inv = CultureInfo.InvariantCulture;
+        if (e is UAValue uav) e = uav.Value;
+        if (e == null) return true;
+        if (dtName == "String" || dtName == "LocalizedText") return true;
+        try
+        {
+            if (e is string s)
+            {
+                s = s.Trim();
+                if (s.Length == 0) return true;
+                if (dtName == "Boolean")
+                    return s == "1" || s == "0" ||
+                           string.Equals(s, "true", StringComparison.OrdinalIgnoreCase) ||
+                           string.Equals(s, "false", StringComparison.OrdinalIgnoreCase);
+                if (dtName == "DateTime")
+                {
+                    DateTime parsed;
+                    return DateTime.TryParse(s, inv, System.Globalization.DateTimeStyles.RoundtripKind, out parsed);
+                }
+                double dv;
+                if (!double.TryParse(s, System.Globalization.NumberStyles.Float, inv, out dv)) return false;
+                if (clr == typeof(float) || clr == typeof(double)) return true;
+                Convert.ChangeType(Math.Round(dv), clr, inv);
+                return true;
+            }
+            if (dtName == "Boolean") { Convert.ToBoolean(e, inv); return true; }
+            if (dtName == "DateTime") return e is DateTime;
+            Convert.ChangeType(e, clr, inv);
+            return true;
+        }
+        catch { return false; }
     }
 
     // One element, old type -> new type. Float/double to text go through "R"
@@ -2314,6 +2959,16 @@ public class StudioMCPBridge : BaseNetLogic
     {
         var inv = CultureInfo.InvariantCulture;
         if (e is UAValue uav) e = uav.Value;
+        if (dtName == "LocalizedText")
+        {
+            // An existing LocalizedText (TextId included) is kept as-is; anything
+            // else goes through its text form. Locale is never empty (an empty
+            // localeId trips a native assertion).
+            var existingLt = e as LocalizedText;
+            if (existingLt != null) return existingLt;
+            string text = e == null ? "" : (string)RetypeScalar(e, "String", typeof(string));
+            return new LocalizedText(text, "en-US");
+        }
         if (dtName == "String")
         {
             if (e == null) return "";
@@ -2432,6 +3087,47 @@ public class StudioMCPBridge : BaseNetLogic
         { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
     }
 
+    // ftx-mcp-vvk.2: create_object `type` that resolves to a VariableType (e.g.
+    // RAEtherNetIPTag) can never be instantiated as an Object. Returns the
+    // refusal message (code variable_type_not_object, hint naming create_variable)
+    // or null when `typePath` is not a VariableType. An ObjectType that resolves
+    // by the same name always wins, so this never shadows a real object type.
+    private string VariableTypeNotObjectMessage(string typePath)
+    {
+        if (string.IsNullOrEmpty(typePath)) return null;
+        try
+        {
+            if (typePath.IndexOf('/') < 0)
+            {
+                bool _via;
+                var builtinId = ResolveUiTypeId(typePath, out _via);
+                if (builtinId != null)
+                {
+                    IUANode bn = null;
+                    try { bn = InformationModel.Get(builtinId); } catch { bn = null; }
+                    if (bn != null && bn.NodeClass == NodeClass.ObjectType) return null;
+                }
+            }
+            var node = ResolveNode(typePath);
+            bool isVarType = node != null
+                ? node.NodeClass == NodeClass.VariableType
+                : ResolveVariableTypeNode(typePath) != null;
+            if (!isVarType) return null;
+        }
+        catch { return null; }
+        return "variable_type_not_object: " + typePath + " is a VariableType, not an ObjectType;" +
+               " create_object cannot instantiate it. hint: use create_variable with variable_type: \"" +
+               typePath + "\". Nothing was created";
+    }
+
+    // `Folder` / `FolderType` (exact, case-insensitive) name the standard OPC UA
+    // FolderType (ns=0 i=61) for create_object (ftx-mcp-wvk.3).
+    private static bool IsFolderTypeName(string typePath)
+    {
+        return string.Equals(typePath, "Folder", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(typePath, "FolderType", StringComparison.OrdinalIgnoreCase);
+    }
+
     // POST /bridge/model/object?parent=<path>&name=<n>[&type=<type path>]
     // Plain structural Object (BaseObjectType) container, OR an INSTANCE of a
     // project-defined ObjectType when `type` is given (the reuse half of the
@@ -2458,8 +3154,30 @@ public class StudioMCPBridge : BaseNetLogic
                 return TryCreateUiNamespaceChild(parentNode, name, parent);
             NodeId typeId = OpcUa.ObjectTypes.BaseObjectType;
             string typeLabel = "BaseObjectType";
-            if (!string.IsNullOrEmpty(typePath))
+            if (IsFolderTypeName(typePath))
             {
+                // ftx-mcp-wvk.3: `Folder` / `FolderType` is the standard OPC UA
+                // folder (FolderType, ns=0 i=61), the same node create_folder makes.
+                // Resolved here, ahead of the builtin catalog walk, so a bare
+                // "Folder" can never land on some module's look-alike type.
+                IUANode folderTypeNode = null;
+                try { folderTypeNode = InformationModel.Get(OpcUa.ObjectTypes.FolderType); }
+                catch { folderTypeNode = null; }
+                if (folderTypeNode == null || folderTypeNode.NodeClass != NodeClass.ObjectType)
+                    return ErrorJson("type_not_found",
+                        "FolderType (ns=0;i=61) is not resolvable on this Studio version." +
+                        " hint: create the folder with create_folder (optix_bridge_create_folder," +
+                        " or op \"create_folder\" in optix_bridge_edit), which makes the same node." +
+                        " Nothing was created");
+                typeId = folderTypeNode.NodeId;
+                typeLabel = "FolderType";
+            }
+            else if (!string.IsNullOrEmpty(typePath))
+            {
+                // Refuse a VariableType before anything is created (vvk.2).
+                var vtMsg = VariableTypeNotObjectMessage(typePath);
+                if (vtMsg != null)
+                    return ErrorJson("variable_type_not_object", vtMsg);
                 IUANode typeNode = null;
                 // A bare or Module.Type name is a BUILTIN catalog type first
                 // (DigitalAlarm, DataLogger, User, ...; see ResolveUiTypeId
@@ -2485,12 +3203,18 @@ public class StudioMCPBridge : BaseNetLogic
                 typeId = typeNode.NodeId;
                 typeLabel = typePath;
             }
-            var o = InformationModel.MakeObject(name, typeId);
-            parentNode.Add(o);
+            // #27: the type may be a NetLogic (or derive from one); instantiating it
+            // needs a session, so Add runs impersonated as root.
+            IUAObject o;
+            using (parentNode.Context.Sessions.ImpersonateRootTemporary())
+            {
+                o = InformationModel.MakeObject(name, typeId);
+                parentNode.Add(o);
+            }
             return "{\"ok\":true,\"created_path\":\"" + JsonEscape(parent + "/" + name) +
                    "\",\"type\":\"" + JsonEscape(typeLabel) +
-                   "\",\"node_class\":\"" + o.NodeClass +
-                   "\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+                   "\",\"node_class\":\"" + o.NodeClass + "\"" +
+                   ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
         }
         catch (Exception ex)
         { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
@@ -2521,9 +3245,48 @@ public class StudioMCPBridge : BaseNetLogic
                 return ErrorJson("node_not_found", "no parent node at: " + parent);
             var dup = DupNameGuard(parentNode, name, parent);
             if (dup != null) return dup;
-            var o = InformationModel.MakeObject(name, FTOptix.NetLogic.ObjectTypes.NetLogic);
-            parentNode.Add(o);
+            // kind=design_time: the node must carry a BehaviourStartPriority child
+            // whose VariableType is BehaviourStartPriorityVariableType (Value 180).
+            // That typed property is what Studio keys design-time behaviour on;
+            // create_variable only mints BaseDataVariableType, with which the
+            // Execute entries appear but Studio logs "No behaviour or observer
+            // found". Resolve the type BEFORE creating anything so a refusal leaves
+            // the model untouched.
+            string kind = QueryParam(firstLine, "kind");
+            bool designTime = false;
+            if (!string.IsNullOrEmpty(kind) && !string.Equals(kind, "runtime", StringComparison.Ordinal))
+            {
+                if (!string.Equals(kind, "design_time", StringComparison.Ordinal))
+                    return ErrorJson("invalid_kind", "kind must be 'runtime' or 'design_time' (got '" + kind + "')");
+                designTime = true;
+            }
+            NodeId prioTypeId = null;
+            if (designTime)
+            {
+                prioTypeId = ResolveVariableTypeByName("BehaviourStartPriorityVariableType");
+                if (prioTypeId == null)
+                    return ErrorJson("design_time_type_unavailable",
+                        "VariableType BehaviourStartPriorityVariableType was not found in this Studio's type tree; nothing was created");
+            }
+            // #27: Add() makes Studio instantiate the design-time behaviour, and for a
+            // class that already exists compiled that runs native code which needs an
+            // Optix session. This HTTP thread has none (same fault as invoke_method:
+            // c0000374 in ntdll), so the whole create runs impersonated as root.
+            IUAObject o;
+            using (parentNode.Context.Sessions.ImpersonateRootTemporary())
+            {
+                o = InformationModel.MakeObject(name, FTOptix.NetLogic.ObjectTypes.NetLogic);
+                if (designTime)
+                {
+                    var prio = InformationModel.MakeVariable("BehaviourStartPriority",
+                        OpcUa.DataTypes.Byte, prioTypeId);
+                    prio.Value = (byte)180;
+                    o.Add(prio);
+                }
+                parentNode.Add(o);
+            }
             return "{\"ok\":true,\"created_path\":\"" + JsonEscape(parent + "/" + name) +
+                   "\",\"kind\":\"" + (designTime ? "design_time" : "runtime") +
                    "\",\"type\":\"NetLogic\",\"node_class\":\"" + o.NodeClass +
                    "\",\"bound_class\":\"" + JsonEscape(name) +
                    "\",\"note\":\"class must exist in NetSolution and match name exactly; rebuild/run to instantiate\"" +
@@ -2531,6 +3294,298 @@ public class StudioMCPBridge : BaseNetLogic
         }
         catch (Exception ex)
         { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // The NodeId of the VariableType named `name`, found by walking the type tree
+    // from BaseDataVariableType up to the VariableTypes folder. Null when absent.
+    private static NodeId ResolveVariableTypeByName(string name)
+    {
+        var n = ResolveVariableTypeNode(name);
+        return n != null ? n.NodeId : null;
+    }
+
+    // The VariableType NODE named by `name` (BaseDataVariableType / PropertyType live
+    // in namespace 0, which FindTypeByBrowseName skips, so they are special-cased).
+    // Null when absent, when the hit is not a VariableType, or when a short name is
+    // ambiguous (use ResolveVariableTypeNodeEx to tell those apart). Accepted forms:
+    //   short name   "RAEtherNetIPTag"
+    //   Module.Type  "FTOptix.RAEtherNetIP.RAEtherNetIPTag" (pins the module)
+    //   type path    "BaseVariableType/BaseDataVariableType/RAEtherNetIPTag", or a
+    //                project path to a project-defined VariableType
+    private static IUANode ResolveVariableTypeNode(string name)
+    {
+        List<string> ambiguous;
+        return ResolveVariableTypeNodeEx(name, out ambiguous);
+    }
+
+    // As ResolveVariableTypeNode, but `ambiguous` is filled (>= 2 "Module.Type"
+    // labels) and null returned when a SHORT name matches VariableTypes of more
+    // than one module: the caller must refuse (ambiguous_variable_type), never pick.
+    private static IUANode ResolveVariableTypeNodeEx(string name, out List<string> ambiguous)
+    {
+        ambiguous = null;
+        try
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            if (name == "BaseDataVariableType")
+                return InformationModel.Get(OpcUa.VariableTypes.BaseDataVariableType);
+            if (name == "PropertyType")
+                return InformationModel.Get(OpcUa.VariableTypes.PropertyType);
+            var anchor = InformationModel.Get(OpcUa.VariableTypes.BaseDataVariableType);
+            if (anchor == null) return null;
+            var root = anchor;
+            while (root.Owner != null && root.Owner.NodeClass == NodeClass.VariableType)
+                root = root.Owner;
+            var searchRoot = root.Owner ?? root;
+
+            // 1. type-node path: any '/' means path, never a name.
+            if (name.IndexOf('/') >= 0)
+                return ResolveVariableTypeByPath(name, root);
+
+            // 2. Module.Type: the module's generated VariableTypes catalog pins it.
+            int dot = name.LastIndexOf('.');
+            if (dot > 0)
+            {
+                var pinned = ResolveModuleVariableTypeId(name.Substring(0, dot), name.Substring(dot + 1));
+                if (pinned == null) return null;
+                var pn = InformationModel.Get(pinned);
+                return pn != null && pn.NodeClass == NodeClass.VariableType ? pn : null;
+            }
+
+            // 3. short name: every VariableType with that browse name outside
+            // namespace 0 and the project. Exactly one is the answer; several
+            // (same short name in two modules) is an ambiguity, never a guess.
+            var hits = new List<IUANode>();
+            FindAllVariableTypesByBrowseName(searchRoot, name, hits);
+            if (hits.Count == 0) return null;
+            if (hits.Count == 1) return hits[0];
+            ambiguous = hits.Select(h => VariableTypeLabel(h)).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+            return ambiguous.Count > 1 ? null : hits[0];
+        }
+        catch { return null; }
+    }
+
+    // Walk a slash-separated chain of browse names down the VariableType tree. The
+    // chain may start at BaseVariableType (`root`), at the VariableTypes folder or at
+    // the Types folder; a project path to a project-defined type is tried first.
+    private static IUANode ResolveVariableTypeByPath(string path, IUANode root)
+    {
+        try
+        {
+            var segs = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (segs.Length == 0) return null;
+            try
+            {
+                var projNode = Project.Current.Get(path);
+                if (projNode != null && projNode.NodeClass == NodeClass.VariableType) return projNode;
+            }
+            catch { /* not a project path; fall through to the type tree */ }
+            var starts = new List<IUANode>();
+            if (root.Owner != null && root.Owner.Owner != null) starts.Add(root.Owner.Owner);
+            if (root.Owner != null) starts.Add(root.Owner);
+            starts.Add(root);
+            foreach (var start in starts)
+            {
+                IUANode cur = start;
+                int i = 0;
+                // The start node itself may be named by the first segment.
+                if (cur.BrowseName == segs[0]) i = 1;
+                for (; cur != null && i < segs.Length; i++)
+                {
+                    IUANode next = null;
+                    foreach (var kid in cur.Children)
+                        if (kid != null && kid.BrowseName == segs[i]) { next = kid; break; }
+                    cur = next;
+                }
+                if (cur != null && cur.NodeClass == NodeClass.VariableType) return cur;
+            }
+        }
+        catch { /* resolver throwing degrades to null */ }
+        return null;
+    }
+
+    // The NodeId behind field `typeName` of the public static class
+    // <module>.VariableTypes (the generated per-module catalog, the VariableType
+    // twin of <module>.ObjectTypes), e.g. FTOptix.RAEtherNetIP.VariableTypes
+    // .RAEtherNetIPTag. Null when the module or the field is absent/unloaded.
+    private static NodeId ResolveModuleVariableTypeId(string module, string typeName)
+    {
+        foreach (var kv in EnumerateModuleVariableTypes())
+            if (kv.Key == module && kv.Value.Name == typeName)
+            {
+                try { return (NodeId)kv.Value.GetValue(null); } catch { }
+            }
+        return null;
+    }
+
+    // Every (module namespace, NodeId field) of a loaded FTOptix.<Module>.VariableTypes.
+    private static List<KeyValuePair<string, FieldInfo>> EnumerateModuleVariableTypes()
+    {
+        var list = new List<KeyValuePair<string, FieldInfo>>();
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException e) { types = e.Types; }
+            catch { continue; }
+            if (types == null) continue;
+            foreach (var t in types)
+            {
+                if (t == null || t.Name != "VariableTypes" || t.Namespace == null ||
+                    !t.Namespace.StartsWith("FTOptix."))
+                    continue;
+                FieldInfo[] fields;
+                try { fields = t.GetFields(BindingFlags.Public | BindingFlags.Static); }
+                catch { continue; }
+                foreach (var f in fields)
+                    if (f.FieldType == typeof(NodeId))
+                        list.Add(new KeyValuePair<string, FieldInfo>(t.Namespace, f));
+            }
+        }
+        return list;
+    }
+
+    // "Module.Type" for a VariableType node when a module catalog names it, else
+    // "Type [ns=N;...]" so two same-named candidates stay distinguishable.
+    private static string VariableTypeLabel(IUANode n)
+    {
+        try
+        {
+            foreach (var kv in EnumerateModuleVariableTypes())
+            {
+                NodeId id = null;
+                try { id = (NodeId)kv.Value.GetValue(null); } catch { }
+                if (id != null && id.Equals(n.NodeId)) return kv.Key + "." + kv.Value.Name;
+            }
+            return n.BrowseName + " [" + n.NodeId + "]";
+        }
+        catch { return n.BrowseName; }
+    }
+
+    // All VariableType nodes under `root` whose BrowseName is `name`, outside
+    // namespace 0 and the project's own (a project type never shadows a builtin).
+    // Same bounded DFS as FindTypeByBrowseName, but collects every hit.
+    private static void FindAllVariableTypesByBrowseName(IUANode root, string name, List<IUANode> hits)
+    {
+        if (root == null || string.IsNullOrEmpty(name)) return;
+        var seen = new HashSet<string>();
+        var stack = new Stack<IUANode>();
+        stack.Push(root);
+        int visited = 0;
+        int projNs = ProjectNsIdx();
+        while (stack.Count > 0 && visited < 50000)
+        {
+            var cur = stack.Pop();
+            if (cur == null) continue;
+            string key;
+            try { key = cur.NodeId.ToString(); } catch { continue; }
+            if (!seen.Add(key)) continue;
+            visited++;
+            try
+            {
+                if (cur.BrowseName == name && cur.NodeClass == NodeClass.VariableType &&
+                    cur.NodeId.NamespaceIndex != 0 && cur.NodeId.NamespaceIndex != projNs)
+                    hits.Add(cur);
+                foreach (var kid in cur.Children)
+                    if (kid != null &&
+                        (kid.NodeClass == NodeClass.VariableType || kid.NodeClass == NodeClass.Object))
+                        stack.Push(kid);
+            }
+            catch { /* one unreadable node must not abort the walk */ }
+        }
+    }
+
+    // The property variable `prop` as DECLARED by VariableType `typeNode` or one of
+    // its supertypes, or null. Only a declared property may be materialized on a
+    // new variable (an undeclared child is an orphan, see DeclaredPropertyGuard).
+    private static IUAVariable FindDeclaredVariableTypeProperty(IUANode typeNode, string prop)
+    {
+        IUANode cur = typeNode;
+        for (int i = 0; cur != null && i < 20; i++)
+        {
+            var d = cur.GetVariable(prop);
+            if (d != null) return d;
+            var vt = cur as IUAVariableType;
+            cur = vt != null ? vt.SuperType : null;
+        }
+        return null;
+    }
+
+    // create_variable 5b extras (variable_type / array_dimensions / properties):
+    // resolve and validate WITHOUT creating anything. Returns an ErrorJson body on
+    // refusal, else null. Shared by the write path and the batch dry_run validator
+    // so they cannot disagree. Codes: unknown_variable_type, ambiguous_variable_type,
+    // invalid_array_dimensions,
+    // invalid_properties, invalid_property_value, unknown_property.
+    private string PrepareVariableExtras(string vtName, string dimsRaw, string propsRaw,
+        out IUANode vtNode, out NodeId vtId, out uint[] dims,
+        out List<KeyValuePair<string, string>> props, out List<NodeId> propTypes)
+    {
+        vtNode = null; vtId = null; dims = null;
+        props = new List<KeyValuePair<string, string>>();
+        propTypes = new List<NodeId>();
+        if (!string.IsNullOrEmpty(vtName))
+        {
+            List<string> vtAmbiguous;
+            vtNode = ResolveVariableTypeNodeEx(vtName, out vtAmbiguous);
+            if (vtNode == null && vtAmbiguous != null)
+                return ErrorJson("ambiguous_variable_type", "variable_type '" + vtName +
+                    "' is ambiguous: several modules define a VariableType with that name; " +
+                    "use Module.Type or a type path. candidates: " +
+                    string.Join(", ", vtAmbiguous) + "; nothing was created");
+            if (vtNode == null)
+                return ErrorJson("unknown_variable_type", "unknown variable_type '" + vtName +
+                    "': no VariableType with that name in this Studio's type tree; nothing was created");
+            vtId = vtNode.NodeId;
+        }
+        if (!string.IsNullOrEmpty(dimsRaw))
+        {
+            uint d;
+            if (!uint.TryParse(dimsRaw.Trim().TrimStart('[').TrimEnd(']').Trim(), out d) || d == 0)
+                return ErrorJson("invalid_array_dimensions",
+                    "array_dimensions must be one positive integer (got '" + dimsRaw + "')");
+            dims = new uint[] { d };
+        }
+        if (!string.IsNullOrEmpty(propsRaw))
+        {
+            try
+            {
+                using (var doc = System.Text.Json.JsonDocument.Parse(propsRaw))
+                {
+                    if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                        return ErrorJson("invalid_properties", "properties must be a JSON object {name: value}");
+                    foreach (var pr in doc.RootElement.EnumerateObject())
+                    {
+                        string pv;
+                        switch (pr.Value.ValueKind)
+                        {
+                            case System.Text.Json.JsonValueKind.String: pv = pr.Value.GetString(); break;
+                            case System.Text.Json.JsonValueKind.Number: pv = pr.Value.GetRawText(); break;
+                            case System.Text.Json.JsonValueKind.True: pv = "true"; break;
+                            case System.Text.Json.JsonValueKind.False: pv = "false"; break;
+                            default: pv = null; break;
+                        }
+                        if (pv == null)
+                            return ErrorJson("invalid_property_value",
+                                "property '" + pr.Name + "' must be a string, number or boolean");
+                        if (vtNode == null)
+                            return ErrorJson("unknown_property", "property '" + pr.Name +
+                                "': properties need a variable_type that declares them");
+                        var decl = FindDeclaredVariableTypeProperty(vtNode, pr.Name);
+                        if (decl == null)
+                            return ErrorJson("unknown_property", "property '" + pr.Name +
+                                "' is not declared by VariableType " + vtNode.BrowseName);
+                        props.Add(new KeyValuePair<string, string>(pr.Name, pv));
+                        propTypes.Add(decl.DataType);
+                    }
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return ErrorJson("invalid_properties", "properties is not valid JSON");
+            }
+        }
+        return null;
     }
 
     // POST /bridge/model/type?name=<n>&parent=<path>[&base=<catalog name | type path>]
@@ -2621,6 +3676,10 @@ public class StudioMCPBridge : BaseNetLogic
                 return ErrorJson("node_not_found", "no node at: " + path);
             if (node.NodeClass == NodeClass.ObjectType)
                 return ErrorJson("already_a_type", path + " is already an ObjectType");
+            // BEFORE ANY MUTATION (see FindUnsafeSubtree): re-authoring a subtree
+            // that holds a NetLogic or an EventHandler crashes Studio.
+            var unsafeConv = SubtreeRefusal(node, path, "convert_to_type", false, false);
+            if (unsafeConv != null) return unsafeConv;
             if (!(node is IUAObject))
                 return ErrorJson("not_an_object", path + " is " + node.NodeClass + ", not an Object instance");
             var folderNode = ResolveNode(typesFolder);
@@ -2663,8 +3722,12 @@ public class StudioMCPBridge : BaseNetLogic
                 var ownerPath = NodePathOf(owner);
                 node.Delete();
                 steps.Append(",\"delete_original\"");
-                var inst = InformationModel.MakeObject(name, newType.NodeId);
-                owner.Add(inst);
+                // #27: instantiation is session-affine; run it impersonated as root.
+                using (owner.Context.Sessions.ImpersonateRootTemporary())
+                {
+                    var inst = InformationModel.MakeObject(name, newType.NodeId);
+                    owner.Add(inst);
+                }
                 steps.Append(",\"instantiate\"");
                 instancePath = string.IsNullOrEmpty(ownerPath) ? name : ownerPath + "/" + name;
             }
@@ -2717,9 +3780,11 @@ public class StudioMCPBridge : BaseNetLogic
             var node = ResolveNode(path);
             if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
             // BEFORE ANY MUTATION - a NetLogic move is not a slow failure, it is
-            // an instant lost session. See IsNetLogicNode / NetLogicMoveMessage.
-            if (IsNetLogicNode(node))
-                return ErrorJson("refused_netlogic_move", NetLogicMoveMessage(path));
+            // an instant lost session, and so is re-authoring a subtree that holds
+            // a NetLogic or an EventHandler. See FindUnsafeSubtree / IsNetLogicNode.
+            var unsafeMove = SubtreeRefusal(node, path, "move",
+                !string.IsNullOrEmpty(newName), true);
+            if (unsafeMove != null) return unsafeMove;
             if (!(node is IUAObject) || node.NodeClass != NodeClass.Object)
                 return ErrorJson("not_an_object",
                     path + " is " + node.NodeClass + " - move handles Object instances" +
@@ -2740,8 +3805,13 @@ public class StudioMCPBridge : BaseNetLogic
             if (srcType == null)
                 return ErrorJson("not_an_object", path + " has no resolvable ObjectType");
 
-            var newNode = InformationModel.MakeObject(name, srcType.NodeId);
-            parentNode.Add(newNode);
+            // #27: instantiation is session-affine; run it impersonated as root.
+            IUAObject newNode;
+            using (parentNode.Context.Sessions.ImpersonateRootTemporary())
+            {
+                newNode = InformationModel.MakeObject(name, srcType.NodeId);
+                parentNode.Add(newNode);
+            }
             steps.Append("\"create_copy\"");
             int copied = 0;
             var skipped = new StringBuilder();
@@ -2807,6 +3877,88 @@ public class StudioMCPBridge : BaseNetLogic
         }
         catch { /* a node we cannot classify is not refused */ }
         return false;
+    }
+
+    // True for an FTOptix.CoreBase.EventHandler node (or a subclass of it).
+    private static bool IsEventHandlerNode(IUANode node)
+    {
+        try
+        {
+            if (node is FTOptix.CoreBase.EventHandler) return true;
+            for (var t = node.GetType(); t != null; t = t.BaseType)
+                if (t.FullName == "FTOptix.CoreBase.EventHandler") return true;
+        }
+        catch { /* a node we cannot classify is not refused */ }
+        return false;
+    }
+
+    // SUBTREE PRE-CHECK (1.0.9). move / rename (lowered to move) / convert_to_type
+    // all re-author the source subtree with CopySubtreeInto, and a subtree that
+    // holds a NetLogic (exported methods with InputArguments) or an EventHandler
+    // (MouseClick, ...) crashed Studio (coreclr 0xc0000005). Walk the source
+    // subtree BEFORE any mutation, pre-order, top node INCLUDED, to the same
+    // depth bound as CopySubtreeInto (12 levels), and return the path of the
+    // first offender with its kind ("netlogic" | "event_handler"), or null.
+    private string FindUnsafeSubtree(IUANode node, out string kind)
+    {
+        kind = null;
+        return FindUnsafeSubtreeAt(node, 0, ref kind);
+    }
+
+    private string FindUnsafeSubtreeAt(IUANode node, int depth, ref string kind)
+    {
+        if (node == null || depth > 12) return null;
+        if (IsNetLogicNode(node)) { kind = "netlogic"; return NodePathOf(node); }
+        if (IsEventHandlerNode(node)) { kind = "event_handler"; return NodePathOf(node); }
+        foreach (var c in node.Children)
+        {
+            // Variables (properties) hold no handlers or logic; only Objects recurse.
+            if (!(c is IUAObject)) continue;
+            var hit = FindUnsafeSubtreeAt(c, depth + 1, ref kind);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
+    // refused_netlogic_move is kept for a top-level NetLogic on MOVE so current
+    // callers and tests still match; any other NetLogic hit is contains_netlogic.
+    private static string SubtreeRefusalCode(string kind, bool isTop, bool isMove)
+    {
+        if (kind == "netlogic") return (isTop && isMove) ? "refused_netlogic_move" : "contains_netlogic";
+        return "contains_event_handler";
+    }
+
+    private static string SubtreeRefusalMessage(string kind, string offenderPath, string path,
+                                                string op, bool isRename)
+    {
+        bool isTop = offenderPath == path;
+        if (kind == "netlogic")
+        {
+            if (isTop && op == "move") return NetLogicMoveMessage(path);
+            return path + (isTop ? " is a NetLogic node" : " contains a NetLogic node at " + offenderPath) +
+                   " - " + op + " is refused, nothing was changed. " + op + " re-authors a copy of the " +
+                   "subtree and deletes the original, and a NetLogic cannot be re-authored safely " +
+                   "(it crashed Studio). Move the NetLogic out of the subtree first (in Studio's " +
+                   "Project view), or make this change in Studio, then save and re-arm the bridge.";
+        }
+        return path + (offenderPath == path ? " is an EventHandler" : " contains an EventHandler at " + offenderPath) +
+               " - " + op + " is refused, nothing was changed. " + op + " re-authors a copy of the " +
+               "subtree and deletes the original, and an EventHandler cannot be re-authored safely " +
+               "(it crashed Studio)." +
+               (isRename ? " Renaming this node needs Studio's own rename for now." :
+                           " Make this change in Studio's Project view, then save and re-arm the bridge.");
+    }
+
+    // Structured ErrorJson for the first offender in node's subtree, or null if
+    // the subtree is safe to re-author. Call BEFORE any MakeObject / mutation.
+    private string SubtreeRefusal(IUANode node, string path, string op, bool isRename, bool isMove)
+    {
+        string kind;
+        string offender = FindUnsafeSubtree(node, out kind);
+        if (offender == null) return null;
+        bool isTop = offender == NodePathOf(node);
+        return ErrorJson(SubtreeRefusalCode(kind, isTop, isMove),
+                         SubtreeRefusalMessage(kind, isTop ? path : offender, path, op, isRename));
     }
 
     // One message for both the refusal and the dry-run report, so validate_ops
@@ -3204,6 +4356,55 @@ public class StudioMCPBridge : BaseNetLogic
         }
     }
 
+    // The child variable `name` as DECLARED by the TYPE of `node` (VariableType chain
+    // for a variable, ObjectType chain for an object), or null. Only a declared child
+    // may be created on demand: an undeclared name is an orphan (see
+    // DeclaredPropertyGuard) and keeps getting property_not_found / unknown_property.
+    private static IUAVariable FindDeclaredOptionalChild(IUANode node, string name)
+    {
+        try
+        {
+            if (node is IUAVariable uv)
+                return uv.VariableType == null ? null : FindDeclaredVariableTypeProperty(uv.VariableType, name);
+            if (node is IUAObject uo)
+            {
+                IUAObjectType cur = uo.ObjectType;
+                for (int i = 0; cur != null && i < 20; i++, cur = cur.SuperType)
+                {
+                    var d = cur.GetVariable(name);
+                    if (d != null) return d;
+                }
+            }
+        }
+        catch { /* an unreadable type means "not declared" */ }
+        return null;
+    }
+
+    // Create the optional child `name` on `node` from its type declaration `decl`
+    // (same MakeVariable(name, declared DataType) + Add the create_variable
+    // `properties` path uses), set it, and report created_optional_child. The value
+    // is coerced BEFORE the child is attached so a bad value leaves the model
+    // untouched. A declared array child is refused like any array write.
+    private string CreateOptionalChildAndSet(IUANode node, string path, string name,
+        IUAVariable decl, string raw, string firstLine)
+    {
+        if (IsArrayVariable(decl))
+            return ArrayWriteError(name, node.GetType().Name, DataTypeName(decl));
+        var child = InformationModel.MakeVariable(name, decl.DataType);
+        var cerr = CoerceAssign(child, raw, firstLine);
+        if (cerr != null) return ErrorJson("bad_value", cerr);
+        node.Add(child);
+        return WithCreatedOptionalChild(
+            PropOkJson(path, name, DataTypeName(child), "created_optional_child", child), name);
+    }
+
+    // Append "created_optional_child":"<name>" to a PropOkJson object.
+    private static string WithCreatedOptionalChild(string okJson, string name)
+    {
+        int end = okJson.LastIndexOf('}');
+        return okJson.Substring(0, end) + ",\"created_optional_child\":\"" + JsonEscape(name) + "\"}";
+    }
+
     private string SetPropertyInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
@@ -3216,6 +4417,14 @@ public class StudioMCPBridge : BaseNetLogic
         // variable-materialization path below.
         if (name == "DisplayName")
             return SetDisplayNameInline(firstLine);
+        // TYPED string[] PATH (1.0.9 #3). Reachable ONLY when the caller states
+        // typed=string[] explicitly (the service sends it only with
+        // FTX_GRID_STRING_ARRAY on). It is a separate branch that never reaches
+        // CoerceAssign or the generic array guards below, which stay exactly as
+        // they were: no typed marker, or any property but GridLayout
+        // Rows/Columns, keeps getting unsupported_array_write.
+        if (QueryParam(firstLine, "typed") == "string[]")
+            return SetGridStringArrayInline(path, name, raw);
         var fmtErr = FormatSpecifierError(name, raw);
         if (fmtErr != null) return ErrorJson("bad_value", fmtErr);
         try
@@ -3257,6 +4466,21 @@ public class StudioMCPBridge : BaseNetLogic
             // Rectangle exposes BorderColor but a Panel does not. Reject an undeclared
             // property BEFORE materializing it, and hand back the valid set so the
             // caller (or describe_*) can self-correct instead of crashing.
+            //
+            // ON-DEMAND OPTIONAL CHILD (1.0.9, ftx-mcp-wvk.2). A VARIABLE instance
+            // (e.g. a TrendPen made by create_variable) has no ObjectType and is not
+            // an IUAObject, so neither the guard's UA-chain check nor
+            // GetOrCreateVariable below apply to it. When the node's VariableType
+            // chain DECLARES a child of that name, create the child from the
+            // declaration and set it (general - no per-type special case). Only a
+            // declared child is ever created; anything else falls through unchanged
+            // to the guard (unknown_property) / property_not_found.
+            if (node is IUAVariable && !IsNodeAttributeName(name))
+            {
+                var vdecl = FindDeclaredOptionalChild(node, name);
+                if (vdecl != null)
+                    return CreateOptionalChildAndSet(node, path, name, vdecl, raw, firstLine);
+            }
             var gateErr = DeclaredPropertyGuard(node, name);
             if (gateErr != null) return gateErr;
 
@@ -3288,19 +4512,1057 @@ public class StudioMCPBridge : BaseNetLogic
             else if (node is IUAObjectType asType)
                 mvar = asType.GetOrCreateVariable(name);
             if (mvar == null)
+            {
+                // GetOrCreateVariable gave nothing: still create the child when the
+                // node's type chain declares it (see FindDeclaredOptionalChild).
+                var odecl = FindDeclaredOptionalChild(node, name);
+                if (odecl != null)
+                    return CreateOptionalChildAndSet(node, path, name, odecl, raw, firstLine);
                 return ErrorJson("property_not_found",
                     "node " + path + " has no variable or materializable property " + name);
+            }
             if (IsArrayVariable(mvar))   // backstop: declared-array gate above should have caught it
                 return ArrayWriteError(name, node.GetType().Name, DataTypeName(mvar));
             var merr = CoerceAssign(mvar, raw, firstLine);
             if (merr != null) return ErrorJson("bad_value", merr);
-            return PropOkJson(path, name, DataTypeName(mvar), "materialized", mvar);
+            return WithCreatedOptionalChild(
+                PropOkJson(path, name, DataTypeName(mvar), "materialized", mvar), name);
         }
         catch (Exception ex)
         {
             return "{\"ok\":false,\"error\":\"" +
                    JsonEscape(ExcMsg(ex)) + "\"}";
         }
+    }
+
+    // ---- typed string[] write for GridLayout Rows/Columns (1.0.9 #3) ---------
+    //
+    // The ONLY array write the bridge performs. Guards, all checked BEFORE any
+    // model access that could materialize or write anything:
+    //   1. name is exactly Rows or Columns,
+    //   2. the node's CLR proxy type is (or derives from) GridLayout,
+    //   3. the value parses as a non-empty JSON array of non-empty strings.
+    // The write is node-model only (GetOrCreateVariable + typed UAValue(string[]),
+    // the same off-thread-safe ops as SetArrayIfPresent); it never touches the
+    // scalar CoerceAssign path, and never the typed CLR setter (hard-crashes
+    // off-thread). If the bench shows this kills Studio, leave
+    // FTX_GRID_STRING_ARRAY off (the service default) and record the WER finding.
+    private static bool IsGridStringArrayProperty(string name)
+    {
+        return name == "Rows" || name == "Columns";
+    }
+
+    private static bool IsGridLayoutNode(IUANode node)
+    {
+        for (Type t = node.GetType(); t != null; t = t.BaseType)
+            if (t.Name == "GridLayout") return true;
+        return false;
+    }
+
+    // null when `raw` is a JSON array of non-empty strings (elements in `items`),
+    // else a human-readable reason.
+    private static string ParseStringArray(string raw, out string[] items)
+    {
+        items = null;
+        try
+        {
+            using (var doc = System.Text.Json.JsonDocument.Parse(raw ?? ""))
+            {
+                var root = doc.RootElement;
+                if (root.ValueKind != System.Text.Json.JsonValueKind.Array)
+                    return "value must be a JSON array of strings";
+                var list = new List<string>();
+                foreach (var el in root.EnumerateArray())
+                {
+                    if (el.ValueKind != System.Text.Json.JsonValueKind.String)
+                        return "every element must be a string";
+                    string sv = el.GetString();
+                    if (string.IsNullOrWhiteSpace(sv))
+                        return "elements must be non-empty strings";
+                    list.Add(sv);
+                }
+                if (list.Count == 0) return "array must not be empty";
+                items = list.ToArray();
+                return null;
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return "value is not valid JSON";
+        }
+    }
+
+    private string SetGridStringArrayInline(string path, string name, string raw)
+    {
+        if (!IsGridStringArrayProperty(name))
+            return ErrorJson("typed_array_not_supported",
+                "typed=string[] is only supported for GridLayout Rows and Columns, not '" + name + "'");
+        string[] items;
+        string perr = ParseStringArray(raw, out items);
+        if (perr != null) return ErrorJson("bad_value", perr);
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null)
+                return ErrorJson("node_not_found", "no node at: " + path);
+            if (!IsGridLayoutNode(node))
+                return ErrorJson("typed_array_not_supported",
+                    "typed string[] writes are guarded to GridLayout nodes; " + path + " is " +
+                    node.GetType().Name);
+
+            var v = node.GetVariable(name);
+            if (v == null && node is IUAObject asObject)
+                v = asObject.GetOrCreateVariable(name);
+            if (v == null)
+                return ErrorJson("property_not_found",
+                    "node " + path + " has no variable or materializable property " + name);
+            if (DataTypeName(v) != "String")
+                return ErrorJson("typed_array_not_supported",
+                    "property '" + name + "' is " + DataTypeName(v) + ", expected String[]");
+
+            // Shape first, then the value (same order as create_variable/retype).
+            bool shaped = false;
+            try
+            {
+                var d = v.ArrayDimensions;
+                shaped = d != null && d.Length == 1 && d[0] == (uint)items.Length;
+            }
+            catch { }
+            if (!shaped)
+            {
+                v.ArrayDimensions = new uint[] { (uint)items.Length };
+                v.ValueRank = ValueRank.OneDimension;
+            }
+            v.Value = new UAValue(items);
+
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
+                   "\",\"name\":\"" + JsonEscape(name) +
+                   "\",\"datatype\":\"String[]\",\"via\":\"typed-string-array\",\"count\":" +
+                   items.Length + ",\"value\":\"" + JsonEscape(string.Join(",", items)) +
+                   "\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // ---- set_text_key: a text property bound to a translation KEY -------------
+    //
+    // POST /bridge/node/text-key?path=..&name=..&key=..[&locale=en-US]
+    //
+    // set_property on a LocalizedText property writes LITERAL text
+    // (new LocalizedText(text, locale)). This route writes the other form: a
+    // LocalizedText carrying a TextId (the key) in the project's namespace, so
+    // the runtime resolves it through the translation table per session locale.
+    // The key is NOT required to exist in the table yet (add_translation may run
+    // later in the same batch) - `translated` reports whether it does now; a key
+    // with no row renders blank until one is added.
+    // NODE ATTRIBUTES (BrowseName/DisplayName/Description/...) are refused before
+    // anything is resolved: they are not UA child variables and must never reach
+    // GetOrCreateVariable (orphan-variable crash). DisplayName has its own route.
+    private string SetTextKeyInline(string firstLine)
+    {
+        string path = QueryParam(firstLine, "path");
+        string name = QueryParam(firstLine, "name");
+        string key = QueryParam(firstLine, "key");
+        string locale = QueryParam(firstLine, "locale");
+        if (string.IsNullOrEmpty(locale)) locale = "en-US";   // empty localeId asserts
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name) || string.IsNullOrEmpty(key))
+            return ErrorJson("bad_query", "required query params: path, name, key");
+        if (IsNodeAttributeName(name))
+            return ErrorJson("node_attribute_not_settable",
+                name + " is a node attribute, not a UA child property; set_text_key never writes " +
+                "attributes (rename a node with the rename op; DisplayName is set via set_property)");
+        string keyErr = TextKeyError(key);
+        if (keyErr != null) return ErrorJson("invalid_text_key", keyErr);
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null)
+                return ErrorJson("node_not_found", "no node at: " + path);
+
+            var prop = node.GetVariable(name);
+            string via = "variable";
+            if (prop == null)
+            {
+                // Same crash-safety gates as SetPropertyInline, BEFORE materializing.
+                var gateErr = DeclaredPropertyGuard(node, name);
+                if (gateErr != null) return gateErr;
+                var arrErr = DeclaredArrayGuard(node, name);
+                if (arrErr != null) return arrErr;
+                if (node is IUAObject asObject) prop = asObject.GetOrCreateVariable(name);
+                else if (node is IUAObjectType asType) prop = asType.GetOrCreateVariable(name);
+                via = "materialized";
+                if (prop == null)
+                    return ErrorJson("property_not_found",
+                        "node " + path + " has no variable or materializable property " + name);
+            }
+            if (IsArrayVariable(prop))
+                return ArrayWriteError(name, node.GetType().Name, DataTypeName(prop));
+            string dt = DataTypeName(prop);
+            if (dt != "LocalizedText")
+                return ErrorJson("not_localized_text",
+                    "property '" + name + "' is " + dt + ", not LocalizedText; only a LocalizedText " +
+                    "property can hold a translation key (use set_property for literal values)");
+
+            int nsIdx = Project.Current.NodeId.NamespaceIndex;
+            // `translated` uses the SAME existence check add_translation uses (the row in
+            // `locale`, else any locale): TranslationRowExists + the per-locale record.
+            string known = TranslationWrittenText(key, locale) ?? TranslationLookupText(key, locale) ?? "";
+            var translatedLocales = TranslationLocalesFor(key);
+            bool translated = translatedLocales.Count > 0 || TranslationRowExists(key);
+            prop.Value = new UAValue(new LocalizedText(nsIdx, key, known, locale));
+
+            string readKey = null;
+            try { var back = prop.Value.Value as LocalizedText; if (back != null) readKey = back.TextId; }
+            catch { }
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
+                   "\",\"name\":\"" + JsonEscape(name) +
+                   "\",\"datatype\":\"LocalizedText\",\"key\":\"" + JsonEscape(key) +
+                   "\",\"text_id\":" + (readKey != null ? "\"" + JsonEscape(readKey) + "\"" : "null") +
+                   ",\"locale\":\"" + JsonEscape(locale) + "\",\"translated\":" + Bool(translated) +
+                   ",\"translated_locales\":" + JsonStringArray(translatedLocales) +
+                   ",\"via\":\"" + via + "\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // ---- set_modelling_rule: Mandatory / Optional / None on a type member ----
+    //
+    // POST /bridge/node/modelling-rule?path=..&rule=Mandatory|Optional|None[&dry_run=true]
+    //
+    // The ModellingRule decides whether instances of an ObjectType must carry a
+    // member (Mandatory), may carry it (Optional) or whether it is a plain child
+    // (None). It is only meaningful on a MEMBER of a type, so a node that has no
+    // ObjectType/VariableType ancestor (an instance, a screen widget, ...) is
+    // refused with not_a_type_member rather than silently given a rule.
+    // Modifies the node's ModellingRule property; no variable is created.
+    private static readonly string[] _ModellingRuleNames = { "Mandatory", "Optional", "None" };
+
+    // Canonical spelling for a rule name (case-insensitive), or null when it is
+    // not one of the three. Mirrors core.normalize_modelling_rule.
+    private static string CanonModellingRule(string rule)
+    {
+        if (string.IsNullOrEmpty(rule)) return null;
+        foreach (var n in _ModellingRuleNames)
+            if (string.Equals(n, rule, StringComparison.OrdinalIgnoreCase)) return n;
+        return null;
+    }
+
+    // True when `node` sits UNDER an ObjectType or VariableType (not the type itself).
+    private static bool IsTypeMember(IUANode node)
+    {
+        var cur = node != null ? node.Owner : null;
+        while (cur != null)
+        {
+            if (cur.NodeClass == NodeClass.ObjectType || cur.NodeClass == NodeClass.VariableType)
+                return true;
+            cur = cur.Owner;
+        }
+        return false;
+    }
+
+    private string SetModellingRuleInline(string firstLine)
+    {
+        string path = QueryParam(firstLine, "path");
+        string ruleIn = QueryParam(firstLine, "rule");
+        bool dryRun = string.Equals(QueryParam(firstLine, "dry_run"), "true", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(ruleIn))
+            return ErrorJson("bad_query", "required query params: path, rule");
+        string rule = CanonModellingRule(ruleIn);
+        if (rule == null)
+            return ErrorJson("invalid_modelling_rule",
+                "modelling rule '" + ruleIn + "' is not one of Mandatory, Optional, None");
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null)
+                return ErrorJson("node_not_found", "no node at: " + path);
+            if (!IsTypeMember(node))
+                return ErrorJson("not_a_type_member",
+                    path + " is not a member of an ObjectType/VariableType; a ModellingRule " +
+                    "only applies to type members");
+            string previous = node.ModellingRule.ToString();
+            if (!dryRun)
+            {
+                node.ModellingRule = (NamingRuleType)Enum.Parse(typeof(NamingRuleType), rule);
+            }
+            string now = dryRun ? previous : node.ModellingRule.ToString();
+            return "{\"ok\":true,\"path\":\"" + JsonEscape(path) +
+                   "\",\"rule\":\"" + rule + "\",\"previous\":\"" + JsonEscape(previous) +
+                   "\",\"modelling_rule\":\"" + JsonEscape(now) +
+                   "\",\"changed\":" + Bool(!dryRun && previous != now) +
+                   ",\"would_set\":" + Bool(dryRun) + ",\"dry_run\":" + Bool(dryRun) +
+                   ",\"via\":\"modelling-rule\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+        }
+        catch (Exception ex)
+        {
+            return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}";
+        }
+    }
+
+    // ---- import_tags: design-time Tag Importer for PLC driver stations ----
+    //
+    // POST /bridge/station/import-tags   JSON body:
+    //   {"station": "<path>", "mode": "offline|online", "file": "<L5X|TPY>",
+    //    "tags": ["Motor1.Speed", ...], "timeout_s": 120}
+    //
+    // Own implementation of the flow documented in the public NetLogic_CheatSheet
+    // page pages/designtime-tags-import.md: station.TagImporter -> FilePath
+    // (ResourceUri.FromAbsoluteFilePath) + Mode (TagImporterAPI.FetchMode) ->
+    // Import(Func<string,string,bool> filter) -> Task.
+    //
+    // 1.7 / 1.8 COMPILE SAFETY: the RA EtherNet/IP TagImporter exists only from
+    // Studio 1.8. Nothing here names FTOptix.RAEtherNetIP / TagImporterAPI types
+    // statically (no `using static`): the station's type is recognised by
+    // namespace, and TagImporter / FilePath / Mode / Import are all reached by
+    // reflection, so the same source builds on 1.7 and 1.8.
+    //
+    // THREADING: like every other inline route this runs on the listener's
+    // background thread, never Studio's UI thread, impersonating root for the
+    // calls (see InvokeMethodInline). The wait on the importer's Task is BOUNDED
+    // (timeout_s, default 120, max 3600): at design time Studio does not pump
+    // DelayedTask / async-task queues, so an unbounded Wait() could hang the
+    // listener forever. The bridge serves one request at a time, so other
+    // requests queue behind a running import until it finishes or times out.
+    private const string ImportTagsRaMinVersion = "1.8";
+    private const double ImportTagsDefaultTimeoutS = 120.0;
+    private const double ImportTagsMaxTimeoutS = 3600.0;
+
+    // The importer's symbol filter (mirror of core.import_tags_keeps_symbol):
+    //   merge (replace=false, the default): keep a symbol when it MATCHES A
+    //     REQUESTED TAG (ImportTagsSymbolMatches) OR is ALREADY PRESENT on the
+    //     station, i.e. its name is in the `before` snapshot's symbol names;
+    //   replace=true: keep only symbols that match a requested tag.
+    // The importer rewrites the station's Tags tree from the file, so a station
+    // tag the file does not contain goes whatever the filter says: with
+    // replace=false ImportTagsRun refuses (would_remove_tags) before importing.
+    private static bool ImportTagsKeepsSymbol(string symbol, IList<string> requested,
+        ISet<string> present, bool replace)
+    {
+        if (ImportTagsSymbolMatches(symbol, requested)) return true;
+        return !replace && present != null && !string.IsNullOrEmpty(symbol) && present.Contains(symbol);
+    }
+
+    // Station symbols (roots only, sorted) that the source file does not contain,
+    // neither as a symbol, child nor parent. Mirror of core.import_tags_would_remove.
+    private static List<string> ImportTagsWouldRemove(IEnumerable<string> present,
+        IList<string> sourceSymbols)
+    {
+        var gone = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var p in present)
+            if (!string.IsNullOrEmpty(p) && !ImportTagsSymbolMatches(p, sourceSymbols)) gone.Add(p);
+        return gone.Where(g => !gone.Any(o => g.StartsWith(o + ".", StringComparison.Ordinal))).ToList();
+    }
+
+    // The requested-tag test. Mirror of core.import_tags_symbol_matches: keep
+    // a symbol that equals a requested name or is its parent or child. Parent/child
+    // are decided on '.' boundaries, so Motor1 never matches Motor10.
+    private static bool ImportTagsSymbolMatches(string symbol, IList<string> requested)
+    {
+        if (string.IsNullOrEmpty(symbol) || requested == null) return false;
+        foreach (var r in requested)
+        {
+            if (string.IsNullOrEmpty(r)) continue;
+            if (string.Equals(symbol, r, StringComparison.Ordinal) ||
+                symbol.StartsWith(r + ".", StringComparison.Ordinal) ||
+                r.StartsWith(symbol + ".", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    // "requires_optix_1_8" when an RA station is asked to import on a Studio older
+    // than 1.8, else null. TwinCAT is never gated (works from 1.7). Same
+    // studio_version source as the pow gate (StudioVersionString / VersionAtLeast);
+    // an unknown version passes. Mirror of core.import_tags_version_gate.
+    private static string ImportTagsVersionGate(string stationKind, string studioVersion)
+    {
+        if (stationKind != "ra") return null;
+        return VersionAtLeast(studioVersion, ImportTagsRaMinVersion) ? null : "requires_optix_1_8";
+    }
+
+    // "ra" | "twincat" | null, from the station's CLR proxy type (namespace based,
+    // so no static reference to the driver assemblies).
+    private static string ImportTagsStationKind(IUANode station)
+    {
+        for (Type t = station.GetType(); t != null; t = t.BaseType)
+        {
+            string ns = t.Namespace ?? "";
+            if (!t.Name.EndsWith("Station", StringComparison.Ordinal)) continue;
+            if (ns.StartsWith("FTOptix.RAEtherNetIP", StringComparison.Ordinal)) return "ra";
+            if (ns.StartsWith("FTOptix.TwinCAT", StringComparison.Ordinal)) return "twincat";
+        }
+        return null;
+    }
+
+    // path -> SymbolName for every tag node (a node carrying a SymbolName
+    // property) below `node`. Property leaves (SymbolName itself, ...) have no
+    // SymbolName child, so they are not counted.
+    private static void ImportTagsSnapshot(IUANode node, string path,
+        Dictionary<string, string> into, int depth)
+    {
+        if (node == null || depth > 64) return;
+        foreach (var child in node.Children)
+        {
+            string cp = path + "/" + child.BrowseName;
+            try
+            {
+                var sym = child.GetVariable("SymbolName");
+                if (sym != null)
+                {
+                    object v = sym.Value != null ? sym.Value.Value : null;
+                    into[cp] = v != null ? v.ToString() : "";
+                }
+            }
+            catch { /* a node that cannot be read is simply not a tag node */ }
+            ImportTagsSnapshot(child, cp, into, depth + 1);
+        }
+    }
+
+    // GET /bridge/station/tags?station=<path>  ->  [{"path":..., "symbol":...}, ...]
+    // Every descendant of <station>/Tags that carries a SymbolName, whatever its node
+    // class (RA tags are Variables nested under Tags/Controller Tags/...). Same
+    // ImportTagsSnapshot the import's before/after diff uses. A station without a
+    // Tags child answers []. Reflection-free: compiles on 1.7 and 1.8.
+    private string StationTagsJson(string stationPath)
+    {
+        try
+        {
+            var station = ResolveNode(stationPath);
+            if (station == null)
+                return ErrorJson("station_not_found", "no node at: " + stationPath);
+            var snap = new Dictionary<string, string>(StringComparer.Ordinal);
+            ImportTagsSnapshot(ImportTagsRoot(station), stationPath.TrimEnd('/') + "/Tags", snap, 0);
+            var sb = new StringBuilder("[");
+            bool first = true;
+            foreach (var kv in snap.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append("{\"path\":\"").Append(JsonEscape(kv.Key))
+                  .Append("\",\"symbol\":\"").Append(JsonEscape(kv.Value)).Append("\"}");
+            }
+            return sb.Append(']').ToString();
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson("station_tags_failed", ExcMsg(ex));
+        }
+    }
+
+    // The station's "Tags" child, or null when it has none (yet).
+    private static IUANode ImportTagsRoot(IUANode station)
+    {
+        try { return station.Get("Tags"); }
+        catch { return null; }
+    }
+
+    // ---- existing-or-temporary station TagImporter (ftx-mcp-jku.1) ----
+    //
+    // An RA EtherNet/IP / TwinCAT station added in Studio's UI already has a
+    // TagImporter; one made by MakeObject (create_object) does not, so
+    // station.TagImporter throws. This helper makes import_tags work for both:
+    //   1. station.TagImporter already works -> "existing": used as is, NEVER
+    //      modified or deleted by this call.
+    //   2. otherwise resolve the importer type by EXACT BrowseName among the
+    //      subtypes of the TagImporter base type (RAEtherNetIPTagImporter for RA,
+    //      TwinCATTagImporter for TwinCAT) - no substring match, no hard-coded
+    //      NodeId - MakeObject it as "FtxMcpTagImporter", station.Add(it), and
+    //      confirm station.TagImporter now works -> "temporary" (`created` is the
+    //      node; the CALLER deletes it when the task finishes).
+    //   3. type unresolved, or station.TagImporter still fails after the add ->
+    //      whatever this call created is deleted again -> "failed" with `detail`.
+    // All reflection / name based - no static reference to the 1.8-only types,
+    // so the same source builds on 1.7 and 1.8.
+    private const string ImportTagsUiStationHint =
+        "hint: the station has no TagImporter it owns and a temporary one could not be added; " +
+        "a station created in Studio's UI (Add > station) has its own, or share the diagnostics above with the maintainers";
+    private const string ImportTagsTempName = "FtxMcpTagImporter";
+    private const string ImportTagsBaseTypeName = "TagImporter";
+
+    private static object ImportTagsTryGetImporter(IUANode station, out string error)
+    {
+        error = null;
+        try
+        {
+            var p = station.GetType().GetProperty("TagImporter",
+                BindingFlags.Public | BindingFlags.Instance);
+            if (p == null) { error = "no TagImporter property"; return null; }
+            var v = p.GetValue(station);
+            if (v == null) error = "returned null";
+            return v;
+        }
+        catch (TargetInvocationException tie)
+        { error = (tie.InnerException ?? tie).GetBaseException().Message; return null; }
+        catch (Exception ex)
+        { error = ex.GetBaseException().Message; return null; }
+    }
+
+    // Type-tree walk: the first ObjectType node below `root` whose BrowseName is
+    // EXACTLY `name` (ordinal), descending ObjectType nodes only. Visit-capped.
+    private static IUANode ImportTagsFindTypeBelow(IUANode root, string name)
+    {
+        if (root == null) return null;
+        var seen = new HashSet<string>();
+        var stack = new Stack<IUANode>();
+        stack.Push(root);
+        int visited = 0;
+        while (stack.Count > 0 && visited++ < 50000)
+        {
+            var cur = stack.Pop();
+            if (cur == null) continue;
+            string key;
+            try { key = cur.NodeId.ToString(); } catch { continue; }
+            if (!seen.Add(key)) continue;
+            if (!ReferenceEquals(cur, root) && cur.NodeClass == NodeClass.ObjectType &&
+                string.Equals(cur.BrowseName, name, StringComparison.Ordinal))
+                return cur;
+            try { foreach (var c in cur.Children) if (c.NodeClass == NodeClass.ObjectType) stack.Push(c); }
+            catch { /* an unreadable branch is simply not searched */ }
+        }
+        return null;
+    }
+
+    // The importer type node: exact BrowseName `typeName` among the subtypes of
+    // the TagImporter base type (itself found by exact BrowseName in the type
+    // tree). Null (with a note in `tried`) when either is missing.
+    private static IUANode ImportTagsResolveImporterType(string typeName, List<string> tried)
+    {
+        try
+        {
+            var objRoot = InformationModel.Get(OpcUa.ObjectTypes.BaseObjectType);
+            var baseType = ImportTagsFindTypeBelow(objRoot, ImportTagsBaseTypeName);
+            if (baseType == null)
+            { tried.Add("base type '" + ImportTagsBaseTypeName + "' not found in the type tree"); return null; }
+            var t = ImportTagsFindTypeBelow(baseType, typeName);
+            if (t == null)
+                tried.Add("no subtype of " + ImportTagsBaseTypeName + " has BrowseName exactly '" + typeName + "'");
+            return t;
+        }
+        catch (Exception ex)
+        { tried.Add("type resolution threw: " + ex.GetBaseException().Message); return null; }
+    }
+
+    // Delete a node this call created; null on success, else the failure text.
+    private static string ImportTagsDeleteNode(IUANode node, IUANode station)
+    {
+        if (node == null) return null;
+        try
+        {
+            using (station.Context.Sessions.ImpersonateRootTemporary())
+            {
+                if (node.Owner != null) node.Delete();
+            }
+            return null;
+        }
+        catch (Exception ex) { return ex.GetBaseException().Message; }
+    }
+
+    // "existing" | "temporary" | "failed". On "temporary" `created` is the node to
+    // delete when done; on "failed" everything this call created is already gone
+    // and `detail` lists what was tried.
+    private string ImportTagsEnsureImporter(IUANode station, string stationPath,
+        string kind, out IUANode created, out string detail)
+    {
+        detail = null;
+        created = null;
+        string err;
+        if (ImportTagsTryGetImporter(station, out err) != null) return "existing";
+        var tried = new List<string> { "station.TagImporter: " + err };
+        string typeName = kind == "ra" ? "RAEtherNetIPTagImporter" : "TwinCATTagImporter";
+
+        IUANode imp = null;
+        try
+        {
+            var typeNode = ImportTagsResolveImporterType(typeName, tried);
+            if (typeNode != null)
+            {
+                using (station.Context.Sessions.ImpersonateRootTemporary())
+                {
+                    imp = InformationModel.MakeObject(ImportTagsTempName, typeNode.NodeId);
+                    station.Add(imp);
+                }
+                if (ImportTagsTryGetImporter(station, out err) != null)
+                {
+                    created = imp;
+                    detail = "added temporary " + typeName + " " + ImportTagsTempName;
+                    return "temporary";
+                }
+                tried.Add("added " + ImportTagsTempName + " (" + typeName +
+                          ") but station.TagImporter still fails: " + err);
+            }
+        }
+        catch (Exception ex)
+        { tried.Add("creating " + ImportTagsTempName + " threw: " + ex.GetBaseException().Message); }
+
+        // Never leave a half-created importer: undo what THIS call created.
+        if (imp != null)
+        {
+            string del = ImportTagsDeleteNode(imp, station);
+            tried.Add(del == null ? "deleted the importer this call created"
+                : "CLEANUP FAILED, check " + stationPath + "/" + ImportTagsTempName + ": " + del);
+        }
+        detail = "could not obtain a TagImporter for " + stationPath +
+                 "; routes tried: [" + string.Join(" | ", tried) + "]";
+        return "failed";
+    }
+
+    private static string ImportTagsStringArray(IEnumerable<string> items)
+    {
+        return "[" + string.Join(",", items.Select(x => "\"" + JsonEscape(x) + "\"")) + "]";
+    }
+
+    // First public instance property called `name` on the type or any base type
+    // (GetProperty can hide inherited ones behind ambiguity); null when absent.
+    private static PropertyInfo ImportTagsFindProperty(Type t, string name)
+    {
+        for (; t != null; t = t.BaseType)
+        {
+            foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance |
+                                              BindingFlags.DeclaredOnly))
+                if (p.Name == name) return p;
+        }
+        return null;
+    }
+
+    private static string ImportTagsTypeName(Type t)
+    {
+        return t == null ? "?" : (t.FullName ?? t.Name);
+    }
+
+    // API-mismatch detail for an importer object: runtime type full name, public
+    // property names, and every public Import* method with its parameter types.
+    // Reflection only - no static reference to the 1.8-only importer types.
+    private static string ImportTagsDescribeImporter(object importer)
+    {
+        if (importer == null) return "importer: null";
+        var t = importer.GetType();
+        var props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Select(p => p.Name).Distinct().OrderBy(n => n, StringComparer.Ordinal).ToList();
+        var methods = t.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Where(m => m.Name.StartsWith("Import", StringComparison.Ordinal))
+            .Select(m => m.Name + "(" + string.Join(", ",
+                m.GetParameters().Select(p => ImportTagsTypeName(p.ParameterType))) + ")")
+            .Distinct().OrderBy(n => n, StringComparer.Ordinal).ToList();
+        return "importer runtime type: " + ImportTagsTypeName(t) +
+               "; public properties: [" + string.Join(", ", props) + "]" +
+               "; Import* methods: [" + string.Join("; ", methods) + "]";
+    }
+
+    // Station-side detail: is there a TagImporter child on this station, and where
+    // was it looked for. The SDK's station.TagImporter needs a node OWNED by the
+    // station whose type derives from the TagImporter base type (PRD 0040).
+    private static string ImportTagsDesignTimeProbe(IUANode station, string stationPath)
+    {
+        string sp = (stationPath ?? "").Trim('/');
+        var searched = new List<string>();
+        var found = new List<string>();
+        string childPath = sp + "/TagImporter (station child)";
+        searched.Add(childPath);
+        try
+        {
+            var child = station.Get("TagImporter");
+            if (child != null) found.Add(childPath + " (" + ImportTagsTypeName(child.GetType()) + ")");
+        }
+        catch { /* no such child */ }
+        return "station-owned TagImporter " + (found.Count > 0 ? "EXISTS" : "NOT FOUND") +
+               " for " + (stationPath ?? "") + "; searched: [" + string.Join(", ", searched) + "]" +
+               "; resolved: [" + string.Join(", ", found) + "]";
+    }
+
+    // True when `t` is a delegate type shaped (string, string) -> bool, whatever
+    // its name (Func<string,string,bool>, a custom `delegate bool X(string, string)`).
+    private static bool ImportTagsIsFilterDelegate(Type t)
+    {
+        if (t == null || !typeof(Delegate).IsAssignableFrom(t) || t == typeof(Delegate) ||
+            t == typeof(MulticastDelegate)) return false;
+        var inv = t.GetMethod("Invoke");
+        if (inv == null || inv.ReturnType != typeof(bool)) return false;
+        var ps = inv.GetParameters();
+        return ps.Length == 2 && ps[0].ParameterType == typeof(string) &&
+               ps[1].ParameterType == typeof(string);
+    }
+
+    // Tolerant Import binding. Picks any public instance `Import` overload with exactly
+    // one parameter whose type is a (string,string)->bool delegate (takesFilter=true).
+    // The parameterless Import() is accepted ONLY when `tagsEmpty` (an empty tag list
+    // means "import everything", so no filter is needed) and is preferred then;
+    // with tags it is never used, as it would silently import every symbol.
+    // Returns null (method) when nothing suitable exists.
+    private static void ImportTagsFindImport(Type itype, bool tagsEmpty,
+        out MethodInfo method, out bool takesFilter)
+    {
+        method = null; takesFilter = false;
+        MethodInfo filterM = null, plainM = null;
+        foreach (var m in itype.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (m.Name != "Import") continue;
+            var ps = m.GetParameters();
+            if (ps.Length == 0) { if (plainM == null) plainM = m; }
+            else if (ps.Length == 1 && ImportTagsIsFilterDelegate(ps[0].ParameterType))
+            {
+                // prefer the stock Func<string,string,bool> over a custom delegate type
+                if (filterM == null || ps[0].ParameterType == typeof(Func<string, string, bool>))
+                    filterM = m;
+            }
+        }
+        if (tagsEmpty && plainM != null) { method = plainM; return; }
+        if (filterM != null) { method = filterM; takesFilter = true; }
+    }
+
+    // Wrap the filter in the importer's exact delegate type. Func<string,string,bool>
+    // is passed through; any other (string,string)->bool delegate is built with
+    // Delegate.CreateDelegate over the filter's closure method + target.
+    private static Delegate ImportTagsBuildFilterDelegate(Type delegateType,
+        Func<string, string, bool> filter)
+    {
+        if (delegateType.IsAssignableFrom(typeof(Func<string, string, bool>))) return filter;
+        return Delegate.CreateDelegate(delegateType, filter.Target, filter.Method);
+    }
+
+    private string ImportTagsInline(string firstLine, string reqBody)
+    {
+        if (string.IsNullOrWhiteSpace(reqBody))
+            return ErrorJson("bad_query",
+                "import-tags needs a JSON body {station, mode, tags[, file, timeout_s]}");
+        string stationPath = null, mode = null, file = null;
+        var tags = new List<string>();
+        List<string> sourceSymbols = null;   // symbols parsed from the offline file by the service
+        string replaceQ = QueryParam(firstLine, "replace");
+        bool replace = replaceQ == "1" || string.Equals(replaceQ, "true", StringComparison.OrdinalIgnoreCase);
+        double timeoutS = ImportTagsDefaultTimeoutS;
+        try
+        {
+            using (var doc = System.Text.Json.JsonDocument.Parse(reqBody))
+            {
+                var root = doc.RootElement;
+                string replaceB = JsonStr(root, "replace");
+                if (replaceB == "1" || string.Equals(replaceB, "true", StringComparison.OrdinalIgnoreCase))
+                    replace = true;
+                System.Text.Json.JsonElement ss;
+                if (root.TryGetProperty("source_symbols", out ss) &&
+                    ss.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    sourceSymbols = new List<string>();
+                    foreach (var t in ss.EnumerateArray())
+                        if (t.ValueKind == System.Text.Json.JsonValueKind.String &&
+                            !string.IsNullOrEmpty(t.GetString()))
+                            sourceSymbols.Add(t.GetString());
+                }
+                stationPath = JsonStr(root, "station");
+                mode = (JsonStr(root, "mode") ?? "").Trim().ToLowerInvariant();
+                file = JsonStr(root, "file");
+                System.Text.Json.JsonElement tg;
+                if (root.TryGetProperty("tags", out tg) &&
+                    tg.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    foreach (var t in tg.EnumerateArray())
+                        if (t.ValueKind == System.Text.Json.JsonValueKind.String &&
+                            !string.IsNullOrEmpty(t.GetString()))
+                            tags.Add(t.GetString());
+                string to = JsonStr(root, "timeout_s");
+                double parsed;
+                if (to != null && double.TryParse(to, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out parsed))
+                    timeoutS = parsed;
+            }
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson("bad_query", "import-tags body is not valid JSON: " + ExcMsg(ex));
+        }
+        if (string.IsNullOrEmpty(stationPath))
+            return ErrorJson("bad_query", "import-tags requires \"station\"");
+        if (mode != "offline" && mode != "online")
+            return ErrorJson("bad_query", "import-tags \"mode\" must be offline or online");
+        if (tags.Count == 0)
+            return ErrorJson("bad_query", "import-tags requires a non-empty \"tags\" list");
+        if (mode == "offline" && string.IsNullOrEmpty(file))
+            return ErrorJson("bad_query", "offline import requires \"file\"");
+        if (!(timeoutS > 0) || timeoutS > ImportTagsMaxTimeoutS)
+            return ErrorJson("bad_query", "\"timeout_s\" must be in (0, " +
+                ImportTagsMaxTimeoutS.ToString(CultureInfo.InvariantCulture) + "]");
+
+        try
+        {
+            var station = ResolveNode(stationPath);
+            if (station == null)
+                return ErrorJson("station_not_found", "no node at: " + stationPath);
+            string kind = ImportTagsStationKind(station);
+            if (kind == null)
+                return ErrorJson("not_a_tag_station",
+                    stationPath + " is a " + station.GetType().Name +
+                    ", not an RA EtherNet/IP or TwinCAT station");
+            string studioVer = StudioVersionString();
+            if (ImportTagsVersionGate(kind, studioVer) != null)
+                return ErrorJson("requires_optix_1_8",
+                    "the RA EtherNet/IP tag importer needs Optix Studio 1.8 or newer (running " +
+                    studioVer + "); TwinCAT stations import from 1.7");
+
+            // offline source: absolute, or relative to the project folder.
+            string abs = null;
+            if (mode == "offline")
+            {
+                abs = file;
+                if (!System.IO.Path.IsPathRooted(abs))
+                {
+                    string proj = GetProjectPath();
+                    if (!string.IsNullOrEmpty(proj) &&
+                        proj.EndsWith(".optix", StringComparison.OrdinalIgnoreCase))
+                        proj = System.IO.Path.GetDirectoryName(proj);
+                    abs = System.IO.Path.Combine(proj ?? "", file);
+                }
+                if (!System.IO.File.Exists(abs))
+                    return ErrorJson("file_not_found", "no such import file: " + abs);
+            }
+
+            // TagImporter / FilePath / Mode / Import by reflection (1.7 builds).
+            // Every API-mismatch failure below carries ImportTagsDescribeImporter /
+            // ImportTagsDesignTimeProbe detail so a live run is conclusive.
+            var tiProp = station.GetType().GetProperty("TagImporter",
+                BindingFlags.Public | BindingFlags.Instance);
+            if (tiProp == null)
+                return ErrorJson("not_a_tag_station",
+                    stationPath + " exposes no TagImporter property on this Studio (station runtime type " +
+                    (station.GetType().FullName ?? station.GetType().Name) + "). " +
+                    ImportTagsDesignTimeProbe(station, stationPath));
+            // Use the station's own TagImporter, else add a temporary one (ftx-mcp-jku.1).
+            string ensureDetail;
+            IUANode tempImporter;
+            string ensured = ImportTagsEnsureImporter(station, stationPath, kind,
+                out tempImporter, out ensureDetail);
+            if (ensured == "failed")
+                return ErrorJson("import_failed",
+                    ensureDetail + ". " + ImportTagsDesignTimeProbe(station, stationPath) +
+                    ". " + ImportTagsUiStationHint);
+            string tempPath = tempImporter != null
+                ? stationPath.TrimEnd('/') + "/" + ImportTagsTempName : null;
+
+            // From here the temporary importer (if any) is deleted on every exit
+            // except import_timeout, where it is kept and reported.
+            string runJson;
+            bool timedOut = false;
+            try
+            {
+                runJson = ImportTagsRun(station, stationPath, kind, mode, tags, abs,
+                    timeoutS, tiProp, ensured, tempPath, replace, sourceSymbols, out timedOut);
+            }
+            catch (Exception ex)
+            { runJson = ErrorJson("import_failed", ex.GetBaseException().Message); }
+            if (tempImporter != null && !timedOut)
+            {
+                string del = ImportTagsDeleteNode(tempImporter, station);
+                if (del != null)
+                    runJson = ImportTagsAddLeftField(runJson, tempPath, del);
+            }
+            return runJson;
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson("import_failed", ex.GetBaseException().Message);
+        }
+    }
+
+    // Insert tag_importer_left (+ cleanup error) into a finished JSON reply when the
+    // temporary importer could not be deleted: into the error object of an error
+    // reply, else into the top-level object.
+    private static string ImportTagsAddLeftField(string json, string path, string cleanupError)
+    {
+        string extra = ",\"tag_importer_left\":\"" + JsonEscape(path) +
+                       "\",\"tag_importer_cleanup_error\":\"" + JsonEscape(cleanupError) + "\"";
+        int cut = json.StartsWith("{\"error\"", StringComparison.Ordinal)
+            ? json.Length - 2 : json.Length - 1;
+        return cut < 1 ? json : json.Substring(0, cut) + extra + json.Substring(cut);
+    }
+
+    // The import proper, against a usable station.TagImporter. `timedOut` is set when
+    // the importer was still running at the deadline (the caller then keeps a
+    // temporary importer). Throws are mapped to import_failed by the caller.
+    private string ImportTagsRun(IUANode station, string stationPath, string kind,
+        string mode, List<string> tags, string abs, double timeoutS, PropertyInfo tiProp,
+        string tagImporterState, string tempPath, bool replace, List<string> sourceSymbols,
+        out bool timedOut)
+    {
+            timedOut = false;
+            object importer;
+            try { importer = tiProp.GetValue(station); }
+            catch (TargetInvocationException tie)
+            {
+                // The SDK getter throws when the design-time TagImporter node is missing.
+                return ErrorJson("import_failed",
+                    "station.TagImporter getter threw: " + (tie.InnerException ?? tie).GetBaseException().Message +
+                    ". " + ImportTagsDesignTimeProbe(station, stationPath));
+            }
+            if (importer == null)
+                return ErrorJson("import_failed",
+                    stationPath + " returned a null TagImporter. " +
+                    ImportTagsDesignTimeProbe(station, stationPath));
+            var itype = importer.GetType();
+            var modeProp = ImportTagsFindProperty(itype, "Mode");
+            var fileProp = ImportTagsFindProperty(itype, "FilePath");
+            MethodInfo importM = null;
+            bool importTakesFilter = false;
+            ImportTagsFindImport(itype, tags.Count == 0, out importM, out importTakesFilter);
+            if (modeProp == null || fileProp == null || importM == null)
+            {
+                var missing = new List<string>();
+                if (modeProp == null) missing.Add("Mode");
+                if (fileProp == null) missing.Add("FilePath");
+                if (importM == null) missing.Add("Import(Func<string,string,bool>)" +
+                    (tags.Count == 0 ? " or Import()" : ""));
+                return ErrorJson("import_failed",
+                    "TagImporter API mismatch: missing " + string.Join(", ", missing) + ". " +
+                    ImportTagsDescribeImporter(importer) + ". " +
+                    ImportTagsDesignTimeProbe(station, stationPath));
+            }
+
+            // Snapshot BEFORE (the station's Tags subtree).
+            string tagsPath = stationPath.TrimEnd('/') + "/Tags";
+            var before = new Dictionary<string, string>(StringComparer.Ordinal);
+            ImportTagsSnapshot(ImportTagsRoot(station), tagsPath, before, 0);
+
+            // Would-remove guard: the importer rewrites the Tags tree from the file, so
+            // a station tag the file lacks is dropped whatever the filter says. Merge
+            // mode (replace=false) refuses before importing; the service sends the
+            // file's symbol names (offline mode only; online reads the controller).
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var v in before.Values) if (!string.IsNullOrEmpty(v)) present.Add(v);
+            if (!replace && sourceSymbols != null)
+            {
+                var wouldRemove = ImportTagsWouldRemove(present, sourceSymbols);
+                if (wouldRemove.Count > 0)
+                    return ErrorJson("would_remove_tags", ImportTagsStringArray(wouldRemove));
+            }
+
+            var matched = new List<string>();      // every symbol the filter kept
+            var requestedHit = new List<string>(); // ...that matched a requested tag
+            var matchedLock = new object();
+            Func<string, string, bool> filter = (symbolName, symbolType) =>
+            {
+                try
+                {
+                    // empty tags = import everything (only reachable via the delegate
+                    // overload when no parameterless Import() exists)
+                    bool req = tags.Count == 0 || ImportTagsSymbolMatches(symbolName, tags);
+                    bool keep = req || ImportTagsKeepsSymbol(symbolName, tags, present, replace);
+                    if (keep) lock (matchedLock)
+                    {
+                        matched.Add(symbolName);
+                        if (req) requestedHit.Add(symbolName);
+                    }
+                    return keep;
+                }
+                catch { return false; }
+            };
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            System.Threading.Tasks.Task task;
+            Exception waitEx = null;
+            bool finished;
+            using (station.Context.Sessions.ImpersonateRootTemporary())
+            {
+                var modeType = Nullable.GetUnderlyingType(modeProp.PropertyType) ?? modeProp.PropertyType;
+                modeProp.SetValue(importer,
+                    Enum.Parse(modeType, mode == "offline" ? "Offline" : "Online"));
+                if (abs != null)
+                {
+                    var fromAbs = fileProp.PropertyType.GetMethod("FromAbsoluteFilePath",
+                        BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+                    if (fromAbs == null)
+                        return ErrorJson("import_failed", "FilePath type has no FromAbsoluteFilePath");
+                    fileProp.SetValue(importer, fromAbs.Invoke(null, new object[] { abs }));
+                }
+                try
+                {
+                    object[] importArgs = importTakesFilter
+                        ? new object[] { ImportTagsBuildFilterDelegate(importM.GetParameters()[0].ParameterType, filter) }
+                        : new object[0];
+                    task = importM.Invoke(importer, importArgs) as System.Threading.Tasks.Task;
+                }
+                catch (TargetInvocationException tie)
+                {
+                    return ErrorJson("import_failed", (tie.InnerException ?? tie).GetBaseException().Message);
+                }
+                if (task == null)
+                    return ErrorJson("import_failed", "Import returned no Task");
+                try { finished = task.Wait(TimeSpan.FromSeconds(timeoutS)); }
+                catch (AggregateException ae) { finished = true; waitEx = ae.GetBaseException(); }
+            }
+            sw.Stop();
+
+            if (!finished)
+            {
+                timedOut = true;
+                string left = tempPath != null
+                    ? " tag_importer_left: " + tempPath : "";
+                string msg = "the importer did not finish within " +
+                    timeoutS.ToString("0.###", CultureInfo.InvariantCulture) +
+                    " s; it may still be running in Studio - check the station's Tags before retrying." +
+                    (tempPath != null ? " The temporary importer was kept." + left : "");
+                if (tempPath == null) return ErrorJson("import_timeout", msg);
+                return "{\"error\":{\"code\":\"import_timeout\",\"message\":\"" + JsonEscape(msg) +
+                       "\",\"tag_importer_left\":\"" + JsonEscape(tempPath) + "\"}}";
+            }
+            if (task.IsCanceled)
+                return ErrorJson("import_cancelled",
+                    waitEx != null ? waitEx.Message : "the import task was cancelled");
+            if (task.IsFaulted)
+            {
+                var be = waitEx ?? (task.Exception != null ? task.Exception.GetBaseException() : null);
+                return ErrorJson("import_failed", be != null ? be.Message : "the import task faulted");
+            }
+
+            // Snapshot AFTER, then the diff.
+            var after = new Dictionary<string, string>(StringComparer.Ordinal);
+            ImportTagsSnapshot(ImportTagsRoot(station), tagsPath, after, 0);
+            var added = after.Keys.Where(k => !before.ContainsKey(k)).OrderBy(k => k, StringComparer.Ordinal).ToList();
+            var already = before.Where(kv => ImportTagsSymbolMatches(kv.Value, tags))
+                                .Select(kv => kv.Key).OrderBy(k => k, StringComparer.Ordinal).ToList();
+            // removed = before - after (paths); skipped = symbols the filter matched
+            // for a requested tag that do not exist afterwards (unknown DataType ...).
+            var removed = before.Keys.Where(k => !after.ContainsKey(k))
+                                .OrderBy(k => k, StringComparer.Ordinal).ToList();
+            var afterSymbols = new HashSet<string>(after.Values, StringComparer.Ordinal);
+            List<string> seen, hit;
+            lock (matchedLock) { seen = new List<string>(matched); hit = new List<string>(requestedHit); }
+            var skippedItems = hit.Distinct(StringComparer.Ordinal)
+                .Where(sy => !afterSymbols.Contains(sy))
+                .OrderBy(sy => sy, StringComparer.Ordinal)
+                .Select(sy => "{\"symbol\":\"" + JsonEscape(sy) + "\",\"reason\":\"" +
+                    JsonEscape("matched the filter but no tag node exists after the import " +
+                               "(the importer skipped it, e.g. an unknown DataType)") + "\"}");
+            string skippedJson = "[" + string.Join(",", skippedItems) + "]";
+            var notFound = tags.Where(r => !seen.Any(sy =>
+                    sy == r || sy.StartsWith(r + ".", StringComparison.Ordinal))).ToList();
+
+            return "{\"ok\":true,\"station\":\"" + JsonEscape(stationPath) +
+                   "\",\"station_kind\":\"" + kind + "\",\"mode\":\"" + mode +
+                   "\",\"tag_importer\":\"" + tagImporterState +
+                   "\",\"added\":" + ImportTagsStringArray(added) +
+                   ",\"already_present\":" + ImportTagsStringArray(already) +
+                   ",\"not_found\":" + ImportTagsStringArray(notFound) +
+                   ",\"removed\":" + ImportTagsStringArray(removed) +
+                   ",\"skipped\":" + skippedJson +
+                   ",\"replace\":" + (replace ? "true" : "false") +
+                   ",\"matched_symbols\":" + seen.Count +
+                   ",\"elapsed_ms\":" + sw.ElapsedMilliseconds +
+                   ",\"via\":\"tag-importer\",\"thread\":\"http-bg\"}";
+    }
+
+    // Structural check for a translation key, shared by the route and validate_ops;
+    // null when acceptable. Mirrors core.validate_text_key_op on the Python side.
+    private static string TextKeyError(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return "key is empty";
+        if (key.Length > 256) return "key is longer than 256 characters";
+        if (key != key.Trim()) return "key has leading or trailing whitespace";
+        foreach (char c in key)
+            if (char.IsControl(c)) return "key contains a control character";
+        return null;
     }
 
     // ARRAY-WRITE GUARD (crash-safety). Array-typed UA variables (String[] like
@@ -3529,6 +5791,57 @@ public class StudioMCPBridge : BaseNetLogic
         public string Type;
     }
 
+    // The Kind a NodePointer aimed at a node created earlier in the batch will
+    // resolve to: the declared type when the create op carried one, else the
+    // default type of what that verb makes.
+    private static string HypoKindName(HypoNode h)
+    {
+        if (!string.IsNullOrEmpty(h.Type)) return h.Type;
+        switch (h.Verb)
+        {
+            case "create_folder": return "FolderType";
+            case "create_variable": return "BaseDataVariableType";
+            default: return "BaseObjectType";
+        }
+    }
+
+    // Child names a station type creates under its instance (PRD 0038 req. 8).
+    // Null when `typeName` is not an RA EtherNet/IP / TwinCAT station type. Uses
+    // the type's DECLARED children when the type node resolves (builtin catalog or
+    // project path) and always includes Tags and Types, which the station creates
+    // even when the declaration is not readable. Reflection-free: name based, so a
+    // 1.7 build has no static reference to the driver assemblies.
+    private List<string> HypoStationTypeChildren(string typeName)
+    {
+        if (string.IsNullOrEmpty(typeName)) return null;
+        string leaf = typeName.Substring(typeName.LastIndexOfAny(new[] { '/', '.' }) + 1);
+        if (!leaf.EndsWith("Station", StringComparison.Ordinal)) return null;
+        if (typeName.IndexOf("RAEtherNetIP", StringComparison.OrdinalIgnoreCase) < 0 &&
+            typeName.IndexOf("TwinCAT", StringComparison.OrdinalIgnoreCase) < 0) return null;
+        var names = new List<string>();
+        try
+        {
+            IUANode typeNode = null;
+            if (typeName.IndexOf('/') < 0)
+            {
+                bool viaBrowse;
+                var builtinId = ResolveUiTypeId(typeName, out viaBrowse);
+                if (builtinId != null)
+                {
+                    try { typeNode = InformationModel.Get(builtinId); } catch { typeNode = null; }
+                }
+            }
+            if (typeNode == null) typeNode = ResolveNode(typeName);
+            if (typeNode != null && typeNode.NodeClass == NodeClass.ObjectType)
+                foreach (var c in typeNode.Children)
+                    if (!string.IsNullOrEmpty(c.BrowseName)) names.Add(c.BrowseName);
+        }
+        catch { /* declaration unreadable: fall back to the known children */ }
+        foreach (var known in new[] { "Tags", "Types" })
+            if (!names.Contains(known, StringComparer.OrdinalIgnoreCase)) names.Add(known);
+        return names;
+    }
+
     // Resolve a path against the hypothetical tree: apply any relocated-prefix
     // rewrite, then check the created set, then fall back to the live model.
     // Returns the resolved (post-rewrite) path when the node exists in any of
@@ -3575,7 +5888,10 @@ public class StudioMCPBridge : BaseNetLogic
     {
         var errors = new StringBuilder();
         var warnings = new StringBuilder();
-        int errCount = 0, warnCount = 0, opCount = 0;
+        // Facts the validator resolved (NodePointer Kind) so a dry_run shows what
+        // apply will write, not just "clean".
+        var resolved = new StringBuilder();
+        int errCount = 0, warnCount = 0, opCount = 0, resolvedCount = 0;
 
         Action<int, string, string, string> addErr = (idx, code, msg, extra) =>
         {
@@ -3589,6 +5905,14 @@ public class StudioMCPBridge : BaseNetLogic
             if (warnCount++ > 0) warnings.Append(",");
             warnings.Append("{\"op_index\":" + idx + ",\"code\":\"" + JsonEscape(code) +
                             "\",\"message\":\"" + JsonEscape(msg) + "\"}");
+        };
+        // Same as addWarn plus extra raw JSON members (e.g. "routed_path":"...").
+        Action<int, string, string, string> addWarnX = (idx, code, msg, extra) =>
+        {
+            if (warnCount++ > 0) warnings.Append(",");
+            warnings.Append("{\"op_index\":" + idx + ",\"code\":\"" + JsonEscape(code) +
+                            "\",\"message\":\"" + JsonEscape(msg) + "\"" +
+                            (string.IsNullOrEmpty(extra) ? "" : "," + extra) + "}");
         };
 
         try
@@ -3614,6 +5938,9 @@ public class StudioMCPBridge : BaseNetLogic
                 var deleted  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 // relocated: old absolute path -> new absolute path, filled by move ops.
                 var relocated = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                // Translation keys this batch adds, so "add_translations then
+                // remove_translation" reaches the not_supported refusal, not not_found.
+                var txAdded = new HashSet<string>(StringComparer.Ordinal);
 
                 // PRE-PASS: every path this batch creates, regardless of position.
                 // The sequential `created` set above is what decides validity (a
@@ -3686,7 +6013,164 @@ public class StudioMCPBridge : BaseNetLogic
                                 break;
                             }
                             ValidateOnNode(idx, verb, path, name, value, created, deleted,
-                                           relocated, willCreate, addErr, addWarn);
+                                           relocated, willCreate, addErr, addWarn,
+                                           JsonStr(op, "typed") == "string[]");
+                            break;
+
+                        case "set_text_key":
+                            {
+                                string tkKey = JsonStr(op, "key");
+                                if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name))
+                                { addErr(idx, "bad_op", verb + " requires \"path\" and \"name\"", null); break; }
+                                if (IsNodeAttributeName(name))
+                                { addErr(idx, "node_attribute_not_settable",
+                                         name + " is a node attribute; set_text_key never writes attributes", null); break; }
+                                if (string.IsNullOrEmpty(tkKey))
+                                { addErr(idx, "text_key_missing", verb + " requires \"key\"", null); break; }
+                                string tkErr = TextKeyError(tkKey);
+                                if (tkErr != null)
+                                { addErr(idx, "invalid_text_key", tkErr, null); break; }
+                                if (!string.IsNullOrEmpty(path) && relocated.ContainsKey(path))
+                                {
+                                    addErr(idx, "moved_earlier_in_batch",
+                                           verb + " targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')",
+                                           null);
+                                    break;
+                                }
+                                ValidateOnNode(idx, verb, path, name, null, created, deleted,
+                                               relocated, willCreate, addErr, addWarn);
+                            }
+                            break;
+
+                        case "set_modelling_rule":
+                            {
+                                string mrRule = JsonStr(op, "rule");
+                                if (string.IsNullOrEmpty(path))
+                                { addErr(idx, "bad_op", verb + " requires \"path\"", null); break; }
+                                if (string.IsNullOrEmpty(mrRule))
+                                { addErr(idx, "bad_op", verb + " requires \"rule\" (Mandatory / Optional / None)", null); break; }
+                                if (CanonModellingRule(mrRule) == null)
+                                { addErr(idx, "invalid_modelling_rule",
+                                         "modelling rule '" + mrRule + "' is not one of Mandatory, Optional, None", null); break; }
+                                if (deleted.Contains(path))
+                                { addErr(idx, "modifies_deleted_node", verb + " targets '" + path + "', deleted earlier in this batch", null); break; }
+                                if (relocated.ContainsKey(path))
+                                { addErr(idx, "moved_earlier_in_batch",
+                                         verb + " targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+                                var mrLive = ResolveNode(path);
+                                if (mrLive == null)
+                                {
+                                    if (HypoResolve(path, created, relocated) == null)
+                                        addErr(idx, "unresolved_reference",
+                                               "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                                }
+                                else if (!IsTypeMember(mrLive))
+                                    addErr(idx, "not_a_type_member",
+                                           "'" + path + "' is not a member of an ObjectType/VariableType", null);
+                            }
+                            break;
+
+                        case "import_tags":
+                            {
+                                // Argument shape only (the service validates the same
+                                // fields first); the importer itself runs at apply time.
+                                string itStation = JsonStr(op, "station");
+                                string itMode = JsonStr(op, "mode");
+                                System.Text.Json.JsonElement itTags;
+                                if (string.IsNullOrEmpty(itStation))
+                                { addErr(idx, "bad_op", verb + " requires \"station\"", null); break; }
+                                if (itMode == null || (!itMode.Equals("offline", StringComparison.OrdinalIgnoreCase) &&
+                                                       !itMode.Equals("online", StringComparison.OrdinalIgnoreCase)))
+                                { addErr(idx, "invalid_mode", verb + " \"mode\" must be offline or online", null); break; }
+                                if (itMode.Equals("offline", StringComparison.OrdinalIgnoreCase) &&
+                                    string.IsNullOrEmpty(JsonStr(op, "file")))
+                                { addErr(idx, "bad_op", verb + " offline mode requires \"file\"", null); break; }
+                                if (!op.TryGetProperty("tags", out itTags) ||
+                                    itTags.ValueKind != System.Text.Json.JsonValueKind.Array ||
+                                    itTags.GetArrayLength() == 0)
+                                { addErr(idx, "bad_op", verb + " requires a non-empty \"tags\" array", null); break; }
+                                if (deleted.Contains(itStation))
+                                { addErr(idx, "modifies_deleted_node", verb + " targets '" + itStation + "', deleted earlier in this batch", null); break; }
+                                var itLive = ResolveNode(itStation);
+                                if (itLive == null)
+                                {
+                                    if (HypoResolve(itStation, created, relocated) == null)
+                                        addErr(idx, "unresolved_reference",
+                                               "no node at '" + itStation + "'" + NearestHint(itStation, willCreate), null);
+                                }
+                                else
+                                {
+                                    // Same gate as the apply route (ImportTagsInline): an RA
+                                    // station on Studio < 1.8 is refused at dry run too, not
+                                    // only at apply. A station created earlier in this batch
+                                    // has no CLR type yet, so it is gated at apply.
+                                    string itKind = ImportTagsStationKind(itLive);
+                                    string itVer = StudioVersionString();
+                                    if (itKind != null && ImportTagsVersionGate(itKind, itVer) != null)
+                                        addErr(idx, "requires_optix_1_8",
+                                               "the RA EtherNet/IP tag importer needs Optix Studio 1.8 or newer (running " +
+                                               itVer + "); TwinCAT stations import from 1.7",
+                                               "\"field\":\"station\"");
+                                }
+                            }
+                            break;
+
+                        case "add_translations":
+                            {
+                                System.Text.Json.JsonElement txRows;
+                                if (!op.TryGetProperty("rows", out txRows) ||
+                                    txRows.ValueKind != System.Text.Json.JsonValueKind.Array ||
+                                    txRows.GetArrayLength() == 0)
+                                { addErr(idx, "rows_empty", verb + " requires a non-empty \"rows\" array", null); break; }
+                                string txDef = JsonStr(op, "locale") ?? "en-US";
+                                var txSeen = new HashSet<string>(StringComparer.Ordinal);
+                                string txDictPath;
+                                var txAvail = DictionaryLocales(out txDictPath);
+                                var txKeys = new List<string>();
+                                int ri = 0;
+                                bool txBad = false;
+                                foreach (var row in txRows.EnumerateArray())
+                                {
+                                    if (row.ValueKind != System.Text.Json.JsonValueKind.Object)
+                                    { addErr(idx, "row_not_an_object", "rows[" + ri + "] must be an object", null); txBad = true; ri++; continue; }
+                                    string rk = JsonStr(row, "key");
+                                    string rl = JsonStr(row, "locale") ?? txDef;
+                                    string rerr = TranslationRowError(rk, JsonStr(row, "value"), rl);
+                                    if (rerr != null)
+                                    { addErr(idx, "invalid_translation_row", "rows[" + ri + "]: " + rerr, null); txBad = true; }
+                                    else if (!txSeen.Add(rk + "\u0001" + rl))
+                                    { addErr(idx, "duplicate_row", "rows[" + ri + "] repeats key '" + rk + "' for locale '" + rl + "'", null); txBad = true; }
+                                    else
+                                    {
+                                        if (txAvail == null)
+                                        { addErr(idx, "locale_check_unavailable", "rows[" + ri + "]: cannot verify locale '" + rl + "': no locale list could be read from the translation dictionary '" + txDictPath + "'",
+                                                 "\"row\":" + ri + ",\"locale\":\"" + JsonEscape(rl) + "\",\"dictionary_path\":\"" + JsonEscape(txDictPath) + "\""); txBad = true; }
+                                        else if (!LocaleKnown(txAvail, rl))
+                                        { addErr(idx, "unknown_locale", "rows[" + ri + "]: locale '" + rl + "' is not a locale of the translation dictionary (available: " + string.Join(", ", txAvail) + ")",
+                                                 "\"row\":" + ri + ",\"locale\":\"" + JsonEscape(rl) + "\",\"available_locales\":" + JsonStringArray(txAvail)); txBad = true; }
+                                        txKeys.Add(rk);
+                                    }
+                                    ri++;
+                                }
+                                if (!txBad)
+                                    foreach (var rk2 in txKeys) txAdded.Add(rk2);
+                            }
+                            break;
+
+                        case "remove_translation":
+                            {
+                                string rmKey = JsonStr(op, "key");
+                                if (string.IsNullOrEmpty(rmKey))
+                                { addErr(idx, "bad_op", verb + " requires \"key\"", null); break; }
+                                string rmErr = TextKeyError(rmKey);
+                                if (rmErr != null)
+                                { addErr(idx, "invalid_text_key", rmErr, null); break; }
+                                if (!txAdded.Contains(rmKey) && !TranslationRowExists(rmKey))
+                                { addErr(idx, "translation_not_found", "no translation row for key '" + rmKey + "'", null); break; }
+                                // The row exists (or was added earlier in this batch), but the SDK
+                                // cannot remove it: refused, so apply never starts.
+                                addErr(idx, "not_supported", RemoveTranslationNotSupported, null);
+                            }
                             break;
 
                         case "delete":
@@ -3715,10 +6199,63 @@ public class StudioMCPBridge : BaseNetLogic
                                 if (relocated.ContainsKey(path))
                                 { addErr(idx, "moved_earlier_in_batch",
                                          "retype targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
+                                string rtDt = JsonStr(op, "datatype");
+                                if (string.IsNullOrEmpty(rtDt))
+                                { addErr(idx, "bad_op", "retype requires \"datatype\"", null); break; }
+                                if (RetypeClrType(rtDt) == null)
+                                { addErr(idx, "invalid_datatype", "unsupported retype datatype '" + rtDt +
+                                         "' - one of Boolean, Int16, Int32, Int64, UInt16, UInt32, UInt64, Float, Double, String, DateTime, LocalizedText", null); break; }
                                 // retype allows loose resolution (slash-in-BrowseName)
-                                if (ResolveNodeLoose(path) == null && HypoResolve(path, created, relocated) == null)
-                                    addErr(idx, "unresolved_reference",
-                                           "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                                var rtLive = ResolveNodeLoose(path);
+                                if (rtLive == null)
+                                {
+                                    if (HypoResolve(path, created, relocated) == null)
+                                        addErr(idx, "unresolved_reference",
+                                               "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                                }
+                                else if (rtDt == "LocalizedText")
+                                {
+                                    var rtVar = rtLive as IUAVariable;
+                                    if (rtVar == null)
+                                        addErr(idx, "not_a_variable", "'" + path + "' is not a variable", null);
+                                    else
+                                    {
+                                        string rtOldDt = "?";
+                                        try { rtOldDt = rtVar.Context.GetDataType(rtVar.DataType).BrowseName; } catch { }
+                                        object rtOldVal = null;
+                                        try { var rtUv = rtVar.Value; rtOldVal = rtUv == null ? null : rtUv.Value; } catch { }
+                                        string rtDims = JsonStr(op, "dims");
+                                        bool rtToArray = IsArrayVariable(rtVar);
+                                        if (!string.IsNullOrEmpty(rtDims))
+                                            rtToArray = !(rtDims == "scalar" || rtDims == "0");
+                                        string rtWhy = LocalizedTextRetypeRefusal(rtOldDt, rtOldVal, rtToArray);
+                                        if (rtWhy != null)
+                                            addErr(idx, "value_not_convertible",
+                                                   "'" + path + "' (" + rtOldDt + ") cannot be retyped to LocalizedText: " + rtWhy, null);
+                                    }
+                                }
+                                // #73: unconvertible current values refuse the op unless it
+                                // carries allow_value_loss:true (same check as the retype route).
+                                if (rtLive != null && rtDt != "LocalizedText" &&
+                                    JsonStr(op, "allow_value_loss") != "true")
+                                {
+                                    var rtV2 = rtLive as IUAVariable;
+                                    if (rtV2 != null)
+                                    {
+                                        object rtVal2 = null;
+                                        try { var rtUv2 = rtV2.Value; rtVal2 = rtUv2 == null ? null : rtUv2.Value; } catch { }
+                                        Type rtClr2 = RetypeClrType(rtDt);
+                                        int rtBad = 0;
+                                        var rtArr2 = rtVal2 as Array;
+                                        if (rtArr2 != null)
+                                        { foreach (var rtE in rtArr2) if (!RetypeConvertible(rtE, rtDt, rtClr2)) rtBad++; }
+                                        else if (!RetypeConvertible(rtVal2, rtDt, rtClr2)) rtBad++;
+                                        if (rtBad > 0)
+                                            addErr(idx, "value_unconvertible",
+                                                   "'" + path + "' has " + rtBad + " value(s) that cannot be converted to " + rtDt +
+                                                   " and would be reset to its default; pass allow_value_loss:true to accept", null);
+                                    }
+                                }
                             }
                             break;
 
@@ -3733,8 +6270,18 @@ public class StudioMCPBridge : BaseNetLogic
                                 { addErr(idx, "moved_earlier_in_batch",
                                          verb + " targets '" + path + "', which was moved earlier in this batch (now at '" + relocated[path] + "')", null); break; }
                                 if (HypoResolve(path, created, relocated) == null)
+                                {
                                     addErr(idx, "unresolved_reference",
                                            "no node at '" + path + "'" + NearestHint(path, willCreate), null);
+                                    break;
+                                }
+                                // Multi-step form: validate the list and every call's
+                                // target against the hypothetical model.
+                                if (verb == "wire_event")
+                                {
+                                    ValidateWireTargetOp(idx, op, path, created, addErr);
+                                    ValidateWireCallsOp(idx, op, created, relocated, willCreate, addErr);
+                                }
                             }
                             break;
 
@@ -3760,10 +6307,20 @@ public class StudioMCPBridge : BaseNetLogic
                                 // MoveNodeInline): a batch must fail the NetLogic
                                 // move in the DRY RUN, not discover it by losing
                                 // the Studio session mid-apply.
-                                if (live != null && IsNetLogicNode(live))
+                                if (live != null)
                                 {
-                                    addErr(idx, "refused_netlogic_move", NetLogicMoveMessage(path), null);
-                                    break;
+                                    string subKind;
+                                    string subPath = FindUnsafeSubtree(live, out subKind);
+                                    if (subPath != null)
+                                    {
+                                        addErr(idx,
+                                               SubtreeRefusalCode(subKind, subPath == NodePathOf(live), true),
+                                               SubtreeRefusalMessage(subKind,
+                                                   subPath == NodePathOf(live) ? path : subPath, path, "move",
+                                                   !string.IsNullOrEmpty(JsonStr(op, "new_name"))),
+                                               null);
+                                        break;
+                                    }
                                 }
 
                                 // Determine the destination.
@@ -3865,8 +6422,101 @@ public class StudioMCPBridge : BaseNetLogic
                                 if (ResolveNode(newPath) != null && !deleted.Contains(newPath))
                                     addWarn(idx, "already_exists",
                                             "'" + newPath + "' already exists in the live model; the create may collide");
+                                // variable_type_not_object for create_object is reported by the
+                                // service validator (validate_create_object_op); the bridge must
+                                // not add it again here (ftx-mcp-aaw.6). The direct
+                                // /bridge/model/object route still refuses it.
+                                if (verb == "create_variable")
+                                {
+                                    string cvDt = JsonStr(op, "datatype");
+                                    string cvTarget = JsonStr(op, "target");
+                                    string cvKind = JsonStr(op, "kind");
+                                    if (IsNodePointerDataType(cvDt))
+                                    {
+                                        string kName = null, kCode = null, kMsg = null;
+                                        string hypoTarget = string.IsNullOrEmpty(cvTarget) ? null
+                                            : HypoResolve(cvTarget, created, relocated);
+                                        HypoNode hypoTgt;
+                                        if (string.IsNullOrEmpty(cvKind) && hypoTarget != null &&
+                                            ResolveNode(hypoTarget) == null &&
+                                            created.TryGetValue(hypoTarget, out hypoTgt))
+                                        {
+                                            // Target is created earlier in THIS batch: its
+                                            // Kind is the type that earlier op will give it.
+                                            kName = HypoKindName(hypoTgt);
+                                        }
+                                        else
+                                        {
+                                            IUANode kTarget; NodeId kId;
+                                            if (!ResolveNodePointerKind(cvTarget, cvKind, out kTarget,
+                                                    out kId, out kName, out kCode, out kMsg))
+                                            {
+                                                addErr(idx, kCode, "create_variable NodePointer '" + newPath + "': " + kMsg, null);
+                                                kName = null;
+                                            }
+                                        }
+                                        if (kName != null)
+                                        {
+                                            if (resolvedCount++ > 0) resolved.Append(",");
+                                            resolved.Append("{\"op_index\":" + idx + ",\"path\":\"" +
+                                                JsonEscape(newPath) + "\",\"datatype\":\"NodePointer\",\"kind\":\"" +
+                                                JsonEscape(kName) + "\"}");
+                                        }
+                                    }
+                                    else if (!string.IsNullOrEmpty(cvTarget) || !string.IsNullOrEmpty(cvKind))
+                                    {
+                                        addErr(idx, "kind_not_applicable",
+                                               "target/kind only apply to datatype NodePointer", null);
+                                    }
+                                    // 1.0.9 5b extras: same resolution as the write path.
+                                    string cvVt = JsonStr(op, "variable_type");
+                                    string cvDims = null;
+                                    System.Text.Json.JsonElement cvDimsEl;
+                                    if (op.TryGetProperty("array_dimensions", out cvDimsEl))
+                                        cvDims = cvDimsEl.ValueKind == System.Text.Json.JsonValueKind.Array
+                                            ? (cvDimsEl.GetArrayLength() == 1 ? cvDimsEl[0].GetRawText() : "x")
+                                            : JsonStr(op, "array_dimensions");
+                                    string cvProps = null;
+                                    System.Text.Json.JsonElement cvPropsEl;
+                                    if (op.TryGetProperty("properties", out cvPropsEl) &&
+                                        cvPropsEl.ValueKind != System.Text.Json.JsonValueKind.Null)
+                                        cvProps = cvPropsEl.GetRawText();
+                                    if (!string.IsNullOrEmpty(cvVt) || !string.IsNullOrEmpty(cvDims) || !string.IsNullOrEmpty(cvProps))
+                                    {
+                                        IUANode xVt; NodeId xId; uint[] xDims;
+                                        List<KeyValuePair<string, string>> xProps; List<NodeId> xTypes;
+                                        string xErr = PrepareVariableExtras(cvVt, cvDims, cvProps,
+                                            out xVt, out xId, out xDims, out xProps, out xTypes);
+                                        if (xErr != null)
+                                        {
+                                            string xCode = "bad_op", xMsg = xErr;
+                                            try
+                                            {
+                                                using (var xd = System.Text.Json.JsonDocument.Parse(xErr))
+                                                {
+                                                    var xe = xd.RootElement.GetProperty("error");
+                                                    xCode = xe.GetProperty("code").GetString();
+                                                    xMsg = xe.GetProperty("message").GetString();
+                                                }
+                                            }
+                                            catch { }
+                                            addErr(idx, xCode, "create_variable '" + newPath + "': " + xMsg, null);
+                                        }
+                                    }
+                                }
                                 created[newPath] = new HypoNode { Verb = verb, Type = typeName ?? "" };
                                 deleted.Remove(newPath);
+                                // A station type creates its Tags/Types (declared) children
+                                // with the instance, so a later create under <station>/Tags
+                                // in this batch resolves (PRD 0038 req. 8).
+                                if (verb == "create_object" || verb == "create_node")
+                                {
+                                    var stChildren = HypoStationTypeChildren(typeName);
+                                    if (stChildren != null)
+                                        foreach (var stc in stChildren)
+                                            if (!created.ContainsKey(newPath + "/" + stc))
+                                                created[newPath + "/" + stc] = new HypoNode { Verb = "type_child", Type = "" };
+                                }
                             }
                             break;
 
@@ -3948,10 +6598,11 @@ public class StudioMCPBridge : BaseNetLogic
                                         {
                                             // Widget will be routed into the collection.
                                             recordedPath = parentPath.TrimEnd('/') + "/" + routes[0] + "/" + name;
-                                            addWarn(idx, "routed_into_collection",
+                                            addWarnX(idx, "routed_into_collection",
                                                     "create_widget will place '" + name + "' into collection '" +
                                                     routes[0] + "' on '" + parentPath +
-                                                    "'; effective path will be '" + recordedPath + "'");
+                                                    "'; effective path will be '" + recordedPath + "'",
+                                                    "\"routed_path\":\"" + JsonEscape(recordedPath) + "\"");
                                         }
                                     }
                                 }
@@ -3962,6 +6613,29 @@ public class StudioMCPBridge : BaseNetLogic
                                             "'" + recordedPath + "' already exists in the live model; the create may collide");
                                 created[recordedPath] = new HypoNode { Verb = verb, Type = typeName ?? "" };
                                 deleted.Remove(recordedPath);
+                            }
+                            break;
+
+                        case "create_netlogic":
+                            {
+                                // PRD 0053 D3: known to the validator, so no unknown_op
+                                // warning; a parent that exists neither live nor earlier
+                                // in the batch is refused here (dry_run included).
+                                string nlName = JsonStr(op, "name");
+                                string nlParent = JsonStr(op, "parent");
+                                if (string.IsNullOrEmpty(nlName) || string.IsNullOrEmpty(nlParent))
+                                { addErr(idx, "bad_op", verb + " requires \"parent\" and \"name\"", null); break; }
+                                string nlPath = nlParent.TrimEnd('/') + "/" + nlName;
+                                if (created.ContainsKey(nlPath))
+                                { addErr(idx, "duplicate_create", "'" + nlPath + "' is created twice in this batch", null); break; }
+                                if (deleted.Contains(nlParent))
+                                { addErr(idx, "modifies_deleted_node",
+                                         "parent '" + nlParent + "' is deleted earlier in this batch", null); break; }
+                                if (HypoResolve(nlParent, created, relocated) == null)
+                                { addErr(idx, "unresolved_reference",
+                                         "no parent node at '" + nlParent + "'" + NearestHint(nlParent, willCreate), null); break; }
+                                created[nlPath] = new HypoNode { Verb = verb, Type = "NetLogic" };
+                                deleted.Remove(nlPath);
                             }
                             break;
 
@@ -3983,7 +6657,8 @@ public class StudioMCPBridge : BaseNetLogic
                 bool ok = errCount == 0;
                 return "{\"ok\":" + Bool(ok) + ",\"op_count\":" + opCount +
                        ",\"strict\":" + Bool(strict) +
-                       ",\"errors\":[" + errors + "],\"warnings\":[" + warnings + "]}";
+                       ",\"errors\":[" + errors + "],\"warnings\":[" + warnings + "]" +
+                       ",\"resolved\":[" + resolved + "]}";
             }
         }
         catch (System.Text.Json.JsonException jx)
@@ -4004,7 +6679,8 @@ public class StudioMCPBridge : BaseNetLogic
         Dictionary<string, string> relocated,
         List<string> willCreate,
         Action<int, string, string, string> addErr,
-        Action<int, string, string> addWarn)
+        Action<int, string, string> addWarn,
+        bool typedStringArray = false)
     {
         if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(name))
         {
@@ -4131,6 +6807,17 @@ public class StudioMCPBridge : BaseNetLogic
             return;
         }
         var arrGate = DeclaredArrayGuard(node, name);
+        if (arrGate != null && verb == "set_property" && typedStringArray
+            && IsGridStringArrayProperty(name) && IsGridLayoutNode(node))
+        {
+            // Typed string[] path (1.0.9 #3): same narrow waiver as the write
+            // route - GridLayout Rows/Columns, marked typed=string[] by the
+            // service, value a JSON array of strings. Nothing else is waived.
+            string[] gitems;
+            string gerr = ParseStringArray(value, out gitems);
+            if (gerr != null) addErr(idx, "bad_value", gerr, null);
+            return;
+        }
         if (arrGate != null)
         {
             // Also a whole {"error":{...}} object - carry it structurally rather
@@ -4139,6 +6826,16 @@ public class StudioMCPBridge : BaseNetLogic
                    "property '" + name + "' on " + node.GetType().Name +
                    " is array-typed; array writes are not supported via set_property",
                    "\"guard\":" + arrGate);
+            return;
+        }
+        if (verb == "set_text_key")
+        {
+            var tv = node.GetVariable(name);
+            if (tv != null && DataTypeName(tv) != "LocalizedText")
+                addErr(idx, "not_localized_text",
+                       "property '" + name + "' is " + DataTypeName(tv) +
+                       ", not LocalizedText; only a LocalizedText property can hold a translation key", null);
+            // A declared-but-unmaterialized property cannot be type-checked until apply.
             return;
         }
         if (verb == "set_property" && value != null)
@@ -4388,7 +7085,7 @@ public class StudioMCPBridge : BaseNetLogic
                "\",\"name\":\"" + JsonEscape(name) +
                "\",\"datatype\":\"" + JsonEscape(dt) +
                "\",\"via\":\"" + via + "\",\"value\":\"" + JsonEscape(ValueString(v)) +
-               "\",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
+               "\"" + LinkTargetJson(v) + ",\"mode\":\"inline\",\"thread\":\"http-bg\"}";
     }
 
     // Assign an enum/unknown-datatype property from its string form.
@@ -4749,13 +7446,532 @@ public class StudioMCPBridge : BaseNetLogic
         try
         {
             int nsIdx = Project.Current.NodeId.NamespaceIndex;
-            var existing = InformationModel.LookupTranslation(new LocalizedText(key));
-            bool isNew = existing == null || string.IsNullOrEmpty(existing.Text);
             var lt = new LocalizedText(nsIdx, key, value, locale);
-            if (isNew) InformationModel.AddTranslation(lt);
-            else InformationModel.SetTranslation(lt);
+            bool isNew = UpsertTranslation(lt, locale, value);
             return "{\"ok\":true,\"key\":\"" + JsonEscape(key) + "\",\"locale\":\"" + JsonEscape(locale) +
                    "\",\"new\":" + Bool(isNew) + ",\"via\":\"translation\"}";
+        }
+        catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // Rows this bridge wrote (added or updated) through UpsertTranslation:
+    // key -> locale -> text. LookupTranslation can miss a row that is really in the
+    // table (it is probed without the project namespace / the row's locale, or the
+    // text for the looked-up locale is empty), so every existence check ALSO trusts
+    // what the bridge itself wrote. set_text_key, add_translation(s) and
+    // remove_translation all use this one record, so `translated` cannot disagree
+    // with the "was this row new?" answer of add_translation.
+    private static readonly System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>
+        TranslationRowsWritten = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string>>(StringComparer.Ordinal);
+
+    // Raw SDK lookup: the row's text for `key` (in `locale` when given), or null.
+    // Probes the project-namespaced id first (how rows are written), then the bare id.
+    private static string TranslationLookupText(string key, string locale)
+    {
+        try
+        {
+            int ns = Project.Current.NodeId.NamespaceIndex;
+            if (!string.IsNullOrEmpty(locale))
+            {
+                // A specific locale: only that locale's row counts.
+                var t = InformationModel.LookupTranslation(new LocalizedText(ns, key, "", locale));
+                if (t != null && !string.IsNullOrEmpty(t.Text)) return t.Text;
+                // Not found through the SDK: rows written in Studio / by the template
+                // are found by scanning the Value matrix (key column 0, locale column j).
+                string mt0 = MatrixText(key, locale);
+                return string.IsNullOrEmpty(mt0) ? null : mt0;
+            }
+            var any = InformationModel.LookupTranslation(new LocalizedText(ns, key, "", "en-US"));
+            if (any != null && !string.IsNullOrEmpty(any.Text)) return any.Text;
+        }
+        catch { }
+        try
+        {
+            var bare = InformationModel.LookupTranslation(new LocalizedText(key));
+            if (bare != null && !string.IsNullOrEmpty(bare.Text)) return bare.Text;
+        }
+        catch { }
+        // Rows written in Studio or by the template: scan the dictionary's Value
+        // matrix (key column 0, locale column j).
+        if (!string.IsNullOrEmpty(locale))
+        {
+            string mt = MatrixText(key, locale);
+            return string.IsNullOrEmpty(mt) ? null : mt;
+        }
+        string pth;
+        var m = ReadValueMatrix(out pth);
+        if (m != null)
+            foreach (var loc in MatrixHeaderLocales(m))
+            {
+                string any2 = MatrixText(key, loc);
+                if (!string.IsNullOrEmpty(any2)) return any2;
+            }
+        return null;
+    }
+
+    private static bool TranslationLookupHit(string key)
+    {
+        return TranslationLookupText(key, null) != null;
+    }
+
+    // Locales that hold a row for `key`: what this bridge wrote plus a lookup per
+    // dictionary locale. Empty when the key has no row at all.
+    private static System.Collections.Generic.List<string> TranslationLocalesFor(string key)
+    {
+        var found = new System.Collections.Generic.List<string>();
+        lock (TranslationRowsWritten)
+        {
+            System.Collections.Generic.Dictionary<string, string> byLoc;
+            if (TranslationRowsWritten.TryGetValue(key, out byLoc))
+                foreach (var kv in byLoc) found.Add(kv.Key);
+        }
+        var avail = DictionaryLocales();
+        if (avail != null)
+            foreach (var loc in avail)
+                if (!found.Contains(loc, StringComparer.OrdinalIgnoreCase) && TranslationLookupText(key, loc) != null)
+                    found.Add(loc);
+        return found;
+    }
+
+    // THE existence check for translation rows. Both remove_translation paths (the inline
+    // /bridge/i18n/translation/remove route and the batch validate_ops case), the
+    // add_translation(s) "new?" answer and set_text_key's `translated` use it, so a
+    // key that was added or updated answers the same everywhere and an unknown key
+    // answers translation_not_found.
+    private static bool TranslationRowExists(string key)
+    {
+        if (TranslationLookupHit(key)) return true;
+        lock (TranslationRowsWritten) { if (TranslationRowsWritten.ContainsKey(key)) return true; }
+        return MatrixHasKey(key);   // a row Studio/the template wrote with empty cells
+    }
+
+    private static void NoteTranslationWritten(string key, string locale, string text)
+    {
+        lock (TranslationRowsWritten)
+        {
+            System.Collections.Generic.Dictionary<string, string> byLoc;
+            if (!TranslationRowsWritten.TryGetValue(key, out byLoc))
+                TranslationRowsWritten[key] = byLoc = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            byLoc[locale ?? "en-US"] = text ?? "";
+        }
+    }
+
+    // The text this bridge wrote for key in locale (else any locale), or null.
+    private static string TranslationWrittenText(string key, string locale)
+    {
+        lock (TranslationRowsWritten)
+        {
+            System.Collections.Generic.Dictionary<string, string> byLoc;
+            if (!TranslationRowsWritten.TryGetValue(key, out byLoc)) return null;
+            string t;
+            if (locale != null && byLoc.TryGetValue(locale, out t)) return t;
+            foreach (var kv in byLoc) return kv.Value;
+        }
+        return null;
+    }
+
+    // ---- translation dictionary layout (1.7 vs 1.8) ---------------------------
+    //
+    // The project's LocalizationDictionary hangs under the "Translations" node
+    // (dictionary object(s) such as LocalizationDictionary1, or the node itself).
+    //
+    //   Studio 1.8: the locales are NOT separate variables. The dictionary's `Value`
+    //   variable is a string matrix. Row 0 is the HEADER row: column 0 is the key
+    //   column (its header cell is a label, not a locale) and columns 1..n hold the
+    //   locale ids ("en-US", "de-DE", ...). Every row i >= 1 is one translation:
+    //   column 0 = text id (key), column j = the text for the locale in header[j]
+    //   (empty cell = no text for that locale).
+    //
+    //          | col 0 (key) | col 1 "en-US" | col 2 "de-DE"
+    //     -----+-------------+---------------+--------------
+    //     row 0| (header)    | en-US         | de-DE
+    //     row 1| greeting    | Hello         | Hallo
+    //
+    //   Observed node shape (1.7.4 and 1.8.0): the dictionary is ONE variable node,
+    //   not an object with a `Value` child:
+    //     name        LocalizationDictionary1   (child of Translations)
+    //     node_class  Variable
+    //     datatype    String[]
+    //     value       System.String[,]          (the matrix above)
+    //   So the matrix is the node's OWN value (IUAVariable.Value.Value); a child
+    //   variable called `Value` does not exist on it. ReadValueMatrix reads the
+    //   node's own value first and looks for a child `Value` only on non-variables.
+    //
+    //   Unobserved (a guess, not seen on 1.7.4 or 1.8.0): the locales exposed as a
+    //   `Locales` / `LocaleIds` variable on the node. That path is kept as a
+    //   fallback (it is probed before the header read and is a no-op when those
+    //   variables are absent or empty); the matrix header is the known source. Nothing here uses reflection or 1.8-only types, so the
+    //   same source compiles on 1.7 and 1.8.
+    //
+    // The matrix may surface as a rank-2 Array or as an array of rows (jagged /
+    // IEnumerable of IEnumerable); both are read. Cells may be string or LocalizedText.
+
+    private static string CellText(object o)
+    {
+        if (o == null) return "";
+        var lt = o as LocalizedText;
+        if (lt != null) return lt.Text ?? "";
+        return o.ToString() ?? "";
+    }
+
+    // The dictionary node(s) to inspect: the Translations node, then its children.
+    private static System.Collections.Generic.List<IUANode> DictionaryNodes()
+    {
+        var res = new System.Collections.Generic.List<IUANode>();
+        try
+        {
+            var tr = Project.Current.Get("Translations");
+            if (tr == null) return res;
+            res.Add(tr);
+            foreach (var c in tr.Children) res.Add(c);
+        }
+        catch { }
+        return res;
+    }
+
+    // The Value matrix as rows of strings (row 0 = header), or null when no
+    // dictionary node exposes one. `path` receives the project path of the node
+    // that holds it (else of the Translations node, else "Translations").
+    private static string[][] ReadValueMatrix(out string path)
+    {
+        path = "Translations";
+        try
+        {
+            var nodes = DictionaryNodes();
+            if (nodes.Count > 0) path = NodePathOf(nodes[0]) ?? "Translations";
+            foreach (var n in nodes)
+            {
+                // The dictionary node IS the variable: read its own value. A child
+                // `Value` variable is tried only when the node is not a variable.
+                object raw = null;
+                var uv = n as IUAVariable;
+                if (uv != null) raw = uv.Value.Value;
+                else
+                {
+                    IUAVariable v = null;
+                    try { v = n.GetVariable("Value"); } catch { }
+                    if (v == null) continue;
+                    raw = v.Value.Value;
+                }
+                var rows = new System.Collections.Generic.List<string[]>();
+                var arr = raw as Array;
+                if (arr != null && arr.Rank == 2)
+                {
+                    int r0 = arr.GetLowerBound(0), c0 = arr.GetLowerBound(1);
+                    for (int i = 0; i < arr.GetLength(0); i++)
+                    {
+                        var row = new string[arr.GetLength(1)];
+                        for (int j = 0; j < row.Length; j++) row[j] = CellText(arr.GetValue(r0 + i, c0 + j));
+                        rows.Add(row);
+                    }
+                }
+                else if (raw is System.Collections.IEnumerable && !(raw is string))
+                {
+                    foreach (var item in (System.Collections.IEnumerable)raw)
+                    {
+                        if (item == null || item is string || !(item is System.Collections.IEnumerable)) { rows.Clear(); break; }
+                        var row = new System.Collections.Generic.List<string>();
+                        foreach (var cell in (System.Collections.IEnumerable)item) row.Add(CellText(cell));
+                        rows.Add(row.ToArray());
+                    }
+                }
+                if (rows.Count == 0) continue;
+                path = NodePathOf(n) ?? path;
+                return rows.ToArray();
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Locale ids from the matrix header (row 0, columns 1..n); empty when unreadable.
+    private static System.Collections.Generic.List<string> MatrixHeaderLocales(string[][] m)
+    {
+        var list = new System.Collections.Generic.List<string>();
+        if (m == null || m.Length == 0) return list;
+        for (int j = 1; j < m[0].Length; j++)
+            if (!string.IsNullOrEmpty(m[0][j])) list.Add(m[0][j]);
+        return list;
+    }
+
+    // Matrix scan: key in column 0 (rows >= 1), locale in header column j.
+    // Returns the cell text; "" when the row exists but the cell is empty;
+    // null when no row has the key (or the locale is not a header column).
+    private static string MatrixText(string key, string locale)
+    {
+        string p;
+        var m = ReadValueMatrix(out p);
+        if (m == null || m.Length < 2) return null;
+        int col = -1;
+        for (int j = 1; j < m[0].Length; j++)
+            if (string.Equals(m[0][j], locale, StringComparison.OrdinalIgnoreCase)) { col = j; break; }
+        if (col < 0) return null;
+        for (int i = 1; i < m.Length; i++)
+            if (m[i].Length > 0 && string.Equals(m[i][0], key, StringComparison.Ordinal))
+                return col < m[i].Length ? m[i][col] : "";
+        return null;
+    }
+
+    // True when some matrix row (>= 1) has `key` in column 0, whatever its cells hold.
+    private static bool MatrixHasKey(string key)
+    {
+        string p;
+        var m = ReadValueMatrix(out p);
+        if (m == null) return false;
+        for (int i = 1; i < m.Length; i++)
+            if (m[i].Length > 0 && string.Equals(m[i][0], key, StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    // The locale list of the translation dictionary, or null when it cannot be read.
+    // Callers must NOT skip the unknown_locale check on null: they refuse with
+    // locale_check_unavailable (see UnknownLocaleJson). `path` is the dictionary
+    // node's project path for that refusal.
+    private static System.Collections.Generic.List<string> DictionaryLocales(out string path)
+    {
+        path = "Translations";
+        try
+        {
+            // Fallback, unobserved; the matrix variable is the known shape on 1.7.4 and 1.8.0:
+            // Locales / LocaleIds variables on the node.
+            foreach (var tr in DictionaryNodes())
+            {
+                foreach (string vn in new[] { "Locales", "LocaleIds" })
+                {
+                    IUAVariable v = null;
+                    try { v = tr.GetVariable(vn); } catch { }
+                    if (v == null) continue;
+                    object raw = v.Value.Value;
+                    var list = new System.Collections.Generic.List<string>();
+                    if (raw is string single) { if (single.Length > 0) list.Add(single); }
+                    else if (raw is System.Collections.IEnumerable en)
+                        foreach (var o in en)
+                        {
+                            if (o == null) continue;
+                            string s = CellText(o);
+                            if (!string.IsNullOrEmpty(s)) list.Add(s);
+                        }
+                    if (list.Count > 0) { path = NodePathOf(tr) ?? path; return list; }
+                }
+            }
+            // Known shape (1.7.4 and 1.8.0): header row of the node's own matrix value.
+            var hdr = MatrixHeaderLocales(ReadValueMatrix(out path));
+            if (hdr.Count > 0) return hdr;
+        }
+        catch { }
+        return null;
+    }
+
+    private static System.Collections.Generic.List<string> DictionaryLocales()
+    {
+        string p;
+        return DictionaryLocales(out p);
+    }
+
+    private static bool LocaleKnown(System.Collections.Generic.List<string> avail, string loc)
+    {
+        foreach (var a in avail)
+            if (string.Equals(a, loc, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static string JsonStringArray(System.Collections.Generic.IEnumerable<string> items)
+    {
+        var sb = new StringBuilder("[");
+        bool first = true;
+        foreach (var it in items)
+        {
+            if (!first) sb.Append(",");
+            first = false;
+            sb.Append("\"" + JsonEscape(it) + "\"");
+        }
+        return sb.Append("]").ToString();
+    }
+
+    // First row whose locale is not a dictionary column, as the structured
+    // unknown_locale refusal; null when every row's locale is known. When the
+    // dictionary's locales cannot be read it is a locale_check_unavailable refusal.
+    private static string UnknownLocaleJson(int opIndex, System.Collections.Generic.List<string[]> rows)
+    {
+        string dictPath;
+        var avail = DictionaryLocales(out dictPath);
+        if (avail == null)
+        {
+            // No locale list could be read: never skip the check, refuse instead.
+            string umsg = "cannot verify locales: no locale list could be read from the translation dictionary '" +
+                          dictPath + "' (neither Locales/LocaleIds nor the Value matrix header row). Nothing was written.";
+            return "{\"error\":{\"code\":\"locale_check_unavailable\",\"message\":\"" + JsonEscape(umsg) +
+                   "\",\"op_index\":" + opIndex + ",\"dictionary_path\":\"" + JsonEscape(dictPath) + "\"}}";
+        }
+        for (int r = 0; r < rows.Count; r++)
+        {
+            if (LocaleKnown(avail, rows[r][2])) continue;
+            string msg = "rows[" + r + "]: locale '" + rows[r][2] + "' is not a locale of the translation dictionary (available: " +
+                         string.Join(", ", avail) + "). Nothing was written.";
+            return "{\"error\":{\"code\":\"unknown_locale\",\"message\":\"" + JsonEscape(msg) +
+                   "\",\"op_index\":" + opIndex + ",\"row\":" + r + ",\"locale\":\"" + JsonEscape(rows[r][2]) +
+                   "\",\"available_locales\":" + JsonStringArray(avail) + "}}";
+        }
+        return null;
+    }
+
+    // Add the row if the key is new, otherwise update it in place (SetTranslation).
+    // Returns true when the row was added, false when an existing key was updated.
+    // LookupTranslation can miss a key that is already in the table (e.g. a row
+    // whose text is empty for the looked-up locale), and AddTranslation then throws
+    // "already contains a translation for text ID"; that case falls back to
+    // SetTranslation instead of failing the row.
+    private static bool UpsertTranslation(LocalizedText lt, string locale, string text)
+    {
+        string key = lt.TextId;
+        if (TranslationRowExists(key))
+        {
+            InformationModel.SetTranslation(lt);
+            NoteTranslationWritten(key, locale, text);
+            return false;
+        }
+        try
+        {
+            InformationModel.AddTranslation(lt);
+            NoteTranslationWritten(key, locale, text);
+            return true;
+        }
+        catch (InvalidOperationException ioex)
+        {
+            if (ioex.Message == null || ioex.Message.IndexOf("already contains", StringComparison.OrdinalIgnoreCase) < 0)
+                throw;
+            InformationModel.SetTranslation(lt);
+            NoteTranslationWritten(key, locale, text);
+            return false;
+        }
+    }
+
+    // Structural check of one add_translations row; null when acceptable.
+    // Mirrors core.validate_translation_rows on the Python side.
+    private static string TranslationRowError(string key, string value, string locale)
+    {
+        string kerr = TextKeyError(key);
+        if (kerr != null) return kerr;
+        if (value == null) return "value is required";
+        if (string.IsNullOrWhiteSpace(locale)) return "locale is empty";
+        foreach (char c in locale)
+            if (!(char.IsLetterOrDigit(c) || c == '-')) return "locale '" + locale + "' is not a language tag";
+        return null;
+    }
+
+    private static string TranslationRowErrorJson(int idx, string code, string message)
+    {
+        return ErrorJson(code, "rows[" + idx + "]: " + message);
+    }
+
+    // POST /bridge/i18n/translations[?locale=en-US&dry_run=true]  body {"rows":[...]}
+    // Adds (or overwrites) every row in one call. The WHOLE list is checked before
+    // the first write, so a bad row never leaves half a list applied; dry_run=true
+    // stops after that check and reports what would happen.
+    private string AddTranslationsInline(string firstLine, string reqBody)
+    {
+        string defLocale = QueryParam(firstLine, "locale") ?? "en-US";
+        bool dryRun = string.Equals(QueryParam(firstLine, "dry_run"), "true", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(reqBody))
+            return ErrorJson("bad_body", "add_translations requires a JSON body: {\"rows\":[{\"key\":..,\"value\":..}]}");
+        try
+        {
+            var rows = new List<string[]>();   // key, value, locale
+            using (var doc = System.Text.Json.JsonDocument.Parse(reqBody))
+            {
+                System.Text.Json.JsonElement rowsEl;
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
+                    !doc.RootElement.TryGetProperty("rows", out rowsEl) ||
+                    rowsEl.ValueKind != System.Text.Json.JsonValueKind.Array)
+                    return ErrorJson("rows_not_a_list", "body must be {\"rows\":[...]}");
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                int i = 0;
+                foreach (var el in rowsEl.EnumerateArray())
+                {
+                    if (el.ValueKind != System.Text.Json.JsonValueKind.Object)
+                        return TranslationRowErrorJson(i, "row_not_an_object", "must be an object");
+                    string k = JsonStr(el, "key");
+                    string v = JsonStr(el, "value");
+                    string loc = JsonStr(el, "locale") ?? defLocale;
+                    string err = TranslationRowError(k, v, loc);
+                    if (err != null) return TranslationRowErrorJson(i, "invalid_translation_row", err);
+                    if (!seen.Add(k + "\u0001" + loc))
+                        return TranslationRowErrorJson(i, "duplicate_row", "repeats key '" + k + "' for locale '" + loc + "'");
+                    rows.Add(new[] { k, v, loc });
+                    i++;
+                }
+                if (rows.Count == 0) return ErrorJson("rows_empty", "\"rows\" is empty");
+            }
+
+            // Every row's locale must be a column of the dictionary BEFORE the first
+            // write; dry_run runs the same check, so it never validates what apply refuses.
+            string badLocale = UnknownLocaleJson(0, rows);
+            if (badLocale != null) return badLocale;
+
+            int nsIdx = Project.Current.NodeId.NamespaceIndex;
+            var report = new StringBuilder();
+            int added = 0, updated = 0;
+            for (int r = 0; r < rows.Count; r++)
+            {
+                string k = rows[r][0], v = rows[r][1], loc = rows[r][2];
+                bool isNew = !TranslationRowExists(k);
+                if (!dryRun)
+                {
+                    try
+                    {
+                        // Existing key -> SetTranslation (counted in "updated"); new -> Add.
+                        isNew = UpsertTranslation(new LocalizedText(nsIdx, k, v, loc), loc, v);
+                    }
+                    catch (Exception rex)
+                    {
+                        // The SDK cannot remove a translation row, so the rows already
+                        // written cannot be rolled back: report exactly how many landed
+                        // (partial:true, written:n) so the batch state is `partial`.
+                        string fmsg = "rows[" + r + "] key '" + k + "' failed after " + r +
+                                      " row(s) were applied: " + ExcMsg(rex);
+                        return "{\"ok\":false,\"partial\":" + Bool(r > 0) + ",\"written\":" + r +
+                               ",\"error\":{\"code\":\"row_failed\",\"message\":\"" + JsonEscape(fmsg) +
+                               "\",\"row\":" + r + ",\"partial\":" + Bool(r > 0) + ",\"written\":" + r + "}}";
+                    }
+                }
+                if (isNew) added++; else updated++;
+                if (r > 0) report.Append(",");
+                report.Append("{\"key\":\"" + JsonEscape(k) + "\",\"locale\":\"" + JsonEscape(loc) +
+                              "\",\"new\":" + Bool(isNew) + "}");
+            }
+            return "{\"ok\":true,\"dry_run\":" + Bool(dryRun) + ",\"count\":" + rows.Count +
+                   ",\"added\":" + added + ",\"updated\":" + updated +
+                   ",\"rows\":[" + report + "],\"via\":\"translations\"}";
+        }
+        catch (System.Text.Json.JsonException jx)
+        {
+            return ErrorJson("bad_json", "could not parse the rows body: " + jx.Message);
+        }
+        catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // Shared refusal text for remove_translation: the Optix SDK has no way to
+    // remove a translation row, so the op is validated and then refused.
+    private const string RemoveTranslationNotSupported =
+        "removing a translation row is not supported by the Optix SDK; edit the key in Studio's Translations editor or overwrite its text with add/set";
+
+    // POST /bridge/i18n/translation/remove?key=K[&dry_run=true]
+    // The SDK cannot remove a translation row. The key is still validated first: a
+    // key with no row is the structured translation_not_found error; an existing
+    // key (dry_run included) is not_supported. Nothing is ever changed.
+    private string RemoveTranslationInline(string firstLine)
+    {
+        string key = QueryParam(firstLine, "key");
+        if (string.IsNullOrEmpty(key))
+            return ErrorJson("bad_query", "required: key");
+        string kerr = TextKeyError(key);
+        if (kerr != null) return ErrorJson("invalid_text_key", kerr);
+        try
+        {
+            if (!TranslationRowExists(key))
+                return ErrorJson("translation_not_found", "no translation row for key '" + key + "'");
+            return "{\"ok\":false,\"error\":{\"code\":\"not_supported\",\"message\":\"" +
+                   JsonEscape(RemoveTranslationNotSupported) + "\"}}";
         }
         catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
     }
@@ -4773,6 +7989,96 @@ public class StudioMCPBridge : BaseNetLogic
             return "{\"ok\":true,\"deleted\":\"" + JsonEscape(path) + "\",\"via\":\"delete\"}";
         }
         catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // ---- #73: invoke_method outcome helpers ------------------------------------
+
+    // The Method node `name` on `obj`: its own child first, then its type chain.
+    private static IUANode FindMethodNode(IUANode obj, string name)
+    {
+        try
+        {
+            foreach (var c in obj.Children)
+                if (c.NodeClass.ToString() == "Method" && c.BrowseName == name) return c;
+            IUAObjectType ot = (obj as UAObject)?.ObjectType;
+            for (int i = 0; ot != null && i < 30; i++, ot = ot.SuperType)
+                foreach (var c in ot.Children)
+                    if (c.NodeClass.ToString() == "Method" && c.BrowseName == name) return c;
+        }
+        catch { }
+        return null;
+    }
+
+    // Number of declared InputArguments of a Method node, or -1 when it cannot be
+    // read (the caller then skips the count check). Reflection-free: the
+    // InputArguments property is an array variable on the method node.
+    private static int MethodInputArgCount(IUANode method)
+    {
+        if (method == null) return -1;
+        try
+        {
+            var ia = method.GetVariable("InputArguments");
+            if (ia == null) return -1;
+            var uv = ia.Value;
+            var arr = (uv == null ? null : uv.Value) as Array;
+            return arr == null ? -1 : arr.Length;
+        }
+        catch { return -1; }
+    }
+
+    private static string StudioLogFile()
+    {
+        string dir = Environment.GetEnvironmentVariable("OPTIX_STUDIO_LOG_DIR");
+        if (string.IsNullOrEmpty(dir))
+            dir = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Rockwell Automation", "FactoryTalk Optix", "FTOptixStudio", "Log");
+        return System.IO.Path.Combine(dir, "FTOptixStudio.0.log");
+    }
+
+    // Size of the Studio log now (-1 when unreadable): lines after it were written
+    // during the call.
+    private static long StudioLogMark()
+    {
+        try { return new System.IO.FileInfo(StudioLogFile()).Length; }
+        catch { return -1; }
+    }
+
+    // The last ERROR/FATAL/Exception line Studio logged after `mark`, or null. A log
+    // that shrank (rotated) is read from its start. Best effort: any I/O failure
+    // reads as "no error seen".
+    private static string StudioLogErrorSince(long mark)
+    {
+        if (mark < 0) return null;
+        try
+        {
+            Thread.Sleep(250);   // let Studio flush the line
+            using (var fs = new System.IO.FileStream(StudioLogFile(), System.IO.FileMode.Open,
+                       System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete))
+            {
+                long start = mark <= fs.Length ? mark : 0;
+                if (fs.Length - start > 262144) start = fs.Length - 262144;
+                fs.Seek(start, System.IO.SeekOrigin.Begin);
+                string text;
+                using (var rd = new System.IO.StreamReader(fs, Encoding.UTF8))
+                    text = rd.ReadToEnd();
+                string hit = null;
+                foreach (var line in text.Split('\n'))
+                    if (System.Text.RegularExpressions.Regex.IsMatch(line,
+                            @"\b(error|fatal|exception)\b",
+                            System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                        hit = line.Trim();
+                return hit;
+            }
+        }
+        catch { return null; }
+    }
+
+    private static string MethodFailedJson(string path, string methodName, string detail)
+    {
+        return "{\"ok\":false,\"error\":\"method_failed\",\"path\":\"" + JsonEscape(path) +
+               "\",\"method\":\"" + JsonEscape(methodName) + "\",\"detail\":\"" +
+               JsonEscape(detail) + "\"}";
     }
 
     // new method. Verified against the real installed SDK
@@ -4820,6 +8126,12 @@ public class StudioMCPBridge : BaseNetLogic
     // fire at design time, and Sessions.CurrentSessionHandler throws
     // NotImplementedException, so the GUI session cannot be borrowed - root it is.
     // The legacy unsafe=1 query param is accepted and ignored.
+    //
+    // #73 outcomes (ok:true only when the method really ran): method_not_found /
+    // export_method_not_loaded (+available) when the object does not expose the
+    // method - ExecuteMethod is NOT called; argument_count_mismatch (+expected,
+    // given) when the args do not match the method's InputArguments; method_failed
+    // (+detail) when ExecuteMethod throws or Studio logs an error line during the call.
     private string InvokeMethodInline(string firstLine)
     {
         string path = QueryParam(firstLine, "path");
@@ -4839,12 +8151,29 @@ public class StudioMCPBridge : BaseNetLogic
                 "node at " + path + " is a " + node.GetType().Name +
                 " - only IUAObject nodes host invokable methods");
 
+        // #73: resolve the method BEFORE ExecuteMethod (same lookup as the wire_event
+        // check). A missing method used to be "executed" and reported ok:true.
+        string missing = WireMethodGuard(obj, path, methodName, -1, "The method was not called.");
+        if (missing != null) return missing;
+
         string argsParam = QueryParam(firstLine, "args");
         object[] inputArgs = string.IsNullOrEmpty(argsParam)
             ? new object[0]
             : argsParam.Split(',').Select(s => (object)s).ToArray();
 
+        // #73: the supplied argument count must match the method's InputArguments.
+        // Unreadable metadata (expected < 0) fails open rather than refusing a call
+        // the SDK might accept.
+        int expectedArgs = MethodInputArgCount(FindMethodNode(obj, methodName));
+        if (expectedArgs >= 0 && expectedArgs != inputArgs.Length)
+            return "{\"ok\":false,\"error\":\"argument_count_mismatch\",\"path\":\"" + JsonEscape(path) +
+                   "\",\"method\":\"" + JsonEscape(methodName) + "\",\"expected\":" + expectedArgs +
+                   ",\"given\":" + inputArgs.Length + ",\"message\":\"" +
+                   JsonEscape("'" + methodName + "' takes " + expectedArgs + " argument(s), " +
+                              inputArgs.Length + " given. The method was not called.") + "\"}";
+
         object[] outputArgs;
+        long logMark = StudioLogMark();
         try
         {
             // NEVER call ExecuteMethod (or read session info) outside this scope.
@@ -4853,8 +8182,14 @@ public class StudioMCPBridge : BaseNetLogic
         }
         catch (Exception ex)
         {
-            return ErrorJson("execution_failed", ExcMsg(ex));
+            return MethodFailedJson(path, methodName, ExcMsg(ex));
         }
+
+        // #73: Optix catches and LOGS an exception thrown inside the method, so
+        // ExecuteMethod returns normally; the Studio log is the only witness.
+        string logError = StudioLogErrorSince(logMark);
+        if (logError != null)
+            return MethodFailedJson(path, methodName, logError);
 
         var outSb = new StringBuilder();
         if (outputArgs != null)
@@ -4936,8 +8271,132 @@ public class StudioMCPBridge : BaseNetLogic
                "count fails at RUNTIME, silently, on the click.";
     }
 
-    private string WireEventInline(string firstLine)
+    // ---- #70: wire_event target validation -----------------------------------
+    // Both checks run BEFORE a handler is deleted or created (single call, the
+    // multi-step form, and validate_ops), so a refused wire changes nothing.
+
+    // True when `node`'s CLR proxy or ObjectType chain reaches the FTOptix.UI Item
+    // type - the declaring type of the mouse/touch/value events. `known` is false
+    // when the type chain cannot be read, so the caller fails open instead of
+    // claiming something it did not see.
+    private static bool IsUiItemNode(IUANode node, out bool known)
     {
+        known = false;
+        try
+        {
+            for (var t = node.GetType(); t != null; t = t.BaseType)
+                if (t.FullName == "FTOptix.UI.Item") { known = true; return true; }
+            IUAObjectType ot = (node as UAObject)?.ObjectType;
+            for (int i = 0; ot != null && i < 30; i++, ot = ot.SuperType)
+            {
+                known = true;
+                if (ot.BrowseName == "Item") return true;
+            }
+        }
+        catch { known = false; }
+        return false;
+    }
+
+    // null when `evt` can be wired on `node`, else the event_not_on_node answer:
+    // {ok:false, error:"event_not_on_node", node, node_class, dotnet_type, event, hint}.
+    // Variables (and every non-Object node) declare no events; an Object that is
+    // not a UI Item (a Folder, a NetLogic, ...) declares none of the UI events.
+    private static string EventOnNodeGuard(IUANode node, string path, string evt)
+    {
+        bool declared = true;
+        try
+        {
+            if (!(node is IUAObject)) declared = false;
+            else
+            {
+                bool known;
+                bool isItem = IsUiItemNode(node, out known);
+                if (known && !isItem) declared = false;
+            }
+        }
+        catch { declared = true; }
+        if (declared) return null;
+        string cls = "?", clr = "?";
+        try { cls = node.NodeClass.ToString(); } catch { }
+        try { clr = node.GetType().Name; } catch { }
+        return "{\"ok\":false,\"error\":\"event_not_on_node\",\"node\":\"" + JsonEscape(path) +
+               "\",\"node_class\":\"" + JsonEscape(cls) + "\",\"dotnet_type\":\"" + JsonEscape(clr) +
+               "\",\"event\":\"" + JsonEscape(evt) + "\",\"hint\":\"" +
+               JsonEscape("'" + evt + "' is declared by UI Items (buttons, panels, labels, ...), not by a " +
+                          cls + " of type " + clr + ". Wire the event on the widget that raises it; " +
+                          "nothing was created or deleted.") + "\"}";
+    }
+
+    // The UAMethod names `obj` exposes: its own Method children plus those its
+    // ObjectType chain declares. `instanceCount` counts the object's own;
+    // `typeKnown` is false when neither source was readable.
+    private static List<string> AvailableMethodNames(IUANode obj, out int instanceCount, out bool typeKnown)
+    {
+        var names = new List<string>();
+        instanceCount = 0; typeKnown = false;
+        try
+        {
+            foreach (var c in obj.Children)
+                if (c.NodeClass.ToString() == "Method")
+                {
+                    instanceCount++;
+                    if (!names.Contains(c.BrowseName)) names.Add(c.BrowseName);
+                }
+            IUAObjectType ot = (obj as UAObject)?.ObjectType;
+            for (int i = 0; ot != null && i < 30; i++, ot = ot.SuperType)
+            {
+                typeKnown = true;
+                foreach (var c in ot.Children)
+                    if (c.NodeClass.ToString() == "Method" && !names.Contains(c.BrowseName))
+                        names.Add(c.BrowseName);
+            }
+        }
+        catch { }
+        names.Sort(System.StringComparer.Ordinal);
+        return names;
+    }
+
+    // null when `obj` exposes `methodName`, else method_not_found with the
+    // available list - or, for a NetLogic that exposes no method at all,
+    // export_method_not_loaded + reopen_required (the answer execute_method gives:
+    // Studio has not loaded the [ExportMethod]s, only a project reopen does).
+    // callIndex >= 0 names the entry of a multi-step `calls` list.
+    private static string WireMethodGuard(IUANode obj, string objPath, string methodName, int callIndex,
+                                          string effect = "Nothing was created or deleted.")
+    {
+        int instanceCount; bool typeKnown;
+        var available = AvailableMethodNames(obj, out instanceCount, out typeKnown);
+        if (available.Contains(methodName)) return null;
+        bool netLogic = IsNetLogicNode(obj);
+        if (!netLogic && instanceCount == 0 && !typeKnown) return null;   // cannot tell: fail open
+        var sb = new StringBuilder();
+        bool notLoaded = netLogic && instanceCount == 0;
+        sb.Append("{\"ok\":false,\"error\":\"" + (notLoaded ? "export_method_not_loaded" : "method_not_found") + "\"");
+        sb.Append(",\"object\":\"" + JsonEscape(objPath) + "\",\"method\":\"" + JsonEscape(methodName) + "\"");
+        if (callIndex >= 0) sb.Append(",\"call_index\":" + callIndex);
+        if (notLoaded)
+            sb.Append(",\"reopen_required\":true,\"message\":\"" + JsonEscape(
+                "'" + objPath + "' is a NetLogic whose [ExportMethod]s Studio has not loaded; reopen the project, then retry. " + effect) + "\"");
+        else
+            sb.Append(",\"message\":\"" + JsonEscape(
+                "'" + objPath + "' has no method '" + methodName + "'. " + effect) + "\"");
+        sb.Append(",\"available\":[");
+        for (int i = 0; i < available.Count; i++)
+        {
+            if (i > 0) sb.Append(",");
+            sb.Append("\"" + JsonEscape(available[i]) + "\"");
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    private string WireEventInline(string firstLine, string reqBody = null)
+    {
+        // Multi-step form: a JSON body {"calls":[...]} (one call per
+        // MethodContainer, in order, under ONE EventHandler). Everything else
+        // below is the single-call path, which the steps path itself reuses.
+        if (!string.IsNullOrWhiteSpace(reqBody))
+            return WireEventStepsInline(firstLine, reqBody);
         string path = QueryParam(firstLine, "path");
         string evt = QueryParam(firstLine, "event");
         string command = QueryParam(firstLine, "command");
@@ -5003,6 +8462,11 @@ public class StudioMCPBridge : BaseNetLogic
                 sb.Append("]}}");
                 return sb.ToString();
             }
+
+            // #70 target guard: refuse BEFORE any handler is touched when the node's
+            // type does not declare the event (a Variable, a Folder, ...).
+            string eventGuard = EventOnNodeGuard(node, path, evt);
+            if (eventGuard != null) return eventGuard;
 
             // Resolve the call target (ObjectPointer value + Method name) by mode.
             NodeId objPtrTarget;
@@ -5081,6 +8545,10 @@ public class StudioMCPBridge : BaseNetLogic
                 objPtrTarget = objNode.NodeId;
                 methodTargetNode = objNode;
                 methodName = method.Substring(slash + 1);
+                // #70 method guard: the object must expose the method (a UAMethod
+                // child, or a loaded NetLogic export) BEFORE any handler is touched.
+                string methodGuard = WireMethodGuard(objNode, method.Substring(0, slash), methodName, -1);
+                if (methodGuard != null) return methodGuard;
             }
 
             // Existing-handler lookup: scan the node's children for any
@@ -5108,13 +8576,18 @@ public class StudioMCPBridge : BaseNetLogic
             // replace=true  -> delete-then-create (explicit caller escape hatch).
             // replace=false -> in-place update (DEFAULT).
             bool replaced = false;
+            FTOptix.CoreBase.EventHandler replaceTarget = null;
             if (existingHandler != null)
             {
                 if (replace)
                 {
-                    // replace=true: delete the existing handler so the full normal
-                    // create path below produces a clean, correctly-wired handler.
-                    existingHandler.Delete();
+                    // replace=true: build a clean, correctly-wired handler through
+                    // the full create path below, and delete the existing one only
+                    // once the new one is complete (#70). A failure while building
+                    // removes the half-built handler and leaves the previous one in
+                    // place, so a refused replace never loses the handler it was
+                    // asked to replace.
+                    replaceTarget = existingHandler;
                     replaced = true;
                 }
                 else
@@ -5451,7 +8924,15 @@ public class StudioMCPBridge : BaseNetLogic
                 }
             }
 
-            var eh = InformationModel.MakeObject<FTOptix.CoreBase.EventHandler>("EH_" + evt + "_" + node.BrowseName);
+            // While the previous handler is still alive the new one needs a name of
+            // its own (BrowseNames are unique among siblings); the handler is found
+            // by ListenEventType, never by name, so the suffix is cosmetic.
+            FTOptix.CoreBase.EventHandler eh = null;
+            bool wireBuilt = false;
+            try
+            {
+            eh = InformationModel.MakeObject<FTOptix.CoreBase.EventHandler>(
+                "EH_" + evt + "_" + node.BrowseName + (replaceTarget != null ? "_replacing" : ""));
             node.Add(eh);
             var letVar = eh.GetOrCreateVariable("ListenEventType");
             letVar.Value = evtTypeId;
@@ -5606,6 +9087,40 @@ public class StudioMCPBridge : BaseNetLogic
                 }
             }
 
+            // The new handler is complete: only now delete the one it replaces.
+            if (replaceTarget != null)
+            {
+                try { replaceTarget.Delete(); }
+                catch (Exception delEx)
+                {
+                    bool stillThere = false;
+                    try
+                    {
+                        foreach (var sib in node.Children)
+                            if (ReferenceEquals(sib, replaceTarget)) { stillThere = true; break; }
+                    }
+                    catch { stillThere = false; }
+                    // Still there: the previous handler is intact, drop the new one
+                    // (the finally below). Gone: it is lost, so keep the new handler
+                    // and say so.
+                    if (!stillThere) wireBuilt = true;
+                    return "{\"ok\":false,\"error\":\"replace_failed\",\"node\":\"" + JsonEscape(path) +
+                           "\",\"event\":\"" + JsonEscape(evt) + "\",\"message\":\"" +
+                           JsonEscape("could not delete the previous handler: " + ExcMsg(delEx)) + "\"" +
+                           (stillThere ? ",\"previous_handler_kept\":true"
+                                       : ",\"previous_handler_lost\":true,\"new_handler_kept\":true") + "}";
+                }
+                // Hand the new handler the conventional name when the SDK allows it.
+                try
+                {
+                    var bnProp = eh.GetType().GetProperty("BrowseName");
+                    if (bnProp != null && bnProp.CanWrite)
+                        bnProp.SetValue(eh, "EH_" + evt + "_" + node.BrowseName);
+                }
+                catch { /* cosmetic */ }
+            }
+            wireBuilt = true;
+
             // Append +replaced when the RESULT was a delete-then-create (replace=true),
             // so the via string reflects the operation outcome, not just the request shape.
             string via = (uiCommand ? "uicommand:" + methodName
@@ -5620,8 +9135,561 @@ public class StudioMCPBridge : BaseNetLogic
                    "\",\"via\":\"" + JsonEscape(via) + "\""
                    + (replaced ? ",\"replaced\":true" : "")
                    + "}";
+            }
+            finally
+            {
+                // A failure after the handler was added (bad args, link, value):
+                // remove what this call built so no half-wired handler is left.
+                // With replace=true the previous handler was never touched.
+                if (!wireBuilt && eh != null) { try { eh.Delete(); } catch { } }
+            }
         }
         catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // ---- wire_event, multi-step form -----------------------------------------
+    //
+    // POST /bridge/node/event?path=..&event=..[&append=true][&replace=true]
+    //   body {"calls":[{"method":"Obj/Method"|"command":"SetVariable", "variable",
+    //                   "value","args","object_raw"}, ...]}
+    //
+    // One EventHandler, N calls: MethodContainer1..N under its MethodsToCall, run
+    // in list order. Semantics:
+    //   no handler for the event      -> create it holding every call
+    //   handler exists, append=true   -> add the calls AFTER the existing ones,
+    //                                    existing MethodContainers untouched
+    //   handler exists, replace=true  -> delete it, create fresh with every call
+    //   handler exists, neither       -> call 0 goes through the single-call path
+    //                                    (in-place update of its one container, or
+    //                                    handler_exists when that is unsafe), the
+    //                                    rest are appended after it
+    // Call 0 (when it is not an append) is written by WireEventInline itself, so
+    // the handler shape, link fixups and read-back stay the single-call code's.
+    // Every call is resolved BEFORE anything is written, and a failure while
+    // appending removes what this request added (and the handler, if this
+    // request created it) - a refused list leaves no half-built handler.
+
+    private static string WireCallsError(int callIndex, string reason, string message)
+    {
+        return "{\"error\":{\"code\":\"invalid_wire_calls\",\"message\":\"" + JsonEscape(message) +
+               "\",\"call_index\":" + callIndex + ",\"reason\":\"" + JsonEscape(reason) + "\"}}";
+    }
+
+    private static readonly string[] _WireCallFields =
+        { "method", "command", "variable", "value", "args", "object_raw" };
+
+    // Parse {"calls":[...]} into one string map per call; null + an error JSON on
+    // a malformed list. Structure only - targets are resolved by the caller.
+    private static List<Dictionary<string, string>> ParseWireCalls(string body, out string error)
+    {
+        error = null;
+        var steps = new List<Dictionary<string, string>>();
+        try
+        {
+            using (var doc = System.Text.Json.JsonDocument.Parse(body))
+            {
+                System.Text.Json.JsonElement callsEl;
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object ||
+                    !doc.RootElement.TryGetProperty("calls", out callsEl) ||
+                    callsEl.ValueKind != System.Text.Json.JsonValueKind.Array)
+                { error = WireCallsError(-1, "calls_not_a_list", "body must be {\"calls\":[...]}"); return null; }
+                int i = 0;
+                foreach (var el in callsEl.EnumerateArray())
+                {
+                    if (el.ValueKind != System.Text.Json.JsonValueKind.Object)
+                    { error = WireCallsError(i, "call_not_an_object", "calls[" + i + "] must be an object"); return null; }
+                    var step = new Dictionary<string, string>();
+                    foreach (var f in _WireCallFields)
+                    {
+                        string v = JsonStr(el, f);
+                        if (v != null) step[f] = v;
+                    }
+                    bool hasCmd = step.ContainsKey("command") && step["command"].Length > 0;
+                    bool hasMeth = step.ContainsKey("method") && step["method"].Length > 0;
+                    if (hasCmd == hasMeth)
+                    {
+                        error = WireCallsError(i, hasCmd ? "call_ambiguous" : "call_missing_action",
+                            "calls[" + i + "] needs exactly one of command / method");
+                        return null;
+                    }
+                    steps.Add(step);
+                    i++;
+                }
+                if (steps.Count == 0)
+                { error = WireCallsError(-1, "calls_empty", "\"calls\" is empty"); return null; }
+            }
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            error = ErrorJson("bad_body", "wire_event body is not valid JSON: " + ex.Message);
+            return null;
+        }
+        return steps;
+    }
+
+    // The single-call query line for one call, so QueryParam-based code can be
+    // reused for each step.
+    private static string WireStepLine(string path, string evt, Dictionary<string, string> step, bool replace)
+    {
+        var sb = new StringBuilder("POST /bridge/node/event?path=");
+        sb.Append(Uri.EscapeDataString(path));
+        sb.Append("&event="); sb.Append(Uri.EscapeDataString(evt));
+        foreach (var f in _WireCallFields)
+        {
+            string v;
+            if (step.TryGetValue(f, out v) && v != null)
+            { sb.Append("&"); sb.Append(f); sb.Append("="); sb.Append(Uri.EscapeDataString(v)); }
+        }
+        if (replace) sb.Append("&replace=true");
+        sb.Append(" HTTP/1.1");
+        return sb.ToString();
+    }
+
+    private static FTOptix.CoreBase.EventHandler FindEventHandlerFor(IUANode node, NodeId evtTypeId)
+    {
+        foreach (var child in node.Children)
+        {
+            if (!(child is FTOptix.CoreBase.EventHandler cand)) continue;
+            var listenVar = cand.GetVariable("ListenEventType");
+            if (listenVar == null) continue;
+            var id = listenVar.Value.Value as NodeId;
+            if (id != null && id == evtTypeId) return cand;
+        }
+        return null;
+    }
+
+    private static int CountMethodContainers(FTOptix.CoreBase.EventHandler eh)
+    {
+        int n = 0;
+        foreach (var c in eh.MethodsToCall) n++;
+        return n;
+    }
+
+    // Resolve one call's target WITHOUT writing: null on success, else an error
+    // JSON. Mirrors the target-resolution block of WireEventInline.
+    private string ResolveWireCallTarget(string stepLine, int callIndex,
+        out NodeId objPtrTarget, out string methodName, out IUANode methodTargetNode,
+        out IUAVariable cmdTargetVar, out string cmdValueRaw, out bool cmdNeedsValue,
+        out bool uiCommand)
+    {
+        objPtrTarget = null; methodName = null; methodTargetNode = null;
+        cmdTargetVar = null; cmdValueRaw = null; cmdNeedsValue = false;
+        string command = QueryParam(stepLine, "command");
+        string method = QueryParam(stepLine, "method");
+        string argsParam = QueryParam(stepLine, "args");
+        uiCommand = !string.IsNullOrEmpty(command) && Array.IndexOf(_UiCommands, command) >= 0;
+        if (uiCommand)
+        {
+            if (command == "OpenKeyboard")
+            {
+                var argErr = OpenKeyboardArgsError(argsParam);
+                if (argErr != null) return WireCallsError(callIndex, "call_bad_args", "calls[" + callIndex + "]: " + argErr);
+            }
+            IUANode uiObj = null;
+            try { uiObj = Project.Current.Owner.Get("Commands/UICommands"); } catch { }
+            if (uiObj == null) return ErrorJson("command_unavailable", "UICommands not in address space");
+            objPtrTarget = uiObj.NodeId;
+            methodName = command;
+        }
+        else if (!string.IsNullOrEmpty(command))
+        {
+            string varPath = QueryParam(stepLine, "variable");
+            if (string.IsNullOrEmpty(varPath))
+                return WireCallsError(callIndex, "call_missing_variable", "calls[" + callIndex + "]: command mode requires: variable");
+            cmdTargetVar = ResolveNode(varPath) as IUAVariable;
+            if (cmdTargetVar == null) return ErrorJson("node_not_found", "calls[" + callIndex + "]: no variable at: " + varPath);
+            var vcObj = InformationModel.GetObject(FTOptix.CoreBase.Objects.VariableCommands);
+            if (vcObj == null) return ErrorJson("command_unavailable", "VariableCommands not in address space");
+            objPtrTarget = vcObj.NodeId;
+            switch (command)
+            {
+                case "SetVariable":
+                case "Set":
+                    methodName = "Set"; cmdNeedsValue = true;
+                    cmdValueRaw = QueryParam(stepLine, "value") ?? "";
+                    break;
+                case "ToggleVariable":
+                case "Toggle":
+                    methodName = "Toggle";
+                    break;
+                default:
+                    return WireCallsError(callIndex, "call_unknown_command",
+                        "calls[" + callIndex + "]: unknown command: " + command);
+            }
+        }
+        else
+        {
+            int slash = method == null ? -1 : method.LastIndexOf('/');
+            if (slash <= 0)
+                return WireCallsError(callIndex, "call_bad_method", "calls[" + callIndex + "]: method must be 'ObjectPath/MethodName'");
+            var objNode = ResolveNode(method.Substring(0, slash));
+            if (objNode == null)
+                return ErrorJson("node_not_found", "calls[" + callIndex + "]: no method object at: " + method.Substring(0, slash));
+            objPtrTarget = objNode.NodeId;
+            methodTargetNode = objNode;
+            methodName = method.Substring(slash + 1);
+            string methodGuard = WireMethodGuard(objNode, method.Substring(0, slash), methodName, callIndex);
+            if (methodGuard != null) return methodGuard;
+        }
+        return null;
+    }
+
+    private static string WireStepVia(string stepLine, string methodName, bool uiCommand, bool autoRel)
+    {
+        string command = QueryParam(stepLine, "command");
+        if (uiCommand) return "uicommand:" + methodName;
+        if (!string.IsNullOrEmpty(command)) return "command:" + methodName;
+        return "eventhandler"
+            + (string.IsNullOrEmpty(QueryParam(stepLine, "args")) ? "" : "+args")
+            + (string.IsNullOrEmpty(QueryParam(stepLine, "object_raw")) ? "" : "+lateobj")
+            + (autoRel ? "+reltype" : "");
+    }
+
+    // Append ONE call to `handler` as a new MethodContainerN. Same container shape
+    // WireEventInline builds for MethodContainer1: ObjectPointer (NodePointer, with
+    // the relative link when object_raw / same-type applies), Method, InputArguments.
+    // Returns null on success (new container in `added`, its `via` in `via`), else
+    // an error JSON; the caller rolls back.
+    private string AppendWireCall(FTOptix.CoreBase.EventHandler handler, string stepLine,
+        int callIndex, List<IUANode> added, out string via)
+    {
+        via = null;
+        string command = QueryParam(stepLine, "command");
+        string argsParam = QueryParam(stepLine, "args");
+        string objectRaw = QueryParam(stepLine, "object_raw");
+        NodeId objPtrTarget; string methodName; IUANode methodTargetNode;
+        IUAVariable cmdTargetVar; string cmdValueRaw; bool cmdNeedsValue; bool uiCommand;
+        string terr = ResolveWireCallTarget(stepLine, callIndex, out objPtrTarget, out methodName,
+            out methodTargetNode, out cmdTargetVar, out cmdValueRaw, out cmdNeedsValue, out uiCommand);
+        if (terr != null) return terr;
+
+        // Unique, increasing container name: MethodContainer<count+1>, bumped past
+        // any name already taken (a hand-authored handler may skip numbers).
+        var taken = new HashSet<string>();
+        foreach (var c in handler.MethodsToCall) taken.Add(c.BrowseName);
+        int k = taken.Count + 1;
+        while (taken.Contains("MethodContainer" + k)) k++;
+        var mc = InformationModel.MakeObject("MethodContainer" + k);
+        handler.MethodsToCall.Add(mc);
+        added.Add(mc);
+
+        var objPtr = InformationModel.MakeVariable<FTOptix.Core.NodePointer>(
+            "ObjectPointer", OpcUa.DataTypes.NodeId);
+        objPtr.Value = objPtrTarget;
+        mc.Add(objPtr);
+        bool autoRel = false;
+        string rawPath = null;
+        if (!string.IsNullOrEmpty(objectRaw) && string.IsNullOrEmpty(command))
+            rawPath = "../../../../" + objectRaw;
+        else if (string.IsNullOrEmpty(command) && methodTargetNode != null)
+        {
+            rawPath = SameTypeRelativePath(objPtr, methodTargetNode);
+            autoRel = rawPath != null;
+        }
+        if (rawPath != null)
+        {
+            objPtr.SetDynamicLink(null, DynamicLinkMode.Read);
+            var opLink = objPtr.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+            if (opLink == null)
+                return ErrorJson("link_materialize_failed",
+                    "SetDynamicLink(null) did not materialize a DynamicLink on ObjectPointer (calls[" + callIndex + "])");
+            if (rawPath.IndexOf('@') < 0) rawPath += "@NodeId";
+            opLink.Value = rawPath;
+            var kindVar = objPtr.GetVariable("Kind");
+            if (kindVar != null) kindVar.Value = new NodeId(0, 58);
+        }
+        var mName = InformationModel.MakeVariable("Method", OpcUa.DataTypes.String);
+        mName.Value = methodName;
+        mc.Add(mName);
+        var inputArgs = InformationModel.MakeObject("InputArguments");
+        mc.Add(inputArgs);
+
+        if (cmdTargetVar != null)
+        {
+            var vtm = InformationModel.MakeVariable("VariableToModify", FTOptix.Core.DataTypes.VariablePointer);
+            vtm.Value = cmdTargetVar.NodeId;
+            inputArgs.Add(vtm);
+            if (cmdNeedsValue)
+            {
+                var valVar = InformationModel.MakeVariable("Value", cmdTargetVar.DataType);
+                inputArgs.Add(valVar);
+                var cverr = CoerceAssign(valVar, cmdValueRaw, stepLine);
+                if (cverr != null) return ErrorJson("bad_value", "calls[" + callIndex + "]: " + cverr);
+            }
+            var ai = InformationModel.MakeVariable("ArrayIndex", OpcUa.DataTypes.UInt32);
+            ai.Value = (uint)0;
+            inputArgs.Add(ai);
+        }
+        else if (!string.IsNullOrEmpty(argsParam) || uiCommand)
+        {
+            foreach (var pair in (argsParam ?? "").Split(';'))
+            {
+                if (pair.Trim().Length == 0) continue;
+                int eq = pair.IndexOf('=');
+                if (eq <= 0)
+                    return WireCallsError(callIndex, "call_bad_args",
+                        "calls[" + callIndex + "]: args entry must be Name=Value, got: " + pair);
+                string argName = pair.Substring(0, eq).Trim();
+                string argVal = pair.Substring(eq + 1);
+                if (uiCommand && argName == "ParentItem" && argVal.Length == 0)
+                {
+                    // Late-bound to the event node: five levels up from a variable
+                    // under InputArguments (IA / MC / MethodsToCall / EH / node).
+                    var pv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId);
+                    inputArgs.Add(pv);
+                    pv.SetDynamicLink(null, DynamicLinkMode.Read);
+                    var pl = pv.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                    if (pl != null) pl.Value = "../../../../..@NodeId";
+                    continue;
+                }
+                if (argVal.Length == 0)
+                {
+                    inputArgs.Add(InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId));
+                    continue;
+                }
+                var argTarget = ResolveNode(argVal);
+                if (argTarget != null)
+                {
+                    var nv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.NodeId);
+                    nv.Value = argTarget.NodeId;
+                    inputArgs.Add(nv);
+                }
+                else
+                {
+                    var sv = InformationModel.MakeVariable(argName, OpcUa.DataTypes.String);
+                    inputArgs.Add(sv);
+                    var argErr = CoerceAssign(sv, argVal, stepLine);
+                    if (argErr != null) return ErrorJson("bad_value", "calls[" + callIndex + "]: " + argErr);
+                }
+            }
+        }
+
+        // Read back what was written before reporting it.
+        var rbPtr = mc.GetVariable("ObjectPointer");
+        var rbMethod = mc.GetVariable("Method");
+        if (rbPtr == null || rbMethod == null)
+            return ErrorJson("readback_failed", "calls[" + callIndex + "]: MethodContainer not readable after append");
+        var rbId = rbPtr.Value.Value as NodeId;
+        if (rbId == null || rbId != objPtrTarget || (rbMethod.Value.Value as string) != methodName)
+            return ErrorJson("readback_mismatch", "calls[" + callIndex + "]: ObjectPointer/Method did not read back as written");
+        via = WireStepVia(stepLine, methodName, uiCommand, autoRel);
+        return null;
+    }
+
+    private string WireEventStepsInline(string firstLine, string reqBody)
+    {
+        string path = QueryParam(firstLine, "path");
+        string evt = QueryParam(firstLine, "event");
+        bool append = string.Equals(QueryParam(firstLine, "append"), "true", StringComparison.OrdinalIgnoreCase);
+        bool replace = string.Equals(QueryParam(firstLine, "replace"), "true", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(evt))
+            return ErrorJson("bad_query", "required: path, event");
+        string parseErr;
+        var steps = ParseWireCalls(reqBody, out parseErr);
+        if (steps == null) return parseErr;
+        try
+        {
+            var node = ResolveNode(path);
+            if (node == null) return ErrorJson("node_not_found", "no node at: " + path);
+            var evtTypeId = ResolveEventType(evt);
+            if (evtTypeId == null)
+                // Same reject-with-valid-list answer as the single-call path; it
+                // fails before writing anything.
+                return WireEventInline(WireStepLine(path, evt, steps[0], false), null);
+
+            string stepsEventGuard = EventOnNodeGuard(node, path, evt);
+            if (stepsEventGuard != null) return stepsEventGuard;
+
+            // Resolve EVERY call up front, so a bad call 3 refuses the list before
+            // call 0 is written.
+            var stepLines = new List<string>();
+            for (int i = 0; i < steps.Count; i++)
+            {
+                string line = WireStepLine(path, evt, steps[i], false);
+                NodeId t; string m; IUANode mn; IUAVariable cv; string cvr; bool nv; bool ui;
+                string err = ResolveWireCallTarget(line, i, out t, out m, out mn, out cv, out cvr, out nv, out ui);
+                if (err != null) return err;
+                stepLines.Add(line);
+            }
+
+            var existing = FindEventHandlerFor(node, evtTypeId);
+            int priorCount = existing == null ? 0 : CountMethodContainers(existing);
+            var handler = existing;
+            bool createdHandler = existing == null || (replace && !append);
+            bool appendMode = append && existing != null;
+            int first = 0;
+            if (!appendMode)
+            {
+                // Call 0 via the single-call path: creates the handler, replaces it
+                // (replace=true), or updates its one container in place.
+                string r0 = WireEventInline(WireStepLine(path, evt, steps[0], replace && !append), null);
+                if (!r0.StartsWith("{\"ok\":true", StringComparison.Ordinal)) return r0;
+                handler = FindEventHandlerFor(node, evtTypeId);
+                if (handler == null)
+                    return ErrorJson("readback_failed", "handler not found after writing call 0");
+                first = 1;
+            }
+
+            var added = new List<IUANode>();
+            for (int i = first; i < steps.Count; i++)
+            {
+                string via;
+                string aerr = AppendWireCall(handler, stepLines[i], i, added, out via);
+                if (aerr != null)
+                {
+                    foreach (var mcAdded in added) { try { mcAdded.Delete(); } catch { } }
+                    bool wholeHandler = createdHandler && !appendMode;
+                    if (wholeHandler) { try { handler.Delete(); } catch { } }
+                    return aerr;
+                }
+            }
+
+            int expected = appendMode ? priorCount + steps.Count : steps.Count;
+            int now = CountMethodContainers(handler);
+            if (now != expected)
+                return ErrorJson("readback_mismatch",
+                    "handler holds " + now + " method call(s) after the write, expected " + expected);
+
+            var sb = new StringBuilder();
+            sb.Append("{\"ok\":true,\"node\":\"" + JsonEscape(path) + "\",\"event\":\"" + JsonEscape(evt) +
+                      "\",\"via\":\"eventhandler+steps\",\"steps\":" + steps.Count +
+                      ",\"handler\":\"" + JsonEscape(handler.BrowseName) + "\"" +
+                      ",\"appended\":" + (appendMode ? "true" : "false") +
+                      ",\"created\":" + (createdHandler ? "true" : "false") +
+                      ",\"call_count\":" + now + ",\"containers\":[");
+            bool firstName = true;
+            foreach (var c in handler.MethodsToCall)
+            {
+                if (!firstName) sb.Append(",");
+                firstName = false;
+                sb.Append("\"" + JsonEscape(c.BrowseName) + "\"");
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+        catch (Exception ex) { return "{\"ok\":false,\"error\":\"" + JsonEscape(ExcMsg(ex)) + "\"}"; }
+    }
+
+    // ValidateOpsJson helper (#70): the event-on-node and method-exists checks of
+    // the write path, run against the LIVE model so a batch is refused at validate
+    // time with op_index. A node, object or method that only exists because an
+    // earlier op of the batch creates it cannot be judged here and is skipped.
+    private void ValidateWireTargetOp(int idx, System.Text.Json.JsonElement op, string path,
+        Dictionary<string, HypoNode> created, Action<int, string, string, string> addErr)
+    {
+        try
+        {
+            string evt = JsonStr(op, "event_type") ?? JsonStr(op, "event");
+            IUANode live = created.ContainsKey(path) ? null : ResolveNode(path);
+            if (live != null && !string.IsNullOrEmpty(evt) && ResolveEventType(evt) != null)
+            {
+                string eg = EventOnNodeGuard(live, path, evt);
+                if (eg != null) { addGuardErr(idx, eg, addErr); return; }
+            }
+            var singles = new List<string>();
+            singles.Add(JsonStr(op, "method_path") ?? JsonStr(op, "method"));
+            System.Text.Json.JsonElement callsEl;
+            if (op.TryGetProperty("calls", out callsEl) &&
+                callsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                singles.Clear();
+                foreach (var call in callsEl.EnumerateArray())
+                    singles.Add(call.ValueKind == System.Text.Json.JsonValueKind.Object
+                        ? (JsonStr(call, "method_path") ?? JsonStr(call, "method")) : null);
+            }
+            bool multi = op.TryGetProperty("calls", out callsEl);
+            for (int ci = 0; ci < singles.Count; ci++)
+            {
+                string meth = singles[ci];
+                if (string.IsNullOrEmpty(meth)) continue;
+                int slash = meth.LastIndexOf('/');
+                if (slash <= 0) continue;
+                string objPath = meth.Substring(0, slash);
+                if (created.ContainsKey(objPath)) continue;
+                var objNode = ResolveNode(objPath);
+                if (objNode == null) continue;
+                string mg = WireMethodGuard(objNode, objPath, meth.Substring(slash + 1), multi ? ci : -1);
+                if (mg != null) { addGuardErr(idx, mg, addErr); return; }
+            }
+        }
+        catch { /* a validator that cannot decide stays silent; the write path still guards */ }
+    }
+
+    // Turn a guard's {"ok":false,"error":"<code>",...} answer into one validate_ops
+    // error: code + message + the guard's own fields (available, hint, ...).
+    private static void addGuardErr(int idx, string guardJson, Action<int, string, string, string> addErr)
+    {
+        using (var gd = System.Text.Json.JsonDocument.Parse(guardJson))
+        {
+            var g = gd.RootElement;
+            string code = JsonStr(g, "error") ?? "wire_event_invalid";
+            string msg = JsonStr(g, "message") ?? JsonStr(g, "hint") ?? code;
+            var extra = new StringBuilder();
+            foreach (var prop in g.EnumerateObject())
+            {
+                if (prop.Name == "ok" || prop.Name == "error" || prop.Name == "message") continue;
+                if (extra.Length > 0) extra.Append(",");
+                extra.Append("\"" + JsonEscape(prop.Name) + "\":" + prop.Value.GetRawText());
+            }
+            addErr(idx, code, msg, extra.ToString());
+        }
+    }
+
+    // ValidateOpsJson helper for a wire_event op carrying `calls`: structure plus
+    // target resolution against the hypothetical model (a variable or method
+    // object created earlier in the batch resolves).
+    private void ValidateWireCallsOp(int idx, System.Text.Json.JsonElement op,
+        Dictionary<string, HypoNode> created, Dictionary<string, string> relocated,
+        List<string> willCreate, Action<int, string, string, string> addErr)
+    {
+        System.Text.Json.JsonElement callsEl;
+        if (!op.TryGetProperty("calls", out callsEl)) return;
+        if (callsEl.ValueKind != System.Text.Json.JsonValueKind.Array)
+        { addErr(idx, "calls_not_a_list", "wire_event `calls` must be a list of method-call objects", null); return; }
+        int n = 0, ci = -1;
+        foreach (var call in callsEl.EnumerateArray())
+        {
+            ci++; n++;
+            string extra = "\"call_index\":" + ci;
+            if (call.ValueKind != System.Text.Json.JsonValueKind.Object)
+            { addErr(idx, "call_not_an_object", "calls[" + ci + "] must be an object", extra); continue; }
+            string cmd = JsonStr(call, "command");
+            string meth = JsonStr(call, "method") ?? JsonStr(call, "method_path");
+            bool hasCmd = !string.IsNullOrEmpty(cmd), hasMeth = !string.IsNullOrEmpty(meth);
+            if (hasCmd && hasMeth)
+            { addErr(idx, "call_ambiguous", "calls[" + ci + "] has both command and method_path", extra); continue; }
+            if (!hasCmd && !hasMeth)
+            { addErr(idx, "call_missing_action", "calls[" + ci + "] needs `command` or `method_path`", extra); continue; }
+            if (hasMeth)
+            {
+                int slash = meth.LastIndexOf('/');
+                if (slash <= 0)
+                { addErr(idx, "call_bad_method", "calls[" + ci + "].method_path must be 'ObjectPath/MethodName'", extra); continue; }
+                string objPath = meth.Substring(0, slash);
+                if (HypoResolve(objPath, created, relocated) == null)
+                    addErr(idx, "unresolved_reference",
+                           "calls[" + ci + "]: no method object at '" + objPath + "'" + NearestHint(objPath, willCreate), extra);
+                continue;
+            }
+            if (Array.IndexOf(_UiCommands, cmd) >= 0)
+            {
+                if (cmd == "OpenKeyboard")
+                {
+                    var kerr = OpenKeyboardArgsError(JsonStr(call, "args"));
+                    if (kerr != null) addErr(idx, "call_bad_args", "calls[" + ci + "]: " + kerr, extra);
+                }
+                continue;
+            }
+            if (cmd != "SetVariable" && cmd != "ToggleVariable" && cmd != "Set" && cmd != "Toggle")
+            { addErr(idx, "call_unknown_command", "calls[" + ci + "]: unknown command '" + cmd + "'", extra); continue; }
+            string v = JsonStr(call, "variable");
+            if (string.IsNullOrEmpty(v))
+            { addErr(idx, "call_missing_variable", "calls[" + ci + "]: " + cmd + " needs `variable`", extra); continue; }
+            if (HypoResolve(v, created, relocated) == null)
+                addErr(idx, "unresolved_reference",
+                       "calls[" + ci + "]: no variable at '" + v + "'" + NearestHint(v, willCreate), extra);
+        }
+        if (n == 0) addErr(idx, "calls_empty", "wire_event `calls` is empty", null);
     }
 
     // ---- setup / project scaffolding ----------------------------------------
@@ -5849,6 +9917,82 @@ public class StudioMCPBridge : BaseNetLogic
         { "max","min","avg","abs","trunc","ceil","floor","round","sqrt","sign","like",
           "isempty","if","left_of","right_of" };
 
+    // Functions the ExpressionEvaluator gained in a later Studio release, name -> the
+    // minimum "major.minor" that has it. `pow` arrived in Studio 1.8; on 1.7 the runtime
+    // rejects it, so ValidateExpressionSyntax reports function_requires_version instead
+    // of the generic unknown-function error. Not in ExprFunctions: that set is the
+    // functions present on EVERY supported Studio.
+    private static readonly System.Collections.Generic.Dictionary<string, string> ExprFunctionMinVersion =
+        new System.Collections.Generic.Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
+        { { "pow", "1.8" } };
+
+    // The running Studio's PRODUCT version ("1.7.4.32", "1.8.0.555"): the version resource of
+    // the Studio process's main module (the FactoryTalk Optix Studio executable), or
+    // "unknown". NOT the FTOptix.UI assembly version (21.2.0.98), which is unrelated to the
+    // Studio release and made the VersionAtLeast pow gate pass on 1.7. Used for
+    // /bridge/health, the schema dump and the expression version gate. Cached.
+    private static string _studioVersionCache;
+    private static string StudioVersionString()
+    {
+        if (_studioVersionCache != null) return _studioVersionCache;
+        string version = "unknown";
+        try
+        {
+            var info = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileVersionInfo;
+            string raw = info.ProductVersion;
+            if (string.IsNullOrEmpty(raw)) raw = info.FileVersion;
+            string clean = CleanProductVersion(raw);
+            if (clean.Length > 0) version = clean;
+        }
+        catch { /* keep "unknown" */ }
+        _studioVersionCache = version;
+        return version;
+    }
+
+    // Leading "digits and dots" of a version resource string ("1.7.4.32+abc" -> "1.7.4.32",
+    // "1.8.0.555 (build)" -> "1.8.0.555"); "" when it does not start with a digit.
+    private static string CleanProductVersion(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        raw = raw.Trim();
+        int cut = 0;
+        while (cut < raw.Length && (char.IsDigit(raw[cut]) || raw[cut] == '.')) cut++;
+        string v = raw.Substring(0, cut).Trim('.');
+        return v.IndexOf('.') < 0 ? "" : v;
+    }
+
+    // True iff `version` ("1.7.4.32", "1.8") is at least major.minor `min` ("1.8").
+    // An unparseable/"unknown" version returns true: the bridge must not refuse a
+    // function it cannot prove the Studio lacks.
+    private static bool VersionAtLeast(string version, string min)
+    {
+        System.Version have, need;
+        if (!System.Version.TryParse(NormalizeVersion(version), out have)) return true;
+        if (!System.Version.TryParse(NormalizeVersion(min), out need)) return true;
+        return have.Major > need.Major || (have.Major == need.Major && have.Minor >= need.Minor);
+    }
+
+    // Version.TryParse needs at least "major.minor"; pad a bare "1" and drop any suffix.
+    private static string NormalizeVersion(string v)
+    {
+        if (string.IsNullOrEmpty(v)) return "";
+        int cut = 0;
+        while (cut < v.Length && (char.IsDigit(v[cut]) || v[cut] == '.')) cut++;
+        v = v.Substring(0, cut);
+        return v.IndexOf('.') < 0 && v.Length > 0 ? v + ".0" : v;
+    }
+
+    // function_requires_version message for `w` when it is a version-gated function
+    // this Studio lacks, else null. `studioVersion` is injectable for testing.
+    private static string ExprFunctionVersionErr(string w, string studioVersion)
+    {
+        string min;
+        if (!ExprFunctionMinVersion.TryGetValue(w, out min)) return null;
+        if (VersionAtLeast(studioVersion, min)) return null;
+        return "function_requires_version: '" + w.ToLowerInvariant() + "' requires Optix Studio " + min
+               + " or later (this Studio is " + studioVersion + ")";
+    }
+
     // LiteralLintTable -- maps runtime-rejected literal tokens to their design-time fixes.
     // Three literal classes are checked by ValidateExpressionSyntax without reimplementing
     // the ExpressionEvaluator grammar:
@@ -5954,7 +10098,19 @@ public class StudioMCPBridge : BaseNetLogic
                 var boolE = LiteralBoolErr(word.ToString()); if (boolE != null) return boolE;
                 string w = word.ToString();
                 if (w.Length > 0 && char.IsLetter(w[0]) && !ExprFunctions.Contains(w))
-                    return "unknown function '" + w + "' (valid: " + string.Join(", ", ExprFunctions) + ")";
+                {
+                    // Version-gated functions (pow = Studio 1.8): accepted on a Studio
+                    // that has them, a structured function_requires_version error on one
+                    // that does not -- never the generic unknown-function message.
+                    if (ExprFunctionMinVersion.ContainsKey(w))
+                    {
+                        var verErr = ExprFunctionVersionErr(w, StudioVersionString());
+                        if (verErr != null) return verErr;
+                    }
+                    else
+                        return "unknown function '" + w + "' (valid: " + string.Join(", ", ExprFunctions)
+                               + ", pow on Studio 1.8+)";
+                }
                 paren++; word.Clear(); continue;
             }
             if (c == ')')
@@ -6055,7 +10211,7 @@ public class StudioMCPBridge : BaseNetLogic
         if (err == null)
             return "{\"ok\":true,\"valid\":true,\"sources\":" + n + "}";
         return "{\"ok\":true,\"valid\":false,\"sources\":" + n + ",\"error\":\"" + JsonEscape(err) + "\"" +
-               InvalidLiteralExtra(err) + "}";
+               InvalidLiteralExtra(err) + RequiresVersionExtra(err) + "}";
     }
 
     // Diagnostic: reflect a CLR type's public methods + properties (walking the base
@@ -6451,7 +10607,72 @@ public class StudioMCPBridge : BaseNetLogic
                     return nid;
             }
         }
+        // Catalog miss on a PINNED "Module.Type" name: the part after the module
+        // prefix may be the type's BrowseName rather than its catalog field name
+        // (FTOptix.RAEtherNetIP.RAEtherNetIPDriver: the field is Driver, the
+        // BrowseName RAEtherNetIPDriver). Dry run accepts the BrowseName spelling,
+        // so apply must too - and the catalog spelling keeps working above.
+        if (ns != null) return ResolveModuleTypeByBrowseName(ns, field);
         return null;
+    }
+
+    // Fallback for ResolveModuleTypeId: BrowseName lookup of `browseName` in the
+    // type tree, restricted to the namespace index of module `ns` (derived from
+    // that module's own ObjectTypes catalog), so a same-named type in another
+    // module, FTOptix.UI or the project can never answer for it. Null when the
+    // module is not loaded or the BrowseName is absent from its namespace.
+    private static NodeId ResolveModuleTypeByBrowseName(string ns, string browseName)
+    {
+        if (string.IsNullOrEmpty(ns) || string.IsNullOrEmpty(browseName)) return null;
+        try
+        {
+            int nsIdx = ModuleNamespaceIndex(ns);
+            if (nsIdx <= 0 || nsIdx == ProjectNsIdx()) return null;
+            var anchor = UiTypeAnchor();
+            if (anchor == null) return null;
+            var root = anchor;
+            while (root.Owner != null && root.Owner.NodeClass == NodeClass.ObjectType)
+                root = root.Owner;
+            // widen to the Types folder, as ResolveUiTypeId step (b) does
+            var searchRoot = root;
+            if (searchRoot.Owner != null) searchRoot = searchRoot.Owner;
+            if (searchRoot.Owner != null) searchRoot = searchRoot.Owner;
+            var hit = FindTypeByBrowseName(searchRoot, browseName, nsIdx);
+            return hit == null ? null : hit.NodeId;
+        }
+        catch { return null; }
+    }
+
+    // The namespace index of loaded module `ns` (e.g. "FTOptix.RAEtherNetIP"),
+    // read from the NodeIds of its <ns>.ObjectTypes catalog fields; -1 if none.
+    private static int ModuleNamespaceIndex(string ns)
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException e) { types = e.Types; }
+            catch { continue; }
+            if (types == null) continue;
+            foreach (var t in types)
+            {
+                if (t == null || t.Name != "ObjectTypes" || t.Namespace != ns) continue;
+                FieldInfo[] fields;
+                try { fields = t.GetFields(BindingFlags.Public | BindingFlags.Static); }
+                catch { continue; }
+                foreach (var f in fields)
+                {
+                    try
+                    {
+                        if (!(f.GetValue(null) is NodeId nid)) continue;
+                        var node = InformationModel.Get(nid);
+                        if (node != null) return nid.NamespaceIndex;
+                    }
+                    catch { /* unreadable field: try the next */ }
+                }
+            }
+        }
+        return -1;
     }
 
     // The project's own namespace index (for step (b2)'s exclusion); -2 when
@@ -6554,6 +10775,7 @@ public class StudioMCPBridge : BaseNetLogic
         var deref = MapDeref(node);
         if (deref != null)
             sb.Append(",\"ref\":\"" + JsonEscape(deref) + "\"");
+        sb.Append(LinkTargetJson(node as IUAVariable));
         var kids = node.Children.ToList();
         if (kids.Count > 0)
         {
@@ -6652,7 +10874,7 @@ public class StudioMCPBridge : BaseNetLogic
     }
 
     // Project-relative path of a node (walk the Owner chain up to the root).
-    private string NodePathOf(IUANode node)
+    private static string NodePathOf(IUANode node)
     {
         try
         {
@@ -6769,6 +10991,135 @@ public class StudioMCPBridge : BaseNetLogic
             return rel;
         }
         catch { return null; }
+    }
+
+    // DynamicLink / Source* values that are NodeId references print as
+    // {NodeId:ns=..;g=..} - useless without GUID matching by hand. Resolve the
+    // NodeId (InformationModel.Get) and return a JSON fragment
+    //   ,"target_path":"<browse path from the project root>"
+    // beside the raw value; an unresolvable NodeId yields
+    //   ,"target_path":null,"target_missing":true
+    // (the dangling-link diagnostic). Returns "" when the variable is not a
+    // DynamicLink / Source* holding a NodeId, so callers can append it blindly.
+    private string LinkTargetJson(IUAVariable v)
+    {
+        try
+        {
+            if (v == null) return "";
+            string tn = v.GetType().Name;
+            bool isSource = v.BrowseName != null && v.BrowseName.StartsWith("Source");
+            if (tn != "DynamicLink" && !isSource) return "";
+            var cand = v.Value != null ? v.Value.Value : null;
+            if (isSource && (cand == null || (cand is string && ((string)cand).Length == 0)))
+            {
+                // Source holder carrying a DynamicLink child whose value is the NodeId
+                // or a NodePath string.
+                var dl = v.Refs.GetVariable(FTOptix.CoreBase.ReferenceTypes.HasDynamicLink);
+                cand = dl != null && dl.Value != null ? dl.Value.Value : null;
+            }
+            var nid = cand as NodeId;
+            string str = cand as string;
+            if (nid == null && string.IsNullOrEmpty(str)) return "";
+            IUANode target = null;
+            if (nid != null)
+            {
+                try { target = InformationModel.Get(nid); } catch { target = null; }
+            }
+            else
+            {
+                // NodePath string: "{NodeId:ns=103;g=...}" or a browse path.
+                if (str.IndexOf('@') >= 0) return "";   // attribute ref, not a node target
+                NodeId parsed;
+                if (TryParseNodeIdString(str, out parsed))
+                {
+                    try { target = InformationModel.Get(parsed); } catch { target = null; }
+                }
+                else
+                {
+                    var rel = str;
+                    var absPrefix = "/Objects/" + Project.Current.BrowseName + "/";
+                    if (rel.StartsWith(absPrefix)) rel = rel.Substring(absPrefix.Length);
+                    target = ResolveNodeLoose(rel);
+                    if (target == null)
+                    {
+                        // Relative forms ("../X", "./X") are anchored at the node that
+                        // HOLDS the link: the DynamicLink's owner, or the Source*
+                        // variable itself. Walk segments by hand (".." = Owner).
+                        var holder = tn == "DynamicLink" ? v.Owner : (IUANode)v;
+                        target = ResolveRelativeFrom(holder, str);
+                        if (target == null && holder != null && !(tn == "DynamicLink") && v.Owner != null)
+                            target = ResolveRelativeFrom(v.Owner, str);
+                    }
+                }
+            }
+            if (target == null)
+                return ",\"target_path\":null,\"target_missing\":true";
+            var p = NodePathOf(target);
+            return ",\"target_path\":\"" +
+                   JsonEscape(string.IsNullOrEmpty(p) ? target.BrowseName : p) + "\"";
+        }
+        catch { return ""; }
+    }
+
+    // Resolve a relative NodePath ("../../Model/X", "./Y") from `anchor`: each
+    // ".." steps to the Owner, "." stays, any other segment is a child by
+    // BrowseName. Null when the path is not relative, climbs past the root, or a
+    // segment does not exist.
+    private static IUANode ResolveRelativeFrom(IUANode anchor, string rel)
+    {
+        try
+        {
+            if (anchor == null || string.IsNullOrEmpty(rel)) return null;
+            if (!(rel == "." || rel == ".." || rel.StartsWith("./") || rel.StartsWith("../")))
+                return null;
+            var cur = anchor;
+            foreach (var seg in rel.Split('/'))
+            {
+                if (seg.Length == 0 || seg == ".") continue;
+                if (seg == "..") { cur = cur.Owner; }
+                else
+                {
+                    IUANode next = null;
+                    foreach (var c in cur.Children)
+                        if (c.BrowseName == seg) { next = c; break; }
+                    cur = next;
+                }
+                if (cur == null) return null;
+            }
+            return cur;
+        }
+        catch { return null; }
+    }
+
+    // Grammar of a NodeId rendered as a NodePath string:
+    //   {NodeId:ns=<n>;g=<guid>}   (also i=<uint> and s=<string> identifiers)
+    // Pure string parsing (no project access) so it is unit-testable; returns
+    // false for anything that is not that form (browse paths fall through).
+    private const string NodeIdStringPattern =
+        @"^\s*\{NodeId:ns=(\d+);(?:g=([0-9A-Fa-f-]{32,36})|i=(\d+)|s=([^}]*))\}\s*$";
+
+    private static bool TryParseNodeIdString(string s, out NodeId nid)
+    {
+        nid = null;
+        if (string.IsNullOrEmpty(s)) return false;
+        var m = System.Text.RegularExpressions.Regex.Match(s, NodeIdStringPattern);
+        if (!m.Success) return false;
+        try
+        {
+            ushort ns = ushort.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
+            if (m.Groups[2].Success)
+            {
+                Guid g;
+                if (!Guid.TryParse(m.Groups[2].Value, out g)) return false;
+                nid = new NodeId(ns, g);
+            }
+            else if (m.Groups[3].Success)
+                nid = new NodeId(ns, uint.Parse(m.Groups[3].Value, CultureInfo.InvariantCulture));
+            else
+                nid = new NodeId(ns, m.Groups[4].Value);
+            return nid != null;
+        }
+        catch { nid = null; return false; }
     }
 
     // Inline dereference for the detail walk: a NodePointer/Alias value is a
@@ -6985,7 +11336,7 @@ public class StudioMCPBridge : BaseNetLogic
     {
         return "{\"error\":{\"code\":\"" + JsonEscape(code) +
                "\",\"message\":\"" + JsonEscape(message) + "\"" +
-               InvalidLiteralExtra(message) + "}}";
+               InvalidLiteralExtra(message) + RequiresVersionExtra(message) + "}}";
     }
 
     // 1.0.8: ValidateExpressionSyntax's two literal-lint checks
@@ -7005,6 +11356,24 @@ public class StudioMCPBridge : BaseNetLogic
         string fix = idx >= 0 ? reason.Substring(idx + 4).Trim().Trim('\'') : "";
         return ",\"invalid_literal\":{\"reason\":\"" + JsonEscape(reason) +
                "\",\"fix\":\"" + JsonEscape(fix) + "\"}";
+    }
+
+    // function_requires_version: ValidateExpressionSyntax's message for a function the
+    // running Studio lacks (pow needs 1.8). Every JSON body carrying it gets a structured
+    // {function, min_version, studio_version} sibling so a caller reads the requirement
+    // without parsing prose. "" for every other message.
+    private static string RequiresVersionExtra(string message)
+    {
+        const string prefix = "function_requires_version: '";
+        if (message == null || !message.StartsWith(prefix)) return "";
+        int end = message.IndexOf('\'', prefix.Length);
+        if (end < 0) return "";
+        string fn = message.Substring(prefix.Length, end - prefix.Length);
+        string min;
+        if (!ExprFunctionMinVersion.TryGetValue(fn, out min)) return "";
+        return ",\"requires_version\":{\"function\":\"" + JsonEscape(fn) +
+               "\",\"min_version\":\"" + JsonEscape(min) +
+               "\",\"studio_version\":\"" + JsonEscape(StudioVersionString()) + "\"}";
     }
 
     private static string Bool(bool b) { return b ? "true" : "false"; }

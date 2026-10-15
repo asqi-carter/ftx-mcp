@@ -27,6 +27,8 @@ _FAKE_WS_DEFAULTS: dict = {
     "Page.getLayoutMetrics": {
         "cssVisualViewport": {"clientWidth": 1280, "clientHeight": 720},
     },
+    "Page.getFrameTree": {"frameTree": {"frame": {"id": "main",
+                                                  "url": "about:blank"}}},
 }
 
 
@@ -219,15 +221,29 @@ class _StaleFakeSess:
     navigate/reload/close so the test can assert the recovery actually
     reconnects + hard-reloads rather than silently reusing the old tab."""
 
+    frame_url = ""  # class-level so tests can monkeypatch the main-frame URL
+
     def __init__(self):
         self.navigated_to: list[str] = []
         self.reloaded: list[bool] = []
         self.closed = 0
+        self.load_waits: list[float] = []
+        self.order: list[str] = []
+
+    def main_frame_url(self):
+        return self.frame_url
+
+    def wait_for_load(self, timeout):
+        self.load_waits.append(timeout)
+        self.order.append("wait")
+        return True
 
     def navigate(self, url):
+        self.order.append("navigate")
         self.navigated_to.append(url)
 
     def reload(self, ignore_cache: bool = False):
+        self.order.append("reload")
         self.reloaded.append(ignore_cache)
 
     def close(self):
@@ -288,8 +304,64 @@ def test_cdp_screenshot_fresh_recovers_from_stale_capture(cfg, monkeypatch):
     # call #1 session, call #2's initial (stale) session, call #2's recovery session
     assert len(sessions) == 3
     assert sessions[1].closed == 1  # the stale session was torn down, not reused
-    assert sessions[2].navigated_to  # recovery re-navigated the fresh session
-    assert sessions[2].reloaded == [True]  # ...and hard-reloaded (ignore_cache=True)
+    # URL differs from the recover target -> exactly one navigate, no reload
+    assert len(sessions[2].navigated_to) == 1
+    assert sessions[2].reloaded == []
+
+
+def test_cdp_stale_recovery_reloads_once_when_already_on_target(cfg, monkeypatch):
+    target = core._runtime_verify_url(cfg, None)
+    monkeypatch.setattr(_StaleFakeSess, "frame_url", target, raising=False)
+    sessions = _script_stale_capture_test(monkeypatch, [
+        (b"frame-A", None, None), (b"frame-A", None, None), (b"frame-B", None, None),
+    ])
+    core.cdp_screenshot_runtime(cfg, fresh=True)
+    out = core.cdp_screenshot_runtime(cfg, fresh=True)
+    assert out["stale_recovery"] == {"attempted": True, "resolved": True}
+    rec = sessions[2]
+    assert rec.reloaded == [True]  # exactly one reload(ignore_cache=True)
+    assert rec.navigated_to == []  # ...and no navigate
+    assert rec.order == ["reload", "wait"]
+
+
+def test_cdp_stale_recovery_navigates_once_when_url_differs(cfg, monkeypatch):
+    monkeypatch.setattr(_StaleFakeSess, "frame_url", "http://elsewhere/", raising=False)
+    sessions = _script_stale_capture_test(monkeypatch, [
+        (b"frame-A", None, None), (b"frame-A", None, None), (b"frame-B", None, None),
+    ])
+    core.cdp_screenshot_runtime(cfg, fresh=True)
+    out = core.cdp_screenshot_runtime(cfg, fresh=True, navigate_url="http://x:1/")
+    assert out["stale_recovery"]["resolved"] is True
+    rec = sessions[2]
+    assert rec.navigated_to == ["http://x:1/"]
+    assert rec.reloaded == []
+    assert rec.order == ["navigate", "wait"]
+
+
+def test_cdp_stale_recovery_load_wait_is_bounded_by_settle_plus_slack(cfg, monkeypatch):
+    sessions = _script_stale_capture_test(monkeypatch, [
+        (b"frame-A", None, None), (b"frame-A", None, None), (b"frame-B", None, None),
+    ])
+    core.cdp_screenshot_runtime(cfg, fresh=True, settle_seconds=2.0)
+    core.cdp_screenshot_runtime(cfg, fresh=True, settle_seconds=2.0)
+    (bound,) = sessions[2].load_waits
+    assert 2.0 < bound <= 2.0 + 10.0
+
+
+def test_cdp_client_wait_for_load_event_and_ready_state(monkeypatch):
+    from service import _cdp
+    ws = FakeWS(results={"Runtime.evaluate": {"result": {"value": "loading"}}})
+    monkeypatch.setattr(_cdp, "_discover_page_ws", lambda url, timeout=5.0: "ws://x/1")
+    monkeypatch.setattr(_cdp, "_connect_ws", lambda url, timeout=30.0: ws)
+    c = _cdp.CDPClient()
+    assert c.wait_for_load(0.0) is False  # never complete -> bounded, no hang
+    ws.results["Runtime.evaluate"] = {"result": {"value": "complete"}}
+    assert c.wait_for_load(1.0) is True
+    ws.results["Runtime.evaluate"] = {"result": {"value": "loading"}}
+    c.navigate("http://x/")
+    ws.pre_events = [{"method": "Page.loadEventFired", "params": {}}]
+    c.reload(ignore_cache=True)  # event arrives while reading the reply
+    assert c.wait_for_load(0.0) is True
 
 
 def test_cdp_screenshot_fresh_reports_unresolved_when_still_stale_after_recovery(cfg, monkeypatch):
@@ -305,6 +377,165 @@ def test_cdp_screenshot_fresh_reports_unresolved_when_still_stale_after_recovery
     assert out2["state"] == "succeeded"  # never raises -- surfaces the info instead
     assert out2["stale_recovery"] == {"attempted": True, "resolved": False}
     assert "next_step" in out2
+
+
+def _stale_recovery_raises(cfg, monkeypatch, exc):
+    sessions = _script_stale_capture_test(monkeypatch, [
+        (b"frame-A", None, None),
+        (b"frame-A", None, None),
+    ])
+    out1 = core.cdp_screenshot_runtime(cfg, fresh=True)
+    assert "stale_recovery" not in out1
+
+    def boom(self, url):
+        raise exc
+    monkeypatch.setattr(_StaleFakeSess, "navigate", boom)
+    return core.cdp_screenshot_runtime(cfg, fresh=True)
+
+
+def test_cdp_screenshot_fresh_recovery_cdp_error_keeps_original_capture(cfg, monkeypatch):
+    from service import _cdp
+    out = _stale_recovery_raises(cfg, monkeypatch, _cdp.CDPError("reconnect failed"))
+    assert out["state"] == "succeeded"
+    assert out["size_bytes"] == len(b"frame-A")
+    assert out["stale_recovery"] == {"attempted": True, "resolved": False,
+                                     "error": "reconnect failed"}
+    assert "next_step" in out
+
+
+def test_cdp_screenshot_fresh_recovery_generic_exception_keeps_original_capture(cfg, monkeypatch):
+    out = _stale_recovery_raises(cfg, monkeypatch, RuntimeError("kaboom"))
+    assert out["state"] == "succeeded"
+    assert out["size_bytes"] == len(b"frame-A")
+    assert out["stale_recovery"] == {"attempted": True, "resolved": False, "error": "kaboom"}
+    assert "next_step" in out
+
+
+class _InFlightFakeSess(_StaleFakeSess):
+    """Fake CDP session that models Chrome's in-flight navigation: a
+    navigate() leaves a load pending until wait_for_load(), and any
+    reload() issued while it is pending fails with 'Not attached to an
+    active page' -- the real-world failure of the old navigate-then-reload
+    recovery."""
+
+    def __init__(self):
+        super().__init__()
+        self.in_flight = False
+
+    def navigate(self, url):
+        super().navigate(url)
+        self.in_flight = True
+
+    def reload(self, ignore_cache: bool = False):
+        if self.in_flight:
+            raise _cdp.CDPError(_cdp.NOT_ATTACHED_MSG)
+        super().reload(ignore_cache)
+
+    def wait_for_load(self, timeout):
+        self.in_flight = False
+        return super().wait_for_load(timeout)
+
+
+def _seed_then_stale_call(cfg, monkeypatch, second_responses, **second_kwargs):
+    """Seed the fresh-capture cache with frame-A, then make a second fresh
+    call that is byte-identical (so recovery fires). Returns (out, sessions)."""
+    sessions = _script_stale_capture_test(
+        monkeypatch, [(b"frame-A", None, None)] + second_responses)
+    out1 = core.cdp_screenshot_runtime(cfg, fresh=True)
+    assert "stale_recovery" not in out1
+    out2 = core.cdp_screenshot_runtime(cfg, fresh=True, **second_kwargs)
+    return out2, sessions
+
+
+def test_selfheal_not_attached_during_recovery_still_succeeds_with_first_capture(cfg, monkeypatch):
+    # A reload racing an in-flight navigate raises 'Not attached'. Whatever
+    # the cause, recovery must never turn a valid capture into a failure.
+    sessions: list[_InFlightFakeSess] = []
+
+    def fake_session(c, **k):
+        s = _InFlightFakeSess()
+        sessions.append(s)
+        return s
+
+    def racy_navigate_then_reload(self, url):
+        # Models the old buggy recovery: reload issued during in-flight navigate.
+        _StaleFakeSess.navigate(self, url)
+        self.in_flight = True
+        self.reload(ignore_cache=True)
+    monkeypatch.setattr(_InFlightFakeSess, "navigate", racy_navigate_then_reload)
+    _script_stale_capture_test(monkeypatch, [])
+    monkeypatch.setattr(core, "_cdp_session", fake_session)
+    caps = iter([(b"frame-A", None, None), (b"frame-A", None, None)])
+    monkeypatch.setattr(core, "_cdp_capture_once", lambda *a, **k: next(caps))
+    core.cdp_screenshot_runtime(cfg, fresh=True)
+    out = core.cdp_screenshot_runtime(cfg, fresh=True)
+    assert out["state"] == "succeeded"
+    assert out["size_bytes"] == len(b"frame-A")  # the first (valid) capture
+    assert out["stale_recovery"]["attempted"] is True
+    assert out["stale_recovery"]["resolved"] is False
+    assert _cdp.NOT_ATTACHED_MSG in out["stale_recovery"]["error"]
+
+
+def test_selfheal_not_attached_on_reload_keeps_first_capture(cfg, monkeypatch):
+    # URL matches -> reload path; the reload itself is detached.
+    target = core._runtime_verify_url(cfg, None)
+    monkeypatch.setattr(_StaleFakeSess, "frame_url", target, raising=False)
+
+    def detached(self, ignore_cache=False):
+        raise _cdp.CDPError(_cdp.NOT_ATTACHED_MSG)
+    monkeypatch.setattr(_StaleFakeSess, "reload", detached)
+    out, _ = _seed_then_stale_call(cfg, monkeypatch, [(b"frame-A", None, None)])
+    assert out["state"] == "succeeded"
+    assert out["size_bytes"] == len(b"frame-A")
+    assert out["stale_recovery"] == {
+        "attempted": True, "resolved": False, "error": _cdp.NOT_ATTACHED_MSG}
+    assert "next_step" in out
+
+
+def _run_with_inflight_sessions(cfg, monkeypatch):
+    """Two fresh calls (seed, then identical -> recovery) on sessions that
+    model in-flight navigation. Returns (second_result, sessions_opened)."""
+    sessions: list[_InFlightFakeSess] = []
+
+    def fake_session(c, **k):
+        s = _InFlightFakeSess()
+        sessions.append(s)
+        return s
+    _script_stale_capture_test(monkeypatch, [])  # patches sleep/point/cache
+    monkeypatch.setattr(core, "_cdp_session", fake_session)
+    caps = iter([(b"frame-A", None, None), (b"frame-A", None, None), (b"frame-B", None, None)])
+    monkeypatch.setattr(core, "_cdp_capture_once", lambda *a, **k: next(caps))
+    core.cdp_screenshot_runtime(cfg, fresh=True)
+    return core.cdp_screenshot_runtime(cfg, fresh=True), sessions
+
+
+def test_selfheal_url_match_issues_exactly_one_reload_and_zero_navigates(cfg, monkeypatch):
+    target = core._runtime_verify_url(cfg, None)
+    monkeypatch.setattr(_StaleFakeSess, "frame_url", target, raising=False)
+    out, sessions = _run_with_inflight_sessions(cfg, monkeypatch)
+    assert out["state"] == "succeeded"
+    assert out["stale_recovery"] == {"attempted": True, "resolved": True}
+    assert sum(len(s.reloaded) for s in sessions) == 1
+    assert sum(len(s.navigated_to) for s in sessions) == 0
+    assert sessions[-1].reloaded == [True]
+
+
+def test_selfheal_url_mismatch_issues_exactly_one_navigate_and_zero_reloads(cfg, monkeypatch):
+    monkeypatch.setattr(_StaleFakeSess, "frame_url", "http://elsewhere/", raising=False)
+    out, sessions = _run_with_inflight_sessions(cfg, monkeypatch)
+    assert out["state"] == "succeeded"
+    assert out["stale_recovery"] == {"attempted": True, "resolved": True}
+    assert sum(len(s.navigated_to) for s in sessions) == 1
+    assert sum(len(s.reloaded) for s in sessions) == 0
+
+
+def test_selfheal_identical_captures_succeed_with_resolved_false(cfg, monkeypatch):
+    out, _ = _seed_then_stale_call(cfg, monkeypatch, [
+        (b"frame-A", None, None), (b"frame-A", None, None)])
+    assert out["state"] == "succeeded"
+    assert out["stale_recovery"] == {"attempted": True, "resolved": False}
+    assert "error" not in out["stale_recovery"]
+    assert out["size_bytes"] == len(b"frame-A")
 
 
 def test_cdp_screenshot_no_stale_check_when_not_fresh(cfg, fake_cdp, monkeypatch):
@@ -430,12 +661,70 @@ def test_ensure_page_opens_via_put_when_tabless(monkeypatch):
     assert puts and puts[0][1] == "PUT"
 
 
+_HEALTHY_PAGE = {"healthy": True, "not_attached": False, "detail": "page answered 1+1"}
+_NOT_ATTACHED = {"healthy": False, "not_attached": True,
+                 "detail": "Runtime.evaluate: Not attached to an active page"}
+
+
 def test_ensure_chrome_cdp_already_healthy(cfg, monkeypatch):
     monkeypatch.setattr(_cdp, "probe", lambda url, timeout=2.0: {"alive": True, "has_page": True})
+    monkeypatch.setattr(_cdp, "page_probe", lambda url, timeout=5.0: _HEALTHY_PAGE)
     runner = make_fake_runner()
     out = core.ensure_chrome_cdp(cfg, runner=runner)
     assert out["state"] == "ok" and out["restarted"] is False
     assert runner.calls == []  # no process work when healthy
+
+
+def test_page_probe_sends_runtime_evaluate_1_plus_1(fake_cdp):
+    ws = fake_cdp(results={"Runtime.evaluate": {"result": {"type": "number", "value": 2}}})
+    out = _cdp.page_probe("http://127.0.0.1:9222")
+    assert out["healthy"] is True
+    evals = [p for (m, p, _) in ws.sent if m == "Runtime.evaluate"]
+    assert len(evals) == 1 and evals[0]["expression"] == "1+1"
+
+
+def test_page_probe_not_attached_is_unhealthy(fake_cdp):
+    fake_cdp(results={"Runtime.evaluate": RuntimeError("Not attached to an active page")})
+    out = _cdp.page_probe("http://127.0.0.1:9222")
+    assert out["healthy"] is False and out["not_attached"] is True
+
+
+def test_ensure_chrome_cdp_not_attached_triggers_restart(cfg, monkeypatch):
+    """Target listed, but a page-level call answers 'Not attached to an active
+    page' -> must NOT report 'already healthy'; must restart the task."""
+    seq = iter([{"alive": True, "has_page": True}, {"alive": True, "has_page": True}])
+    monkeypatch.setattr(_cdp, "probe", lambda url, timeout=2.0: next(seq))
+    monkeypatch.setattr(_cdp, "page_probe", lambda url, timeout=5.0: _NOT_ATTACHED)
+    monkeypatch.setattr(core, "_tcp_probe", lambda h, p, timeout=0.5: True)
+    monkeypatch.setattr(_cdp, "ensure_page", lambda url, **k: None)
+    runner = make_fake_runner()
+    out = core.ensure_chrome_cdp(cfg, runner=runner, wait_seconds=1.0)
+    assert out["state"] == "restarted" and out["restarted"] is True
+    assert out["detail"] != "already healthy"
+    ran = [" ".join(c[0]) for c in runner.calls]
+    assert any("schtasks" in r and core._CHROME_CDP_TASK in r for r in ran)
+
+
+def test_ensure_chrome_cdp_not_attached_no_restart_when_disabled(cfg, monkeypatch):
+    monkeypatch.setattr(_cdp, "probe", lambda url, timeout=2.0: {"alive": True, "has_page": True})
+    monkeypatch.setattr(_cdp, "page_probe", lambda url, timeout=5.0: _NOT_ATTACHED)
+    runner = make_fake_runner()
+    out = core.ensure_chrome_cdp(cfg, runner=runner, allow_restart=False)
+    assert out["state"] == "failed" and "Not attached" in out["detail"]
+    assert runner.calls == []
+
+
+@pytest.mark.skipif(
+    __import__("os").environ.get("FTX_LIVE_CDP") != "1",
+    reason="live CDP test: set FTX_LIVE_CDP=1 with the chrome-cdp Chrome running",
+)
+def test_page_probe_live():
+    """Against a real Chrome (OPTIX_CDP_URL, default :9222) a healthy page
+    answers 1+1. Run: FTX_LIVE_CDP=1 pytest service/tests/test_cdp.py -k live"""
+    import os
+    url = os.environ.get("OPTIX_CDP_URL", "http://127.0.0.1:9222")
+    _cdp.ensure_page(url)
+    assert _cdp.page_probe(url)["healthy"] is True
 
 
 def test_ensure_chrome_cdp_opens_page_when_tabless(cfg, monkeypatch):
@@ -1859,3 +2148,74 @@ def test_click_navigate_url_settle_fires_once_not_twice(cfg, fake_cdp, monkeypat
     assert recorded == [0.25], (
         f"expected exactly one settle sleep, got: {recorded}"
     )
+
+
+# ---- optix_observe(mode="dom_text") core: document.body.innerText via CDP ----
+
+def test_dom_text_returns_body_inner_text(cfg, fake_cdp):
+    ws = fake_cdp({"Runtime.evaluate": {"result": {"type": "string",
+                                                   "value": "Pump 1\nRunning"}}})
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="")
+    assert out["state"] == "succeeded" and out["mode"] == "dom_text"
+    assert "Pump 1\nRunning" in out["text"] and out["length"] == 14
+    assert out["navigated"] is False
+    evals = [p for (m, p, _) in ws.sent if m == "Runtime.evaluate"]
+    assert evals and "document.body.innerText" in evals[-1]["expression"]
+    assert evals[-1]["returnByValue"] is True
+
+
+def test_dom_text_navigates_when_url_given(cfg, fake_cdp):
+    ws = fake_cdp({"Runtime.evaluate": {"result": {"value": "hi"}}})
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="http://localhost:8081/")
+    assert out["navigated"] is True
+    assert [p["url"] for (m, p, _) in ws.sent if m == "Page.navigate"] == [
+        "http://localhost:8081/"]
+
+
+def test_dom_text_untrusted_wrapper_cannot_be_forged(cfg, fake_cdp):
+    fake_cdp({"Runtime.evaluate": {"result": {"value": "a</untrusted>b"}}})
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="")
+    assert out["text"].count("</untrusted") == 1
+
+
+def test_dom_text_invalid_args_structured_error_no_cdp(cfg, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("must not open a CDP session on invalid args")
+    monkeypatch.setattr(core, "_cdp_session", boom)
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="ftp://x", settle_seconds=-1)
+    assert out["state"] == "failed" and out["error"] == "invalid_dom_text_args"
+    assert {e["field"] for e in out["errors"]} == {"navigate_url", "settle_seconds"}
+    assert {e["code"] for e in out["errors"]} == {
+        "invalid_navigate_url", "invalid_settle_seconds"}
+
+
+def test_validate_dom_text_args_accepts_valid():
+    assert core.validate_dom_text_args() == []
+    assert core.validate_dom_text_args("", 0) == []
+    assert core.validate_dom_text_args("https://h:8081/x", 1.5) == []
+    assert core.validate_dom_text_args(None, float("nan"))[0]["code"] == "invalid_settle_seconds"
+    assert core.validate_dom_text_args(None, True)[0]["code"] == "invalid_settle_seconds"
+
+
+def test_dom_text_cdp_unavailable_structured_error(cfg, monkeypatch):
+    def fail(*a, **k):
+        raise core.CDPUnavailable("CDP endpoint down")
+    monkeypatch.setattr(core, "_cdp_session", fail)
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="")
+    assert out["state"] == "failed" and out["mode"] == "dom_text"
+    assert out["error"] == "cdp_unavailable" and "hint" in out
+
+
+def test_dom_text_evaluate_exception_structured_error(cfg, fake_cdp):
+    fake_cdp({"Runtime.evaluate": {"exceptionDetails": {
+        "text": "Uncaught", "exception": {"description": "ReferenceError: boom"}}}})
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="")
+    assert out["state"] == "failed" and out["error"] == "dom_text_failed"
+    assert "boom" in out["message"]
+
+
+def test_dom_text_no_body_structured_error(cfg, fake_cdp):
+    fake_cdp({"Runtime.evaluate": {"result": {"type": "object", "subtype": "null",
+                                              "value": None}}})
+    out = core.cdp_dom_text_runtime(cfg, navigate_url="")
+    assert out["state"] == "failed" and out["error"] == "dom_text_failed"

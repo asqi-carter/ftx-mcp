@@ -23,6 +23,18 @@ def test_health_reports_paths_and_runtime_state(cfg: core.Config) -> None:
     assert h["interactive_session"] in (True, False, None)
 
 
+def test_health_reports_service_path(cfg: core.Config) -> None:
+    import service
+
+    h = core.health(cfg)
+    assert "service_path" in h
+    assert Path(h["service_path"]) == Path(service.__file__).resolve().parent
+    assert Path(h["service_path"]).is_dir()
+    # existing fields remain present
+    for key in ("ok", "version", "bridge_source", "projects_root", "bind"):
+        assert key in h
+
+
 def test_list_projects_finds_optix_dirs(cfg: core.Config, projects_root: Path) -> None:
     make_project(projects_root, "Alpha")
     make_project(projects_root, "Beta")

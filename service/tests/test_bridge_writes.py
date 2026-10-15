@@ -855,6 +855,144 @@ def test_set_property_bridge_array_error_surfaces_code(alpha, monkeypatch):
     assert "String[]" in str(e.value)
 
 
+# --- 1.0.9 #3: guarded typed string[] path for GridLayout Rows/Columns ---------
+
+def _grid_cfg(alpha, on=True):
+    import dataclasses
+    return dataclasses.replace(alpha, enable_grid_string_array=on)
+
+
+def test_grid_string_array_flag_defaults_off(alpha):
+    assert core.Config.__dataclass_fields__["enable_grid_string_array"].default is False
+    assert alpha.enable_grid_string_array is False
+
+
+def test_grid_string_array_flag_from_env(monkeypatch):
+    monkeypatch.setenv("FTX_GRID_STRING_ARRAY", "1")
+    assert core.Config.from_env().enable_grid_string_array is True
+    monkeypatch.delenv("FTX_GRID_STRING_ARRAY")
+    assert core.Config.from_env().enable_grid_string_array is False
+
+
+@pytest.mark.parametrize("name", ["Rows", "Columns"])
+def test_grid_string_array_flag_on_dispatches_typed(alpha, monkeypatch, name):
+    cap: list = []
+    routes = {"/bridge/node/property": (200, {"ok": True, "via": "typed-string-array",
+                                              "datatype": "String[]"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_set_property(_grid_cfg(alpha), "Alpha", "UI/MainWindow/G1",
+                                   name, '["1*","1*"]')
+    assert out["ok"] is True
+    _m, path = next(c for c in cap if "/bridge/node/property" in c[1])
+    assert "typed=string%5B%5D" in path
+    assert f"name={name}" in path
+
+
+def test_grid_string_array_flag_off_still_rejected(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_set_property(alpha, "Alpha", "UI/MainWindow/G1", "Columns",
+                                 '["1*","1*"]')
+    assert "unsupported_array_write" in str(e.value)
+    assert "FTX_GRID_STRING_ARRAY" in str(e.value)
+    assert not [c for c in cap if "/bridge/node/property" in c[1]]
+
+
+@pytest.mark.parametrize("name,value", [
+    ("AliasNodeArray", '["UI/Screens/ScreenA"]'),   # other array property
+    ("Children", '["a"]'),                           # other name
+    ("rows", '["1*"]'),                              # case-sensitive
+    ("Columns", '[1, 2]'),                           # non-string elements
+    ("Columns", '["1*", 2]'),
+    ("Columns", '[]'),                               # empty
+    ("Columns", '[""]'),                             # blank element
+    ("Columns", '[["1*"]]'),                         # nested
+])
+def test_grid_string_array_guard_not_loosened_when_flag_on(alpha, monkeypatch, name, value):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_set_property(_grid_cfg(alpha), "Alpha", "UI/MainWindow/G1",
+                                 name, value)
+    assert "unsupported_array_write" in str(e.value)
+    assert not [c for c in cap if "/bridge/node/property" in c[1]]
+
+
+def test_grid_string_array_non_gridlayout_rejected_by_bridge(alpha, monkeypatch):
+    """The service cannot see node types; the bridge refuses a non-GridLayout and
+    the code surfaces (never falls back to the scalar path)."""
+    routes = {"/bridge/node/property": (200, {"error": {
+        "code": "typed_array_not_supported",
+        "message": "typed string[] writes are guarded to GridLayout nodes; "
+                   "UI/MainWindow/R1 is Rectangle"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_set_property(_grid_cfg(alpha), "Alpha", "UI/MainWindow/R1",
+                                 "Columns", ["1*"])
+    assert "typed_array_not_supported" in str(e.value)
+
+
+def test_grid_validate_ops_annotates_only_eligible_ops(alpha, monkeypatch):
+    sent: list = []
+
+    def fake_post(cfg, path, body, **kw):
+        sent.append(body)
+        return 200, {"ok": True, "op_count": 3, "strict": False, "errors": [], "warnings": []}
+
+    monkeypatch.setattr(core, "_bridge_post_body", fake_post)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    ops = [
+        {"op": "set_property", "path": "UI/G", "name": "Columns", "value": ["1*", "1*"]},
+        {"op": "set_property", "path": "UI/G", "name": "AliasNodeArray", "value": ["a"]},
+        {"op": "set_property", "path": "UI/L", "name": "Text", "value": "x"},
+    ]
+    core.bridge_validate_ops(_grid_cfg(alpha), "Alpha", ops)
+    wire = sent[-1]["ops"]
+    assert wire[0]["typed"] == "string[]" and wire[0]["value"] == '["1*", "1*"]'
+    assert "typed" not in wire[1] and "typed" not in wire[2]
+    core.bridge_validate_ops(alpha, "Alpha", ops)       # flag off: untouched
+    assert all("typed" not in o for o in sent[-1]["ops"])
+
+
+def test_gridlayout_warning_retired_only_when_both_set_and_flag_on(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_post_body", lambda *a, **k: (200, {
+        "ok": True, "op_count": 1, "strict": False, "errors": [], "warnings": []}))
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_apply_one_edit", lambda cfg, project, op: {"ok": True})
+    create = {"op": "create_widget", "screen": "UI/MainWindow", "name": "G",
+              "type": "GridLayout"}
+    both = [create,
+            {"op": "set_property", "path": "UI/MainWindow/G", "name": "Rows", "value": ["1*"]},
+            {"op": "set_property", "path": "UI/MainWindow/G", "name": "Columns", "value": ["1*"]}]
+    one = both[:2]
+
+    def codes(cfg, ops):
+        out = core.bridge_edit(cfg, "Alpha", [dict(o) for o in ops])
+        return [w["code"] for w in out["report"]["warnings"]]
+
+    assert "gridlayout_without_columns" not in codes(_grid_cfg(alpha), both)
+    assert "gridlayout_without_columns" in codes(_grid_cfg(alpha), one)
+    assert "gridlayout_without_columns" in codes(alpha, both)       # flag off
+    assert "gridlayout_without_columns" in codes(_grid_cfg(alpha), [create])
+
+
+def test_bridge_source_typed_path_is_isolated_from_generic_guard():
+    """Static pin on StudioMCPBridge.cs: the typed branch is gated on the explicit
+    typed=string[] marker, limited to Rows/Columns on GridLayout, and the generic
+    array guards/CoerceAssign backstop are still present and unconditional."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[2] / "studio-bridge" /
+           "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    assert 'QueryParam(firstLine, "typed") == "string[]"' in src
+    assert 'name == "Rows" || name == "Columns"' in src
+    assert 't.Name == "GridLayout"' in src
+    assert "var arrErr = DeclaredArrayGuard(node, name);\n            if (arrErr != null) return arrErr;" in src
+    assert "if (IsArrayVariable(prop))\n                    return ArrayWriteError(" in src
+    # the scalar coercion backstop still refuses arrays
+    assert "unsupported_array_write: property is array-typed" in src
+
+
 def test_classify_array_write_failure_does_not_blame_connection(alpha):
     """unsupported_array_write is a per-op rejection: bridge stays up, nudge
     must not tell the user to restart Studio (the crash it prevents did)."""
@@ -985,7 +1123,7 @@ def test_bridge_attach_formatter_no_sources_no_mode_omits_params(alpha, monkeypa
                         _fake_bridge({"/bridge/node/attach-formatter": (200, {"ok": True})},
                                      capture=cap))
     core.bridge_attach_formatter(
-        alpha, "Alpha", "UI/MainWindow/L1", "Panel", "{#key}@NodeId")
+        alpha, "Alpha", "UI/MainWindow/L1", "Panel", "../Panel@NodeId")
     _, path = next(c for c in cap if "/bridge/node/attach-formatter" in c[1])
     assert "sources=" not in path
     assert "mode=" not in path
@@ -1068,6 +1206,51 @@ def test_create_object_not_a_type_raises(alpha, monkeypatch):
         core.bridge_create_object(alpha, "Alpha", "Model", "X",
                                   object_type="UI/MainWindow/L1")
     assert "not_a_type" in str(e.value)
+
+
+# ---- ftx-mcp-wvk.3: create_object Folder / FolderType -------------------------
+
+@pytest.mark.parametrize("spelling", ["Folder", "FolderType", "folder", "FOLDERTYPE"])
+def test_create_object_folder_resolves_to_foldertype(alpha, monkeypatch, spelling):
+    """Folder and FolderType both resolve to FolderType (ns=0 i=61) and succeed."""
+    from urllib.parse import parse_qs, urlsplit
+    assert core.resolve_create_object_type(spelling) == "FolderType"
+    assert core.FOLDER_TYPE_NODE_ID == "ns=0;i=61"
+    cap: list = []
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": "Model/F1",
+              "type": "FolderType", "node_class": "Object"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_object(alpha, "Alpha", "Model", "F1", spelling)
+    assert out["ok"] is True and out["type"] == "FolderType"
+    _, path = next(c for c in cap if "/bridge/model/object" in c[1])
+    assert parse_qs(urlsplit(path).query)["type"] == ["FolderType"]
+
+
+def test_create_object_folder_not_refused_by_validator():
+    assert core.validate_create_object_op("F", "Folder") == []
+    assert core.validate_create_object_op("F", "FolderType") == []
+    assert core.resolve_create_object_type("UI/Templates/Card") == "UI/Templates/Card"
+    assert core.resolve_create_object_type(None) is None
+
+
+def test_create_object_folder_type_not_found_names_working_route(alpha, monkeypatch):
+    """When the bridge cannot create the Folder on this Studio version the result
+    is type_not_found with a hint naming create_folder."""
+    routes = {"/bridge/model/object": (200, {"error": {
+        "code": "type_not_found", "message": "FolderType (ns=0;i=61) is not resolvable"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_object(alpha, "Alpha", "Model", "F1", "Folder")
+    assert out["ok"] is False and out["code"] == "type_not_found"
+    assert "create_folder" in out["hint"]
+    assert out["type_node_id"] == "ns=0;i=61"
+
+
+def test_create_object_other_type_not_found_still_raises(alpha, monkeypatch):
+    routes = {"/bridge/model/object": (200, {"error": {
+        "code": "type_not_found", "message": "no node at type path: Nope"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed):
+        core.bridge_create_object(alpha, "Alpha", "Model", "X", "Nope")
 
 
 # ---- GridLayoutProperties / UI-namespace-child handling ----
@@ -1217,6 +1400,139 @@ def test_create_netlogic_dup_name_raises(alpha, monkeypatch):
     with pytest.raises(core.BridgeWriteFailed) as e:
         core.bridge_create_netlogic(alpha, "Alpha", "UI/Screens/ScreenD", "MyLogic")
     assert "name_exists" in str(e.value)
+
+
+def test_create_netlogic_design_time_posts_kind(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/netlogic": (200, {"ok": True,
+              "created_path": "Model/DtLogic", "type": "NetLogic",
+              "kind": "design_time", "node_class": "Object",
+              "bound_class": "DtLogic"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "DtLogic",
+                                      kind="design_time")
+    assert out["kind"] == "design_time"
+    method, path = next(c for c in cap if "/bridge/model/netlogic" in c[1])
+    assert method == "POST" and "kind=design_time" in path
+
+
+def test_create_netlogic_default_kind_omits_param(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/netlogic": (200, {"ok": True,
+              "created_path": "Model/Logic", "type": "NetLogic"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_create_netlogic(alpha, "Alpha", "Model", "Logic", kind="runtime")
+    _, path = next(c for c in cap if "/bridge/model/netlogic" in c[1])
+    assert "kind=" not in path
+
+
+def test_create_netlogic_invalid_kind_structured_error(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "Logic",
+                                      kind="designtime")
+    assert out["ok"] is False and out["code"] == "invalid_kind"
+    err = out["errors"][0]
+    assert err["field"] == "kind" and err["allowed"] == ["runtime", "design_time"]
+    assert not any("/bridge/model/netlogic" in c[1] for c in cap)
+
+
+def test_create_netlogic_missing_name_structured_error(alpha):
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "")
+    assert out["ok"] is False and out["code"] == "missing_field"
+    assert out["errors"][0]["field"] == "name"
+
+
+def test_create_netlogic_design_time_dry_run_reports_plan(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "DtLogic",
+                                      kind="design_time", dry_run=True)
+    assert out["ok"] is True and out["dry_run"] is True
+    plan = out["plan"]
+    assert plan["kind"] == "design_time" and plan["created_path"] == "Model/DtLogic"
+    assert plan["children"] == [{
+        "name": "BehaviourStartPriority",
+        "variable_type": "BehaviourStartPriorityVariableType", "value": 180}]
+    assert not any("/bridge/model/netlogic" in c[1] for c in cap)
+
+
+def test_create_netlogic_dry_run_validates_kind(alpha):
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "X",
+                                      kind="bogus", dry_run=True)
+    assert out["ok"] is False and out["code"] == "invalid_kind"
+
+
+def test_create_netlogic_design_time_old_bridge_refused(alpha, monkeypatch):
+    # A bridge that ignores `kind` answers without kind=design_time: surface it.
+    routes = {"/bridge/model/netlogic": (200, {"ok": True,
+              "created_path": "Model/DtLogic", "type": "NetLogic"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_create_netlogic(alpha, "Alpha", "Model", "DtLogic",
+                                    kind="design_time")
+    assert "design_time" in str(e.value)
+
+
+def test_create_netlogic_design_time_bridge_source():
+    """The C# mints BehaviourStartPriority typed BehaviourStartPriorityVariableType
+    = 180 (source-level; the bridge is not compiled in CI)."""
+    from pathlib import Path
+    cs = (Path(__file__).parent.parent.parent / "studio-bridge"
+          / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    start = cs.index("private string CreateNetLogicInline")
+    body = cs[start:start + 4500]
+    assert "BehaviourStartPriorityVariableType" in body
+    assert '"BehaviourStartPriority"' in body and "(byte)180" in body
+    assert "design_time" in body and "invalid_kind" in body
+
+
+def _method_body(cs: str, signature: str) -> str:
+    start = cs.index(signature)
+    return cs[start:cs.index("\n    }\n", start)]
+
+
+def test_create_netlogic_add_inside_root_impersonation():
+    """#27: CreateNetLogicInline's MakeObject and Add (parentNode.Add) both sit
+    inside a `using (...Sessions.ImpersonateRootTemporary())` block; without a
+    session the design-time instantiation of an already-compiled class killed
+    Studio (c0000374). Source-level: the bridge is not compiled in CI."""
+    from pathlib import Path
+    cs = (Path(__file__).parent.parent.parent / "studio-bridge"
+          / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    body = _method_body(cs, "private string CreateNetLogicInline")
+    scope = body.index("using (parentNode.Context.Sessions.ImpersonateRootTemporary())")
+    open_brace = body.index("{", scope)
+    depth, end = 0, None
+    for i in range(open_brace, len(body)):
+        if body[i] == "{":
+            depth += 1
+        elif body[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    assert end is not None
+    block = body[open_brace:end]
+    assert "parentNode.Add(o)" in block
+    assert "InformationModel.MakeObject(" in block
+    assert body.count("parentNode.Add(") == 1
+    assert body.count("InformationModel.MakeObject(") == 1
+
+
+def test_session_affine_instantiation_paths_are_impersonated():
+    """#27 audit: every bridge path that instantiates an Object into the model
+    (create_object, create_netlogic, convert_to_type replace, move copy) wraps
+    its MakeObject + Add in ImpersonateRootTemporary."""
+    from pathlib import Path
+    cs = (Path(__file__).parent.parent.parent / "studio-bridge"
+          / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    for sig in ("private string CreateObjectInline", "private string CreateNetLogicInline",
+                "private string ConvertToTypeInline", "private string MoveNodeInline"):
+        body = _method_body(cs, sig)
+        scope = body.index("Sessions.ImpersonateRootTemporary()")
+        assert body.index("InformationModel.MakeObject(", scope) > scope, sig
+        assert "InformationModel.MakeObject(" not in body[:scope], sig
 
 
 def test_create_type_posts_base(alpha, monkeypatch):
@@ -4029,7 +4345,7 @@ def test_bridge_attach_string_formatter_builds_raw_param(alpha, monkeypatch):
     raw must not send the param at all."""
     calls: list = []
     monkeypatch.setattr(core, "_bridge_write",
-                        lambda cfg, project, verb, route, params: calls.append((route, params)) or {"ok": True})
+                        lambda cfg, project, verb, route, params, **kw: calls.append((route, params)) or {"ok": True})
     core.bridge_attach_string_formatter(
         alpha, "Alpha", "UI/Templates/ValueOnlyHP/value", "Text",
         "{0:F1}", sources="{data}/value", raw=True)
@@ -4042,3 +4358,2462 @@ def test_bridge_attach_string_formatter_builds_raw_param(alpha, monkeypatch):
         alpha, "Alpha", "UI/M/L", "Text", "{0:F1}", sources="Model/x")
     _, params2 = calls[-1]
     assert "raw" not in params2
+
+
+# ---- wire_event multi-step (`calls`) + append (PRD 0024 / 1.0.9 9e) ----------
+
+def _fake_bodied_bridge(monkeypatch, reply=None, *, capture=None):
+    """Healthy fake bridge whose JSON-BODY POST (`_bridge_post_body`) is captured
+    as (path, payload); the query-string route must NOT be used for a list."""
+    cap = capture if capture is not None else []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+
+    def fake_post_body(cfg, path, payload, timeout=20.0):
+        cap.append(("BODY", path, payload))
+        return 200, (reply if reply is not None else {"ok": True, "via": "eventhandler+steps"})
+
+    monkeypatch.setattr(core, "_bridge_post_body", fake_post_body)
+    return cap
+
+
+_TWO_CALLS = [
+    {"command": "SetVariable", "variable": "Model/Flag", "value": "true"},
+    {"method_path": "UI/Logic/DoThing", "args": "NewPanel=UI/Screens/Home",
+     "object_raw": "../Loader"},
+]
+
+
+def test_validate_wire_calls_clean_list_is_normalized():
+    errors, norm = core.validate_wire_calls(
+        [{"command": "togglevariable", "variable": "Model/Flag"},
+         {"method_path": "UI/Logic/DoThing", "args": "A=1"}])
+    assert errors == []
+    # bridge spelling: `method`, canonical command casing, order preserved
+    assert norm == [{"command": "ToggleVariable", "variable": "Model/Flag"},
+                    {"method": "UI/Logic/DoThing", "args": "A=1"}]
+
+
+@pytest.mark.parametrize("calls,code,idx", [
+    ("nope", "calls_not_a_list", None),
+    ([], "calls_empty", None),
+    (["x"], "call_not_an_object", 0),
+    ([{}], "call_missing_action", 0),
+    ([{"command": "ToggleVariable", "variable": "M/F", "method_path": "A/B"}], "call_ambiguous", 0),
+    ([{"command": "Explode"}], "call_unknown_command", 0),
+    ([{"command": "ToggleVariable"}], "call_missing_variable", 0),
+    ([{"command": "SetVariable", "variable": "M/F"}], "call_missing_value", 0),
+    ([{"command": "ToggleVariable", "variable": "M/F", "args": "A=1"}],
+     "call_args_with_variable_command", 0),
+    ([{"method_path": "A/B", "variable": "M/F"}], "call_field_not_applicable", 0),
+    ([{"method_path": "A/B", "bogus": "x"}], "unknown_call_field", 0),
+    ([{"method_path": "A/B", "args": "no-equals"}], "call_bad_args", 0),
+    ([{"command": "OpenKeyboard", "args": "KeyboardType=Numeric"}], "call_bad_args", 0),
+    ([{"method_path": ["A/B"]}], "call_field_type", 0),
+    # second call bad: the index points at it
+    ([{"method_path": "A/B"}, {"command": "ToggleVariable"}], "call_missing_variable", 1),
+])
+def test_validate_wire_calls_structured_errors(calls, code, idx):
+    errors, norm = core.validate_wire_calls(calls)
+    assert norm == []
+    hit = [e for e in errors if e["code"] == code]
+    assert hit, f"expected {code}, got {errors}"
+    assert hit[0]["call_index"] == idx and hit[0]["message"]
+
+
+def test_wire_event_calls_posts_ordered_list_as_json_body(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    out = core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                                 calls=_TWO_CALLS)
+    assert out["ok"] is True
+    (_tag, path, payload), = [c for c in cap if c[0] == "BODY"]
+    assert path.startswith("/bridge/node/event?") and "event=MouseClickEvent" in path
+    assert "append=" not in path and "replace=" not in path
+    # order preserved, bridge field names
+    assert payload == {"calls": [
+        {"command": "SetVariable", "variable": "Model/Flag", "value": "true"},
+        {"method": "UI/Logic/DoThing", "args": "NewPanel=UI/Screens/Home",
+         "object_raw": "../Loader"}]}
+
+
+def test_wire_event_append_flag_reaches_bridge(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                           calls=_TWO_CALLS, append=True)
+    (_t, path, payload), = [c for c in cap if c[0] == "BODY"]
+    assert "append=true" in path and len(payload["calls"]) == 2
+
+
+def test_wire_event_single_call_with_append_appends_one_step(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                           command="ToggleVariable", variable="Model/Flag", append=True)
+    (_t, path, payload), = [c for c in cap if c[0] == "BODY"]
+    assert "append=true" in path
+    assert payload == {"calls": [{"command": "ToggleVariable", "variable": "Model/Flag"}]}
+
+
+def test_wire_event_calls_invalid_returns_structured_error_and_writes_nothing(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    out = core.bridge_wire_event(
+        alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+        calls=[{"method_path": "A/B"}, {"command": "SetVariable", "variable": "M/F"}])
+    assert out["ok"] is False and out["code"] == "invalid_wire_calls"
+    assert out["errors"][0]["code"] == "call_missing_value"
+    assert out["errors"][0]["call_index"] == 1
+    assert not any(c[0] == "BODY" or "/bridge/node/event" in c[1] for c in cap)
+
+
+def test_wire_event_calls_conflicts_with_single_call_args(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    out = core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                                 method_path="A/B", calls=_TWO_CALLS)
+    assert out["code"] == "invalid_wire_calls"
+    assert out["errors"][0]["code"] == "calls_conflict"
+    assert not any(c[0] == "BODY" for c in cap)
+
+
+def test_wire_event_append_with_replace_is_refused(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    out = core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                                 calls=_TWO_CALLS, append=True, replace=True)
+    assert out["code"] == "invalid_wire_calls"
+    assert any(e["code"] == "append_with_replace" for e in out["errors"])
+    assert not any(c[0] == "BODY" for c in cap)
+
+
+def test_wire_event_op_spec_accepts_calls_and_append():
+    _fn, _required, optional = core._BRIDGE_EDIT_OPS["wire_event"]
+    assert optional["calls"] == "calls" and optional["append"] == "append"
+    assert core.unknown_op_fields(
+        {"op": "wire_event", "path": "UI/B", "event_type": "MouseClickEvent",
+         "calls": _TWO_CALLS, "append": True}) == []
+
+
+def test_apply_one_edit_forwards_calls_and_append(alpha, monkeypatch):
+    cap = _fake_bodied_bridge(monkeypatch)
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "wire_event", "path": "UI/MainWindow/Btn", "event_type": "MouseClickEvent",
+        "calls": _TWO_CALLS, "append": True})
+    (_t, path, payload), = [c for c in cap if c[0] == "BODY"]
+    assert "append=true" in path and len(payload["calls"]) == 2
+
+
+def _dry_run(alpha, monkeypatch, op):
+    """bridge_edit(dry_run) against a bridge whose validator reports clean, so any
+    error in the report comes from the service-side list validation."""
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (
+            200, {"ok": True, "op_count": len(payload["ops"]), "errors": [], "warnings": []}))
+    return core.bridge_edit(alpha, "Alpha", [op], dry_run=True)
+
+
+def test_dry_run_accepts_valid_calls_list(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "wire_event", "path": "UI/MainWindow/Btn", "event_type": "MouseClickEvent",
+        "calls": _TWO_CALLS})
+    assert out["state"] == "validated" and out["report"]["ok"] is True
+    assert out["applied"] == 0
+
+
+def test_dry_run_returns_structured_errors_for_invalid_calls(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "wire_event", "path": "UI/MainWindow/Btn", "event_type": "MouseClickEvent",
+        "calls": [{"method_path": "A/B"}, {"command": "ToggleVariable"}, {}]})
+    assert out["state"] == "validated" and out["report"]["ok"] is False
+    errs = out["report"]["errors"]
+    assert [(e["op_index"], e["call_index"], e["code"]) for e in errs] == [
+        (0, 1, "call_missing_variable"), (0, 2, "call_missing_action")]
+    assert out["applied"] == 0 and "nudge" in out
+
+
+def test_dry_run_refuses_calls_alongside_single_call_fields(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "wire_event", "path": "UI/MainWindow/Btn", "event_type": "MouseClickEvent",
+        "method_path": "A/B", "calls": _TWO_CALLS})
+    assert out["report"]["ok"] is False
+    assert out["report"]["errors"][0]["code"] == "calls_conflict"
+
+
+def test_dry_run_single_call_wire_event_unaffected(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "wire_event", "path": "UI/MainWindow/Btn", "event_type": "MouseClickEvent",
+        "command": "ToggleVariable", "variable": "Model/Flag"})
+    assert out["report"]["ok"] is True
+
+
+def test_wire_event_multistep_bridge_error_surfaces(alpha, monkeypatch):
+    _fake_bodied_bridge(monkeypatch, reply={
+        "error": {"code": "invalid_wire_calls", "message": "calls[1]: no variable at: Model/Nope",
+                  "call_index": 1}})
+    with pytest.raises(core.BridgeWriteFailed, match="calls\\[1\\]"):
+        core.bridge_wire_event(alpha, "Alpha", "UI/MainWindow/Btn", "MouseClickEvent",
+                               calls=_TWO_CALLS)
+
+
+def test_wire_event_multistep_keeps_node_attribute_guard():
+    """BrowseName/DisplayName are never written as attributes (PRD 0024): the
+    guard still sits on set_property/bind, and the multi-step path adds no
+    attribute write of its own."""
+    with pytest.raises(core.BridgeWriteFailed):
+        core._reject_node_attribute("set_property", "BrowseName")
+    from pathlib import Path
+    text = (Path(__file__).parent.parent.parent / "studio-bridge" / "StudioMCPBridge.cs"
+            ).read_text(encoding="utf-8", errors="replace")
+    start = text.find("private string WireEventStepsInline(")
+    end = text.find("// ---- setup / project scaffolding", start)
+    body = text[start:end]
+    assert "BrowseName =" not in body and "DisplayName =" not in body
+
+
+# -- source-level checks of the C# multi-step logic ----------------------------
+
+def _bridge_cs_text() -> str:
+    from pathlib import Path
+    return (Path(__file__).parent.parent.parent / "studio-bridge" / "StudioMCPBridge.cs"
+            ).read_text(encoding="utf-8", errors="replace")
+
+
+def _cs_region(text: str, start_marker: str, end_marker: str) -> str:
+    start = text.find(start_marker)
+    assert start >= 0, f"{start_marker!r} not found in StudioMCPBridge.cs"
+    end = text.find(end_marker, start + 1)
+    assert end > start, f"{end_marker!r} not found after {start_marker!r}"
+    return text[start:end]
+
+
+def test_wire_event_route_reads_body_and_dispatches_to_steps():
+    text = _bridge_cs_text()
+    route = _cs_region(text, 'StartsWith("POST /bridge/node/event")',
+                       'StartsWith("POST /bridge/node/invoke")')
+    assert "ReadRequestBody(" in route and "WireEventInline(firstLine," in route
+    inline = _cs_region(text, "private string WireEventInline(", "string path = QueryParam")
+    assert "WireEventStepsInline(firstLine, reqBody)" in inline
+
+
+def test_wire_event_steps_appends_method_containers_in_order():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string AppendWireCall(", "private string WireEventStepsInline(")
+    # a NEW MethodContainerN is added to the SAME handler's MethodsToCall
+    assert 'MakeObject("MethodContainer" + k)' in body
+    assert "handler.MethodsToCall.Add(mc)" in body
+    # same container shape as MethodContainer1: pointer, method, arguments
+    for needle in ('"ObjectPointer"', '"Method"', '"InputArguments"', "HasDynamicLink",
+                   '"../../../../..@NodeId"', "readback_mismatch"):
+        assert needle in body, needle
+    # never creates a second EventHandler
+    assert "MakeObject<FTOptix.CoreBase.EventHandler>" not in body
+
+
+def test_wire_event_steps_append_mode_keeps_existing_calls_and_rolls_back():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string WireEventStepsInline(", "private void ValidateWireCallsOp(")
+    # append=true skips the single-call (create / replace-in-place) path entirely
+    assert 'QueryParam(firstLine, "append")' in body
+    assert "appendMode" in body and "if (!appendMode)" in body
+    # existing containers are counted, and the post-write count is verified
+    assert "priorCount" in body and "readback_mismatch" in body
+    # every call is resolved before call 0 is written; a failing append is undone
+    assert body.index("ResolveWireCallTarget(") < body.index("string r0 = WireEventInline(")
+    assert "mcAdded.Delete()" in body and "handler.Delete()" in body
+    # calls are appended in list order
+    assert "for (int i = first; i < steps.Count; i++)" in body
+
+
+def test_validate_ops_checks_wire_event_calls_in_bridge():
+    text = _bridge_cs_text()
+    case = _cs_region(text, 'case "wire_event":', 'case "move":')
+    assert "ValidateWireCallsOp(" in case
+    helper = _cs_region(text, "private void ValidateWireCallsOp(", "// ---- setup / project scaffolding")
+    for code in ("calls_not_a_list", "call_missing_action", "call_ambiguous",
+                 "call_unknown_command", "call_missing_variable", "unresolved_reference",
+                 "call_bad_args", "calls_empty"):
+        assert f'"{code}"' in helper, code
+    assert "HypoResolve(" in helper  # targets created earlier in the batch validate clean
+
+
+# -- set_text_key: a text property set to a translation key (ftx-mcp-8fy.2) ----
+
+def test_validate_text_key_op_clean():
+    assert core.validate_text_key_op("UI/W/L1", "Text", "greeting") == []
+    assert core.validate_text_key_op("UI/W/L1", "Text", "Ns.group_1/hello", "de-DE") == []
+
+
+@pytest.mark.parametrize("path,name,key,locale,code,field", [
+    ("", "Text", "k", "en-US", "missing_field", "path"),
+    ("UI/L", None, "k", "en-US", "missing_field", "name"),
+    ("UI/L", "Text", "", "en-US", "missing_field", "key"),
+    ("UI/L", "Text", "   ", "en-US", "missing_field", "key"),
+    ("UI/L", "Text", " k", "en-US", "invalid_text_key", "key"),
+    ("UI/L", "Text", "a\nb", "en-US", "invalid_text_key", "key"),
+    ("UI/L", "Text", "k" * 257, "en-US", "invalid_text_key", "key"),
+    ("UI/L", "Text", "k", "", "invalid_locale", "locale"),
+    ("UI/L", "Text", "k", "en US", "invalid_locale", "locale"),
+    ("UI/L", "BrowseName", "k", "en-US", "node_attribute_not_settable", "name"),
+    ("UI/L", "DisplayName", "k", "en-US", "node_attribute_not_settable", "name"),
+])
+def test_validate_text_key_op_structured_errors(path, name, key, locale, code, field):
+    errs = core.validate_text_key_op(path, name, key, locale)
+    assert [(e["code"], e["field"]) for e in errs] == [(code, field)]
+    assert errs[0]["message"]
+
+
+def test_set_text_key_posts_key_not_value(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/text-key": (200, {"ok": True, "key": "greeting",
+                                              "text_id": "greeting", "translated": False})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_set_text_key(alpha, "Alpha", "UI/MainWindow/L1", "Text", "greeting")
+    assert out["ok"] is True and out["text_id"] == "greeting"
+    method, path = next(c for c in cap if "/bridge/node/text-key" in c[1])
+    assert method == "POST"
+    assert "path=UI%2FMainWindow%2FL1" in path and "name=Text" in path
+    assert "key=greeting" in path and "locale=en-US" in path
+    assert "value=" not in path          # a key, never a literal value
+    assert not any("/bridge/node/property" in c[1] for c in cap)
+
+
+@pytest.mark.parametrize("attr", ["BrowseName", "DisplayName", "Description", "NodeId"])
+def test_set_text_key_rejects_node_attributes_before_dispatch(alpha, monkeypatch, attr):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    with pytest.raises(core.BridgeWriteFailed, match="node_attribute_not_settable"):
+        core.bridge_set_text_key(alpha, "Alpha", "UI/MainWindow/L1", attr, "greeting")
+    assert not any("/bridge/node/" in c[1] for c in cap)
+
+
+def test_set_text_key_invalid_returns_structured_error_and_writes_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_set_text_key(alpha, "Alpha", "UI/MainWindow/L1", "Text", " bad key ")
+    assert out["ok"] is False and out["code"] == "invalid_text_key"
+    assert out["errors"][0]["code"] == "invalid_text_key"
+    assert not any("/bridge/node/" in c[1] for c in cap)
+
+
+def test_set_text_key_bridge_error_surfaces(alpha, monkeypatch):
+    routes = {"/bridge/node/text-key": (200, {"error": {
+        "code": "not_localized_text", "message": "property 'Width' is Double"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="not_localized_text"):
+        core.bridge_set_text_key(alpha, "Alpha", "UI/MainWindow/L1", "Width", "k")
+
+
+def test_set_text_key_op_is_a_batch_verb():
+    assert "set_text_key" in core.BRIDGE_EDIT_VERBS
+    assert core.unknown_op_fields(
+        {"op": "set_text_key", "path": "A", "name": "Text", "key": "k", "locale": "de-DE"}) == []
+    assert core.unknown_op_fields(
+        {"op": "set_text_key", "path": "A", "name": "Text", "value": "k"}) == ["value"]
+
+
+def test_apply_one_edit_set_text_key(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/text-key": (200, {"ok": True, "text_id": "k"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "set_text_key", "path": "UI/W/L1", "name": "Text", "key": "k", "locale": "de-DE"})
+    _m, path = next(c for c in cap if "/bridge/node/text-key" in c[1])
+    assert "key=k" in path and "locale=de-DE" in path
+
+
+def test_dry_run_accepts_valid_set_text_key(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "set_text_key", "path": "UI/W/L1", "name": "Text", "key": "greeting"})
+    assert out["state"] == "validated" and out["report"]["ok"] is True
+    assert out["applied"] == 0
+
+
+def test_dry_run_set_text_key_returns_structured_errors(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "set_text_key", "path": "UI/W/L1", "name": "DisplayName", "key": " k"})
+    assert out["state"] == "validated" and out["report"]["ok"] is False
+    errs = out["report"]["errors"]
+    assert {(e["op_index"], e["code"]) for e in errs} == {
+        (0, "node_attribute_not_settable"), (0, "invalid_text_key")}
+    assert out["applied"] == 0
+
+
+def test_set_property_still_rejects_browsename_and_displayname_route_unchanged(alpha, monkeypatch):
+    """_reject_node_attribute is preserved: BrowseName is refused, and the literal
+    DisplayName route is still the attribute endpoint (not text-key)."""
+    with pytest.raises(core.BridgeWriteFailed, match="node_attribute_not_settable"):
+        core.bridge_set_property(alpha, "Alpha", "UI/W/L1", "BrowseName", "x")
+    cap: list = []
+    routes = {"/bridge/node/displayname": (200, {"ok": True})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_set_property(alpha, "Alpha", "UI/W/L1", "DisplayName", "x")
+    assert any("/bridge/node/displayname" in c[1] for c in cap)
+    assert not any("text-key" in c[1] for c in cap)
+
+
+# -- source-level checks of the C# set_text_key logic ---------------------------
+
+def test_set_text_key_route_is_dispatched_and_logged():
+    text = _bridge_cs_text()
+    route = _cs_region(text, 'StartsWith("POST /bridge/node/text-key")',
+                       'StartsWith("POST /bridge/node/bind")')
+    assert "SetTextKeyInline(firstLine)" in route
+    assert '"POST /bridge/node/text-key"' in _cs_region(
+        text, "_MutationRoutes = {", "};")
+
+
+def test_set_text_key_bridge_writes_text_id_not_literal_and_no_attributes():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string SetTextKeyInline(", "private static string TextKeyError(")
+    # a keyed LocalizedText: (namespace, TextId, text, locale) -- not the literal ctor
+    assert "new LocalizedText(nsIdx, key, known, locale)" in body
+    assert "new LocalizedText(raw" not in body
+    assert "TextId" in body                       # read-back
+    # attributes refused FIRST, before the node is even resolved
+    assert body.index("IsNodeAttributeName(name)") < body.index("ResolveNode(path)")
+    assert "node_attribute_not_settable" in body
+    # same crash-safety gates as set_property before materializing a property
+    assert body.index("DeclaredPropertyGuard(node, name)") < body.index("GetOrCreateVariable(name)")
+    assert "DeclaredArrayGuard(node, name)" in body
+    assert "not_localized_text" in body
+    # never assigns a node attribute
+    assert "BrowseName =" not in body and "DisplayName =" not in body
+    assert "node.DisplayName" not in body
+
+
+def test_validate_ops_checks_set_text_key_in_bridge():
+    text = _bridge_cs_text()
+    case = _cs_region(text, 'case "set_text_key":', 'case "delete":')
+    for needle in ("IsNodeAttributeName(name)", "text_key_missing", "invalid_text_key",
+                   "TextKeyError(tkKey)", "moved_earlier_in_batch", "ValidateOnNode("):
+        assert needle in case, needle
+    vo = _cs_region(text, "private void ValidateOnNode(", "private static string NearestHint(")
+    assert 'verb == "set_text_key"' in vo and "not_localized_text" in vo
+
+
+def test_set_text_key_registered_as_gated_author_tool(cfg):
+    from service import auth
+    from service.mcp_app import make_mcp
+    assert auth.TOOL_SCOPES.get("optix_bridge_set_text_key") == "author"
+    names = {t.name for t in make_mcp(cfg)._tool_manager.list_tools()}
+    assert "optix_bridge_set_text_key" not in names      # gated with the primitives
+
+
+# -- add_translations bulk + remove_translation (ftx-mcp-8fy.3) -----------------
+
+def test_validate_translation_rows_clean_applies_default_locale():
+    errs, norm = core.validate_translation_rows(
+        [{"key": "a", "value": "A"}, {"key": "a", "value": "Ah", "locale": "de-DE"}], "en-US")
+    assert errs == []
+    assert norm == [{"key": "a", "value": "A", "locale": "en-US"},
+                    {"key": "a", "value": "Ah", "locale": "de-DE"}]
+
+
+@pytest.mark.parametrize("rows,code,idx", [
+    ("nope", "rows_not_a_list", None),
+    ([], "rows_empty", None),
+    (["x"], "row_not_an_object", 0),
+    ([{"value": "v"}], "missing_field", 0),
+    ([{"key": "k"}], "missing_field", 0),
+    ([{"key": "k", "value": 3}], "missing_field", 0),
+    ([{"key": " k", "value": "v"}], "invalid_text_key", 0),
+    ([{"key": "k", "value": "v", "locale": "en US"}], "invalid_locale", 0),
+    ([{"key": "k", "value": "v", "bogus": 1}], "unknown_row_field", 0),
+    ([{"key": "k", "value": "v"}, {"key": "k", "value": "w"}], "duplicate_row", 1),
+])
+def test_validate_translation_rows_structured_errors(rows, code, idx):
+    errs, _ = core.validate_translation_rows(rows)
+    assert code in [e["code"] for e in errs]
+    e = next(e for e in errs if e["code"] == code)
+    assert e["message"]
+    assert e.get("row_index") == idx
+
+
+def test_validate_translation_rows_reports_every_bad_row():
+    errs, _ = core.validate_translation_rows(
+        [{"key": "", "value": "v"}, {"key": "ok", "value": "v"}, {"key": "k", "value": None}])
+    assert [(e["row_index"], e["field"]) for e in errs] == [(0, "key"), (2, "value")]
+
+
+def test_validate_remove_translation_op():
+    assert core.validate_remove_translation_op("greeting") == []
+    assert core.validate_remove_translation_op("")[0]["code"] == "missing_field"
+    assert core.validate_remove_translation_op(None)[0]["code"] == "missing_field"
+    assert core.validate_remove_translation_op("a\nb")[0]["code"] == "invalid_text_key"
+
+
+def test_add_translations_posts_all_rows_in_one_call(alpha, monkeypatch):
+    cap: list = []
+    bodies: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+
+    def fake_body(cfg, path, payload, timeout=20.0):
+        bodies.append((path, payload))
+        return 200, {"ok": True, "count": len(payload["rows"]), "added": 2, "updated": 0}
+
+    monkeypatch.setattr(core, "_bridge_post_body", fake_body)
+    out = core.bridge_add_translations(
+        alpha, "Alpha", [{"key": "a", "value": "A"}, {"key": "b", "value": "B", "locale": "de-DE"}])
+    assert out["ok"] is True and out["count"] == 2
+    assert len(bodies) == 1                                   # ONE bridge call
+    path, payload = bodies[0]
+    assert path.startswith("/bridge/i18n/translations?") and "locale=en-US" in path
+    assert "dry_run" not in path
+    assert payload["rows"] == [{"key": "a", "value": "A", "locale": "en-US"},
+                               {"key": "b", "value": "B", "locale": "de-DE"}]
+
+
+def test_add_translations_dry_run_flag_reaches_bridge(alpha, monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (seen.append(path) or (200, {"ok": True, "dry_run": True})))
+    out = core.bridge_add_translations(alpha, "Alpha", [{"key": "a", "value": "A"}], dry_run=True)
+    assert out["dry_run"] is True and "dry_run=true" in seen[0]
+
+
+def test_add_translations_invalid_rows_structured_error_and_no_bridge_write(alpha, monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (seen.append(path) or (200, {"ok": True})))
+    out = core.bridge_add_translations(
+        alpha, "Alpha", [{"key": "good", "value": "v"}, {"key": "", "value": "v"}])
+    assert out["ok"] is False and out["code"] == "invalid_translation_rows"
+    assert out["errors"][0]["row_index"] == 1
+    assert seen == []                                          # the good row was NOT sent either
+
+
+def test_remove_translation_existing_key_is_not_supported(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/i18n/translation/remove": (200, {"ok": False, "error": {
+        "code": "not_supported", "message": core.REMOVE_TRANSLATION_NOT_SUPPORTED}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_remove_translation(alpha, "Alpha", "k1")
+    assert out["ok"] is False and out["code"] == "not_supported" and out["key"] == "k1"
+    assert out["message"] == core.REMOVE_TRANSLATION_NOT_SUPPORTED and out["nudge"]
+    m, p = next(c for c in cap if "/bridge/i18n/translation/remove" in c[1])
+    assert m == "POST" and "key=k1" in p and "dry_run" not in p
+
+
+def test_remove_translation_dry_run_is_still_not_supported(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/i18n/translation/remove": (200, {"ok": False, "error": {
+        "code": "not_supported", "message": "x"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_remove_translation(alpha, "Alpha", "k1", dry_run=True)
+    assert out["ok"] is False and out["code"] == "not_supported"
+    assert any("dry_run=true" in c[1] for c in cap)
+
+
+def test_remove_translation_not_supported_message_is_exact():
+    assert core.REMOVE_TRANSLATION_NOT_SUPPORTED == (
+        "removing a translation row is not supported by the Optix SDK; edit the key in "
+        "Studio's Translations editor or overwrite its text with add/set")
+
+
+def test_remove_translation_missing_row_is_structured_error(alpha, monkeypatch):
+    routes = {"/bridge/i18n/translation/remove": (200, {"error": {
+        "code": "translation_not_found", "message": "no translation row for key 'nope'"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_remove_translation(alpha, "Alpha", "nope")
+    assert out["ok"] is False and out["code"] == "translation_not_found"
+    assert out["key"] == "nope" and out["message"] and out["nudge"]
+
+
+def test_remove_translation_other_bridge_errors_still_raise(alpha, monkeypatch):
+    routes = {"/bridge/i18n/translation/remove": (200, {"error": {
+        "code": "boom", "message": "kaput"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="kaput"):
+        core.bridge_remove_translation(alpha, "Alpha", "k")
+
+
+def test_remove_translation_invalid_key_writes_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_remove_translation(alpha, "Alpha", " ")
+    assert out["ok"] is False and out["code"] == "invalid_translation_key"
+    assert not any("/bridge/i18n/" in c[1] for c in cap)
+
+
+def test_translation_ops_are_batch_verbs():
+    assert {"add_translations", "remove_translation"} <= core.BRIDGE_EDIT_VERBS
+    assert core.unknown_op_fields(
+        {"op": "add_translations", "rows": [], "locale": "de-DE"}) == []
+    assert core.unknown_op_fields({"op": "remove_translation", "key": "k"}) == []
+    assert core.unknown_op_fields({"op": "remove_translation", "key": "k", "locale": "x"}) == ["locale"]
+
+
+def test_apply_one_edit_add_translations(alpha, monkeypatch):
+    bodies: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (bodies.append(payload) or (200, {"ok": True})))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "add_translations", "rows": [{"key": "a", "value": "A"}], "locale": "fr-FR"})
+    assert bodies[0]["rows"] == [{"key": "a", "value": "A", "locale": "fr-FR"}]
+
+
+def test_apply_one_edit_missing_row_fails_the_op(alpha, monkeypatch):
+    routes = {"/bridge/i18n/translation/remove": (200, {"error": {
+        "code": "translation_not_found", "message": "no row"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="translation_not_found"):
+        core._apply_one_edit(alpha, "Alpha", {"op": "remove_translation", "key": "zzz"})
+
+
+def test_apply_one_edit_remove_translation_not_supported_fails_the_op(alpha, monkeypatch):
+    routes = {"/bridge/i18n/translation/remove": (200, {"ok": False, "error": {
+        "code": "not_supported", "message": "x"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="not_supported"):
+        core._apply_one_edit(alpha, "Alpha", {"op": "remove_translation", "key": "a"})
+
+
+def test_dry_run_accepts_valid_translation_ops(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "add_translations", "rows": [{"key": "a", "value": "A"}]})
+    assert out["state"] == "validated" and out["report"]["ok"] is True and out["applied"] == 0
+
+
+def test_dry_run_translation_ops_return_structured_errors(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "add_translations",
+        "rows": [{"key": "a", "value": "A"}, {"key": "a", "value": "B"}, {"value": "x"}]})
+    assert out["report"]["ok"] is False and out["applied"] == 0
+    errs = out["report"]["errors"]
+    assert {(e["op_index"], e["code"], e["row_index"]) for e in errs} == {
+        (0, "duplicate_row", 1), (0, "missing_field", 2)}
+    out = _dry_run(alpha, monkeypatch, {"op": "remove_translation", "key": ""})
+    assert [e["code"] for e in out["report"]["errors"]] == ["missing_field"]
+
+
+def test_batch_remove_translation_reports_not_supported_with_op_index(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {"op": "remove_translation", "key": "a"})
+    assert out["report"]["ok"] is False and out["applied"] == 0
+    errs = out["report"]["errors"]
+    assert [(e["op_index"], e["code"], e["message"]) for e in errs] == [
+        (0, "not_supported", core.REMOVE_TRANSLATION_NOT_SUPPORTED)]
+
+
+def test_batch_remove_translation_applies_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    monkeypatch.setattr(core, "_bridge_post_body", lambda cfg, path, payload, timeout=20.0: (
+        200, {"ok": True, "op_count": len(payload["ops"]), "errors": [], "warnings": []}))
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "add_translations", "rows": [{"key": "a", "value": "A"}]},
+        {"op": "remove_translation", "key": "a"}])
+    assert out["state"] != "succeeded" and out["applied"] == 0
+    assert [(e["op_index"], e["code"]) for e in out["report"]["errors"]] == [(1, "not_supported")]
+    assert not any("/bridge/i18n/" in c[1] for c in cap)
+
+def test_dry_run_translation_ops_do_not_mutate(alpha, monkeypatch):
+    """dry_run never reaches a translation route, only /bridge/validate_ops."""
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    posted: list = []
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (posted.append(path) or (
+                            200, {"ok": True, "op_count": 2, "errors": [], "warnings": []})))
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "add_translations", "rows": [{"key": "a", "value": "A"}]},
+        {"op": "remove_translation", "key": "a"}], dry_run=True)
+    assert out["applied"] == 0 and out["state"] == "validated"
+    assert posted == ["/bridge/validate_ops"] or all("i18n" not in p for p in posted)
+    assert not any("/bridge/i18n/" in c[1] for c in cap)
+
+
+# -- source-level checks of the C# translation logic ----------------------------
+
+def test_translation_routes_are_dispatched_before_the_prefix_route_and_logged():
+    text = _bridge_cs_text()
+    bulk = text.index('StartsWith("POST /bridge/i18n/translations")')
+    rem = text.index('StartsWith("POST /bridge/i18n/translation/remove")')
+    single = text.index('StartsWith("POST /bridge/i18n/translation")')
+    # "…/translation" is a prefix of both new routes, so they MUST be tested first
+    assert bulk < single and rem < single
+    assert "AddTranslationsInline(firstLine, ReadRequestBody(" in text[bulk:single]
+    assert "RemoveTranslationInline(firstLine)" in text[rem:single]
+    assert '"POST /bridge/i18n/translation"' in _cs_region(text, "_MutationRoutes = {", "};")
+
+
+def test_add_translations_bridge_validates_all_rows_before_writing():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string AddTranslationsInline(", "private string RemoveTranslationInline(")
+    assert "ReadRequestBody" not in body                     # body is passed in by the dispatcher
+    assert "TranslationRowError(" in body and "duplicate_row" in body
+    # the write calls come strictly after the validation loop, and honour dry_run
+    assert body.index("rows.Add(") < body.index("UpsertTranslation(")
+    assert "InformationModel.SetTranslation(" in text      # existing key -> SetTranslation (in UpsertTranslation)
+    assert "if (!dryRun)" in body
+    assert "row_failed" in body                              # partial failure says how many applied
+    assert "new LocalizedText(nsIdx, k, v, loc)" in body
+
+
+def test_remove_translation_bridge_is_not_supported_and_never_calls_the_sdk():
+    text = _bridge_cs_text()
+    assert "RemoveTranslation(" not in text.replace("RemoveTranslationInline(", "")
+    body = _cs_region(text, "private string RemoveTranslationInline(", "private string DeleteNodeInline(")
+    assert "translation_not_found" in body and "not_supported" in body
+    assert body.index("TextKeyError(") < body.index("translation_not_found") < body.index("not_supported")
+    assert "removing a translation row is not supported by the Optix SDK; edit the key in " \
+           "Studio's Translations editor or overwrite its text with add/set" in text
+    assert "dryRun" not in body                      # dry_run gets the same answer
+
+
+def test_remove_translation_inline_and_batch_share_one_existence_check():
+    """ftx-mcp-phv.4 (#40): the inline route and the batch case call the same helper."""
+    text = _bridge_cs_text()
+    inline = _cs_region(text, "private string RemoveTranslationInline(", "private string DeleteNodeInline(")
+    batch = _cs_region(text, 'case "remove_translation":', 'case "delete":')
+    assert "TranslationRowExists(key)" in inline
+    assert "LookupTranslation" not in inline            # no private lookup of its own
+    assert "TranslationRowExists(rmKey)" in batch
+    assert "LookupTranslation" not in batch
+    helper = _cs_region(text, "private static bool TranslationRowExists(", "private static void NoteTranslationWritten(")
+    assert "TranslationLookupHit(key)" in helper and "TranslationRowsWritten" in helper
+    # the raw SDK lookup for translation rows lives only in TranslationLookupText
+    # (PRD 0052 C: namespaced + per-locale probe; TranslationLookupHit delegates)
+    lookup = _cs_region(text, "private static string TranslationLookupText(", "private static bool TranslationLookupHit(")
+    assert "InformationModel.LookupTranslation(" in lookup
+    assert "LookupTranslation" not in _cs_region(text, "private static bool UpsertTranslation(", "// Structural check")
+
+
+def test_remove_translation_after_primitive_add_and_batch_add_is_not_supported(monkeypatch):
+    """Python side: remove of a key just added (primitive or batch) is not_supported,
+    an unknown key is translation_not_found; the bridge answer is surfaced verbatim."""
+    rows = {}
+
+    def bridge(cfg, project, op, path, params, *a, **k):
+        if path == "/bridge/i18n/translation/remove":
+            key = params["key"]
+            if key not in rows:
+                raise core.BridgeWriteFailed("translation_not_found: no translation row for key '%s'" % key)
+            return {"ok": False, "error": {"code": "not_supported", "message": "removing a translation row is not supported"}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(core, "_bridge_write", bridge, raising=False)
+    rows["PrimKey"] = "x"   # as if added by primitive add_translations
+    rows["BatchKey"] = "y"  # as if added by a batch add_translations op
+    cfg = project = None
+    for key in ("PrimKey", "BatchKey"):
+        res = core.bridge_remove_translation(cfg, project, key)
+        assert res["ok"] is False and res["code"] == "not_supported", res
+    unknown = core.bridge_remove_translation(cfg, project, "NoSuchKey")
+    assert unknown["ok"] is False and unknown["code"] == "translation_not_found", unknown
+
+
+def test_validate_ops_checks_translation_ops_in_bridge():
+    text = _bridge_cs_text()
+    add = _cs_region(text, 'case "add_translations":', 'case "remove_translation":')
+    for needle in ("rows_empty", "TranslationRowError(", "duplicate_row", "txAdded.Add("):
+        assert needle in add, needle
+    rem = _cs_region(text, 'case "remove_translation":', 'case "delete":')
+    for needle in ("translation_not_found", "TranslationRowExists(rmKey)", "txAdded", "not_supported"):
+        assert needle in rem, needle
+
+
+def test_translation_tools_registered_as_gated_author_tools(cfg):
+    from service import auth
+    from service.mcp_app import make_mcp
+    names = {t.name for t in make_mcp(cfg)._tool_manager.list_tools()}
+    for tool in ("optix_bridge_add_translations", "optix_bridge_remove_translation"):
+        assert auth.TOOL_SCOPES.get(tool) == "author"
+        assert tool not in names                             # gated with the primitives
+
+
+# -- set_modelling_rule: ModellingRule on type members (ftx-mcp-8fy.4) -----------
+
+@pytest.mark.parametrize("rule", ["Mandatory", "Optional", "None", "mandatory", "OPTIONAL", "none"])
+def test_validate_modelling_rule_op_accepts_the_three_rules(rule):
+    assert core.validate_modelling_rule_op("Model/Types/T/Speed", rule) == []
+
+
+def test_normalize_modelling_rule_is_canonical():
+    assert core.normalize_modelling_rule("mandatory") == "Mandatory"
+    assert core.normalize_modelling_rule("OPTIONAL") == "Optional"
+    assert core.normalize_modelling_rule("none") == "None"
+    for bad in ("Required", "", " Mandatory", None, 1, "ExposesItsArray"):
+        assert core.normalize_modelling_rule(bad) is None
+
+
+@pytest.mark.parametrize("path,rule,code,field", [
+    ("", "Mandatory", "missing_field", "path"),
+    (None, "Mandatory", "missing_field", "path"),
+    ("T/Speed", None, "missing_field", "rule"),
+    ("T/Speed", "  ", "missing_field", "rule"),
+    ("T/Speed", "Required", "invalid_modelling_rule", "rule"),
+    ("T/Speed", "Mandatory ", "invalid_modelling_rule", "rule"),
+    ("T/Speed", 3, "invalid_modelling_rule", "rule"),
+])
+def test_validate_modelling_rule_op_structured_errors(path, rule, code, field):
+    errs = core.validate_modelling_rule_op(path, rule)
+    assert [(e["code"], e["field"]) for e in errs] == [(code, field)]
+    assert errs[0]["message"]
+
+
+def test_invalid_modelling_rule_error_lists_allowed_values():
+    err = core.validate_modelling_rule_op("T/Speed", "Required")[0]
+    assert err["allowed"] == ["Mandatory", "Optional", "None"]
+
+
+def test_set_modelling_rule_posts_canonical_rule(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/modelling-rule": (200, {
+        "ok": True, "rule": "Mandatory", "previous": "None"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_set_modelling_rule(alpha, "Alpha", "Model/Types/T/Speed", "mandatory")
+    assert out["ok"] is True and out["rule"] == "Mandatory"
+    method, path = next(c for c in cap if "/bridge/node/modelling-rule" in c[1])
+    assert method == "POST"
+    assert "path=Model%2FTypes%2FT%2FSpeed" in path and "rule=Mandatory" in path
+    assert "dry_run" not in path
+
+
+def test_set_modelling_rule_dry_run_forwards_flag(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/modelling-rule": (200, {"ok": True, "would_set": True})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_set_modelling_rule(alpha, "Alpha", "T/Speed", "Optional", dry_run=True)
+    _m, path = next(c for c in cap if "/bridge/node/modelling-rule" in c[1])
+    assert "dry_run=true" in path and "rule=Optional" in path
+
+
+def test_set_modelling_rule_invalid_rule_returns_structured_error_and_writes_nothing(
+        alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_set_modelling_rule(alpha, "Alpha", "T/Speed", "Required", dry_run=True)
+    assert out["ok"] is False and out["code"] == "invalid_modelling_rule"
+    assert out["errors"][0]["field"] == "rule"
+    assert not any("/bridge/node/" in c[1] for c in cap)
+
+
+def test_set_modelling_rule_bridge_error_surfaces(alpha, monkeypatch):
+    routes = {"/bridge/node/modelling-rule": (200, {"error": {
+        "code": "not_a_type_member", "message": "UI/Screen1 is not a member"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="not_a_type_member"):
+        core.bridge_set_modelling_rule(alpha, "Alpha", "UI/Screen1", "Mandatory")
+
+
+def test_set_modelling_rule_op_is_a_batch_verb():
+    assert "set_modelling_rule" in core.BRIDGE_EDIT_VERBS
+    assert core.unknown_op_fields(
+        {"op": "set_modelling_rule", "path": "T/Speed", "rule": "Optional"}) == []
+    assert core.unknown_op_fields(
+        {"op": "set_modelling_rule", "path": "T/Speed", "rule": "Optional",
+         "value": "x"}) == ["value"]
+
+
+def test_apply_one_edit_set_modelling_rule(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/modelling-rule": (200, {"ok": True, "rule": "None"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "set_modelling_rule", "path": "T/Speed", "rule": "none"})
+    _m, path = next(c for c in cap if "/bridge/node/modelling-rule" in c[1])
+    assert "rule=None" in path
+
+
+def test_dry_run_accepts_valid_set_modelling_rule(alpha, monkeypatch):
+    for rule in ("Mandatory", "Optional", "None"):
+        out = _dry_run(alpha, monkeypatch, {
+            "op": "set_modelling_rule", "path": "Model/Types/T/Speed", "rule": rule})
+        assert out["state"] == "validated" and out["report"]["ok"] is True
+        assert out["applied"] == 0
+
+
+def test_dry_run_rejects_invalid_modelling_rule_with_structured_error(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "set_modelling_rule", "path": "Model/Types/T/Speed", "rule": "Required"})
+    assert out["state"] == "validated" and out["report"]["ok"] is False
+    errs = out["report"]["errors"]
+    assert [(e["op_index"], e["code"], e["field"]) for e in errs] == [
+        (0, "invalid_modelling_rule", "rule")]
+    assert out["applied"] == 0
+
+
+def test_dry_run_rejects_missing_rule(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {"op": "set_modelling_rule", "path": "T/Speed"})
+    assert out["report"]["ok"] is False
+    assert [e["code"] for e in out["report"]["errors"]] == ["missing_field"]
+
+
+def test_apply_batch_with_invalid_modelling_rule_applies_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (
+            200, {"ok": True, "op_count": len(payload["ops"]), "errors": [], "warnings": []}))
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "set_modelling_rule", "path": "T/Speed", "rule": "Required"}])
+    assert out.get("applied", 0) == 0
+    assert not any("/bridge/node/modelling-rule" in c[1] for c in cap)
+
+
+# -- source-level checks of the C# set_modelling_rule logic ----------------------
+
+def test_set_modelling_rule_route_is_dispatched_and_logged():
+    text = _bridge_cs_text()
+    route = _cs_region(text, 'StartsWith("POST /bridge/node/modelling-rule")',
+                       'StartsWith("POST /bridge/node/property")')
+    assert "SetModellingRuleInline(firstLine)" in route
+    assert '"POST /bridge/node/modelling-rule"' in _cs_region(
+        text, "_MutationRoutes = {", "};")
+
+
+def test_set_modelling_rule_bridge_validates_before_writing():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string SetModellingRuleInline(",
+                      "// Structural check for a translation key")
+    # rule checked, then node resolved, then type-membership, then the write
+    assert (body.index("CanonModellingRule(ruleIn)") < body.index("ResolveNode(path)")
+            < body.index("IsTypeMember(node)") < body.index("node.ModellingRule = "))
+    for code in ("invalid_modelling_rule", "node_not_found", "not_a_type_member"):
+        assert f'"{code}"' in body, code
+    assert "if (!dryRun)" in body and "would_set" in body
+    assert "(NamingRuleType)Enum.Parse(typeof(NamingRuleType), rule)" in body
+    # a node setting only: never touches variables or attributes
+    assert "GetOrCreateVariable" not in body
+    assert "BrowseName =" not in body and "DisplayName =" not in body
+
+
+def test_modelling_rule_names_are_exactly_the_three():
+    text = _bridge_cs_text()
+    assert '{ "Mandatory", "Optional", "None" }' in text
+
+
+def test_validate_ops_checks_set_modelling_rule_in_bridge():
+    text = _bridge_cs_text()
+    case = _cs_region(text, 'case "set_modelling_rule":', 'case "add_translations":')
+    for needle in ("invalid_modelling_rule", "CanonModellingRule(mrRule)", "not_a_type_member",
+                   "IsTypeMember(mrLive)", "moved_earlier_in_batch", "modifies_deleted_node",
+                   "unresolved_reference"):
+        assert needle in case, needle
+
+
+def test_set_modelling_rule_registered_as_gated_author_tool(cfg):
+    from service import auth
+    from service.mcp_app import make_mcp
+    tool = "optix_bridge_set_modelling_rule"
+    assert auth.TOOL_SCOPES.get(tool) == "author"
+    names = {t.name for t in make_mcp(cfg)._tool_manager.list_tools()}
+    assert tool not in names                                 # gated with the primitives
+
+
+# -- retype to LocalizedText (ftx-mcp-8fy.5) -------------------------------------
+
+@pytest.mark.parametrize("dt", ["LocalizedText", "localizedtext", "LOCALIZEDTEXT", "String", "Float"])
+def test_validate_retype_op_accepts_supported_datatypes(dt):
+    assert core.validate_retype_op("Model/Caption", dt) == []
+
+
+def test_normalize_retype_datatype_is_canonical():
+    assert core.normalize_retype_datatype("localizedtext") == "LocalizedText"
+    assert core.normalize_retype_datatype("INT32") == "Int32"
+    for bad in ("Color", "NodeId", "", None, 3, " String"):
+        assert core.normalize_retype_datatype(bad) is None
+
+
+@pytest.mark.parametrize("path,dt,dims,code,field", [
+    ("", "LocalizedText", None, "missing_field", "path"),
+    (None, "LocalizedText", None, "missing_field", "path"),
+    ("Model/X", None, None, "missing_field", "datatype"),
+    ("Model/X", "  ", None, "missing_field", "datatype"),
+    ("Model/X", "Color", None, "invalid_datatype", "datatype"),
+    ("Model/X", "Text", None, "invalid_datatype", "datatype"),
+    ("Model/X", "LocalizedText", "1,2", "invalid_dims", "dims"),
+    ("Model/X", "LocalizedText", "-3", "invalid_dims", "dims"),
+    ("Model/X", "LocalizedText", "abc", "invalid_dims", "dims"),
+])
+def test_validate_retype_op_structured_errors(path, dt, dims, code, field):
+    errs = core.validate_retype_op(path, dt, dims)
+    assert [(e["code"], e["field"]) for e in errs] == [(code, field)]
+    assert errs[0]["message"]
+
+
+def test_validate_retype_op_accepts_dims_forms():
+    for dims in (None, "", "scalar", "0", "10", 10):
+        assert core.validate_retype_op("Model/X", "LocalizedText", dims) == []
+
+
+def test_invalid_retype_datatype_lists_allowed_values():
+    err = core.validate_retype_op("Model/X", "Color")[0]
+    assert "LocalizedText" in err["allowed"] and "String" in err["allowed"]
+
+
+def test_retype_to_localized_text_posts_canonical_params(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/retype": (200, {
+        "ok": True, "from": {"datatype": "String", "dims": None},
+        "to": {"datatype": "LocalizedText", "dims": None}, "values_converted": 1})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_retype(alpha, "Alpha", "Model/Caption", "localizedtext")
+    assert out["ok"] is True and out["to"]["datatype"] == "LocalizedText"
+    method, path = next(c for c in cap if "/bridge/node/retype" in c[1])
+    assert method == "POST"
+    assert "path=Model%2FCaption" in path and "datatype=LocalizedText" in path
+    assert "dry_run" not in path and "dims" not in path
+
+
+def test_retype_dry_run_forwards_flag(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/retype": (200, {"ok": True, "would_retype": True})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_retype(alpha, "Alpha", "Model/Caption", "LocalizedText", dry_run=True)
+    assert out["would_retype"] is True
+    _m, path = next(c for c in cap if "/bridge/node/retype" in c[1])
+    assert "dry_run=true" in path
+
+
+def test_retype_non_convertible_value_is_a_structured_refusal(alpha, monkeypatch):
+    routes = {"/bridge/node/retype": (200, {"error": {
+        "code": "value_not_convertible",
+        "message": "'Model/Ref' (NodeId) cannot be retyped to LocalizedText: "
+                   "its DataType NodeId has no text form",
+        "field": "datatype"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_retype(alpha, "Alpha", "Model/Ref", "LocalizedText")
+    assert out["ok"] is False and out["code"] == "value_not_convertible"
+    assert out["errors"][0]["field"] == "datatype"
+    assert "no text form" in out["errors"][0]["message"]
+    assert "Nothing was changed" in out["nudge"]
+
+
+def test_retype_other_bridge_errors_still_raise(alpha, monkeypatch):
+    routes = {"/bridge/node/retype": (200, {"error": {
+        "code": "not_a_variable", "message": "'UI/Screen1' is a Panel, not a variable"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="not_a_variable"):
+        core.bridge_retype(alpha, "Alpha", "UI/Screen1", "LocalizedText")
+
+
+def test_retype_invalid_datatype_writes_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_retype(alpha, "Alpha", "Model/X", "Color")
+    assert out["ok"] is False and out["code"] == "invalid_datatype"
+    assert not any("/bridge/node/" in c[1] for c in cap)
+
+
+def test_apply_one_edit_retype_non_convertible_fails_the_op(alpha, monkeypatch):
+    routes = {"/bridge/node/retype": (200, {"error": {
+        "code": "value_not_convertible", "message": "no text form"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="value_not_convertible"):
+        core._apply_one_edit(alpha, "Alpha", {
+            "op": "retype", "path": "Model/Ref", "datatype": "LocalizedText"})
+
+
+def test_apply_one_edit_retype_to_localized_text(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/node/retype": (200, {"ok": True})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "retype", "path": "Model/Caption", "datatype": "LocalizedText"})
+    _m, path = next(c for c in cap if "/bridge/node/retype" in c[1])
+    assert "datatype=LocalizedText" in path
+
+
+def test_dry_run_accepts_retype_to_localized_text(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "retype", "path": "Model/Caption", "datatype": "LocalizedText"})
+    assert out["state"] == "validated" and out["report"]["ok"] is True
+    assert out["applied"] == 0
+
+
+def test_dry_run_rejects_invalid_retype_with_structured_error(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "retype", "path": "Model/Caption", "datatype": "Color"})
+    assert out["state"] == "validated" and out["report"]["ok"] is False
+    errs = out["report"]["errors"]
+    assert [(e["op_index"], e["code"], e["field"]) for e in errs] == [
+        (0, "invalid_datatype", "datatype")]
+    assert out["applied"] == 0
+
+
+def test_dry_run_surfaces_bridge_value_not_convertible(alpha, monkeypatch):
+    """The bridge's validate_ops reports value_not_convertible per op; dry_run passes it on."""
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (200, {
+            "ok": False, "op_count": 1, "warnings": [],
+            "errors": [{"op_index": 0, "code": "value_not_convertible",
+                        "message": "NodeId has no text form"}]}))
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "retype", "path": "Model/Ref", "datatype": "LocalizedText"}], dry_run=True)
+    assert out["report"]["ok"] is False and out["applied"] == 0
+    assert [e["code"] for e in out["report"]["errors"]] == ["value_not_convertible"]
+
+
+def test_apply_batch_with_invalid_retype_applies_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (
+            200, {"ok": True, "op_count": len(payload["ops"]), "errors": [], "warnings": []}))
+    out = core.bridge_edit(alpha, "Alpha", [
+        {"op": "retype", "path": "Model/X", "datatype": "Color"}])
+    assert out.get("applied", 0) == 0
+    assert not any("/bridge/node/retype" in c[1] for c in cap)
+
+
+# -- source-level checks of the C# retype-to-LocalizedText logic -----------------
+
+def test_retype_localized_text_is_a_supported_clr_target():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private static Type RetypeClrType(", "// Sample text for the retype")
+    assert 'case "LocalizedText": return typeof(LocalizedText);' in body
+
+
+def test_retype_bridge_checks_convertibility_before_writing():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string RetypeVariableInline(",
+                      "private static Type RetypeClrType(")
+    assert (body.index("LocalizedTextRetypeRefusal(oldDt, oldVal, toArray)")
+            < body.index("v.DataType = ResolveDataType(dtName)")
+            < body.index("v.Value = new UAValue(newVal)"))
+    assert "value_not_convertible" in body and '"not_a_variable"' in body
+    # dry_run runs the checks and skips every write
+    assert "bool dryRun" in body and "if (!dryRun)" in body and "would_retype" in body
+    assert body.index("if (!dryRun)") > body.index("LocalizedTextRetypeRefusal(")
+
+
+def test_retype_localized_text_scalar_keeps_existing_text_and_locale():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private static object RetypeScalar(", "private static NodeId ResolveDataType(")
+    lt = body[:body.index('if (dtName == "String")')]
+    assert 'dtName == "LocalizedText"' in lt
+    assert "return existingLt;" in lt                      # TextId preserved
+    assert 'new LocalizedText(text, "en-US")' in lt        # never an empty localeId
+
+
+def test_retype_localized_text_refusal_rules():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private static string LocalizedTextRetypeRefusal(",
+                      "private static object RetypeScalar(")
+    assert "has no text form" in body and "would drop" in body
+    for dt in ("NodeId", "ByteString"):
+        assert f'"{dt}"' not in _cs_region(text, "_TextConvertibleDataTypes = {", "};"), dt
+    for dt in ("String", "LocalizedText", "Int32", "Float", "Boolean", "DateTime"):
+        assert f'"{dt}"' in _cs_region(text, "_TextConvertibleDataTypes = {", "};"), dt
+
+
+def test_validate_ops_checks_retype_to_localized_text_in_bridge():
+    text = _bridge_cs_text()
+    case = _cs_region(text, 'case "retype":', 'case "reorder":')
+    for needle in ("invalid_datatype", "RetypeClrType(rtDt)", "value_not_convertible",
+                   "LocalizedTextRetypeRefusal(rtOldDt, rtOldVal, rtToArray)",
+                   "not_a_variable", "moved_earlier_in_batch", "modifies_deleted_node",
+                   "unresolved_reference"):
+        assert needle in case, needle
+
+
+def test_retype_registered_as_gated_author_tool(cfg):
+    from service import auth
+    from service.mcp_app import make_mcp
+    tool = "optix_bridge_retype"
+    assert auth.TOOL_SCOPES.get(tool) == "author"
+    names = {t.name for t in make_mcp(cfg)._tool_manager.list_tools()}
+    assert tool not in names                                 # gated with the primitives
+
+
+# -- create_variable NodePointer Kind (ftx-mcp-8fy.6) ------------------------------
+
+@pytest.mark.parametrize("dt", ["NodePointer", "nodepointer", "NODEPOINTER"])
+def test_validate_create_variable_nodepointer_with_target_or_kind_is_clean(dt):
+    assert core.validate_create_variable_op("Sel", dt, target="UI/Screens/A") == []
+    assert core.validate_create_variable_op("Sel", dt, kind="Button") == []
+    assert core.validate_create_variable_op("Sel", dt, "UI/Screens/A", "Button") == []
+
+
+@pytest.mark.parametrize("target,kind", [(None, None), ("", ""), ("  ", None), (None, " ")])
+def test_validate_create_variable_nodepointer_without_kind_source_is_refused(target, kind):
+    errs = core.validate_create_variable_op("Sel", "NodePointer", target, kind)
+    assert [(e["code"], e["field"]) for e in errs] == [("kind_required", "target")]
+    assert "BaseObject" in errs[0]["message"]
+
+
+def test_validate_create_variable_target_on_other_datatype_is_refused():
+    errs = core.validate_create_variable_op("X", "Int32", target="UI/Screens/A")
+    assert [(e["code"], e["field"]) for e in errs] == [("kind_not_applicable", "target")]
+    errs = core.validate_create_variable_op("X", "String", kind="Button")
+    assert [(e["code"], e["field"]) for e in errs] == [("kind_not_applicable", "kind")]
+    assert core.validate_create_variable_op("X", "Int32") == []
+
+
+def test_create_variable_nodepointer_posts_target_and_canonical_datatype(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {
+        "ok": True, "created_path": "Model/Sel", "datatype": "NodePointer",
+        "kind": "Screen", "target": "UI/Screens/A"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_variable(
+        alpha, "Alpha", "Sel", "Model", "nodepointer", target="UI/Screens/A")
+    assert out["kind"] == "Screen"
+    method, path = next(c for c in cap if "/bridge/model/variable" in c[1])
+    assert method == "POST"
+    assert "datatype=NodePointer" in path and "target=UI%2FScreens%2FA" in path
+    assert "kind=" not in path
+
+
+def test_create_variable_nodepointer_forwards_explicit_kind(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/Sel"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_create_variable(alpha, "Alpha", "Sel", "Model", "NodePointer", kind="Button")
+    _m, path = next(c for c in cap if "/bridge/model/variable" in c[1])
+    assert "kind=Button" in path and "target=" not in path
+
+
+def test_create_variable_plain_datatype_sends_no_target_or_kind(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/F"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_create_variable(alpha, "Alpha", "F")
+    _m, path = next(c for c in cap if "/bridge/model/variable" in c[1])
+    assert "target=" not in path and "kind=" not in path and "datatype=Boolean" in path
+
+
+def test_create_variable_nodepointer_without_target_writes_nothing(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_create_variable(alpha, "Alpha", "Sel", "Model", "NodePointer")
+    assert out["ok"] is False and out["code"] == "kind_required"
+    assert not any("/bridge/model/variable" in c[1] for c in cap)
+
+
+def test_create_variable_bridge_kind_refusal_raises(alpha, monkeypatch):
+    routes = {"/bridge/model/variable": (200, {"error": {
+        "code": "node_not_found", "message": "no target node at: UI/Nope"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed, match="node_not_found"):
+        core.bridge_create_variable(
+            alpha, "Alpha", "Sel", "Model", "NodePointer", target="UI/Nope")
+
+
+def test_apply_one_edit_create_variable_nodepointer_forwards_target(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/Sel"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "create_variable", "parent": "Model", "name": "Sel",
+        "datatype": "NodePointer", "target": "UI/Screens/A"})
+    _m, path = next(c for c in cap if "/bridge/model/variable" in c[1])
+    assert "datatype=NodePointer" in path and "target=UI%2FScreens%2FA" in path
+
+
+def test_apply_one_edit_create_variable_nodepointer_without_target_fails_the_op(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    with pytest.raises(core.BridgeWriteFailed, match="kind_required"):
+        core._apply_one_edit(alpha, "Alpha", {
+            "op": "create_variable", "parent": "Model", "name": "Sel",
+            "datatype": "NodePointer"})
+
+
+def test_dry_run_accepts_create_variable_nodepointer_with_target(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "create_variable", "parent": "Model", "name": "Sel",
+        "datatype": "NodePointer", "target": "UI/Screens/A"})
+    assert out["state"] == "validated" and out["report"]["ok"] is True
+    assert out["applied"] == 0
+
+
+def test_dry_run_rejects_create_variable_nodepointer_without_kind_source(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "create_variable", "parent": "Model", "name": "Sel", "datatype": "NodePointer"})
+    assert out["state"] == "validated" and out["report"]["ok"] is False
+    assert [(e["op_index"], e["code"]) for e in out["report"]["errors"]] == [
+        (0, "kind_required")]
+    assert out["applied"] == 0
+
+
+def test_dry_run_rejects_target_on_non_nodepointer_variable(alpha, monkeypatch):
+    out = _dry_run(alpha, monkeypatch, {
+        "op": "create_variable", "parent": "Model", "name": "X",
+        "datatype": "Int32", "target": "UI/Screens/A"})
+    assert out["report"]["ok"] is False
+    assert [e["code"] for e in out["report"]["errors"]] == ["kind_not_applicable"]
+
+
+def test_dry_run_surfaces_bridge_resolved_kind(alpha, monkeypatch):
+    """The bridge's validate_ops reports the Kind it resolved; dry_run passes it on."""
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    resolved = [{"op_index": 0, "path": "Model/Sel", "datatype": "NodePointer", "kind": "Screen"}]
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (200, {
+            "ok": True, "op_count": 1, "errors": [], "warnings": [], "resolved": resolved}))
+    out = core.bridge_edit(alpha, "Alpha", [{
+        "op": "create_variable", "parent": "Model", "name": "Sel",
+        "datatype": "NodePointer", "target": "UI/Screens/A"}], dry_run=True)
+    assert out["report"]["resolved"] == resolved
+
+
+def test_dry_run_surfaces_bridge_unresolved_target(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(
+        core, "_bridge_post_body",
+        lambda cfg, path, payload, timeout=20.0: (200, {
+            "ok": False, "op_count": 1, "warnings": [], "resolved": [],
+            "errors": [{"op_index": 0, "code": "node_not_found",
+                        "message": "no target node at: UI/Nope"}]}))
+    out = core.bridge_edit(alpha, "Alpha", [{
+        "op": "create_variable", "parent": "Model", "name": "Sel",
+        "datatype": "NodePointer", "target": "UI/Nope"}], dry_run=True)
+    assert out["report"]["ok"] is False and out["applied"] == 0
+
+
+def test_create_variable_tool_exposes_target_and_kind():
+    import inspect
+    from service import mcp_app
+    src = inspect.getsource(mcp_app)
+    start = src.index("def optix_bridge_create_variable(")
+    sig = src[start:src.index('"""', start)]
+    assert "target: str | None = None" in sig and "kind: str | None = None" in sig
+    assert "target=target, kind=kind" in src[start:start + 3000]
+
+
+# -- source-level checks of the C# NodePointer Kind logic ------------------------
+
+def test_bridge_create_variable_makes_typed_nodepointer_with_resolved_kind():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private string WriteVariableInline(", "// create_variable accepts")
+    assert "IsNodePointerDataType(dtName)" in body
+    assert "MakeVariable<FTOptix.Core.NodePointer>" in body
+    assert "ResolveNodePointerKind(" in body
+    # Kind is set from the resolved id, BEFORE the node is attached to its parent
+    assert body.index("np.Kind = ptrKindId") < body.index("parentNode.Add(np)")
+    # the pointed-to node becomes the value; the response reports the Kind
+    assert "np.Value = ptrTargetNode.NodeId" in body and '\\"kind\\":' in body
+    # never a hard-coded BaseObjectType (ns=0;i=58) Kind
+    assert "new NodeId(0, 58)" not in body
+    # the Kind is resolved (and any refusal returned) before anything is created
+    assert body.index("ResolveNodePointerKind(") < body.index("MakeVariable<FTOptix.Core.NodePointer>")
+
+
+def test_bridge_nodepointer_kind_is_the_pointed_to_nodes_type():
+    text = _bridge_cs_text()
+    kind_of = _cs_region(text, "private static NodeId KindIdOfNode(", "private bool ResolveNodePointerKind(")
+    assert "o.ObjectType.NodeId" in kind_of and "uv.VariableType.NodeId" in kind_of
+    assert "NodeClass.ObjectType" in kind_of
+    resolver = _cs_region(text, "private bool ResolveNodePointerKind(", "// POST /bridge/node/retype")
+    assert "KindIdOfNode(targetNode" in resolver
+    # neither target nor kind -> refused, never a silent unset/BaseObject Kind
+    assert '"kind_required"' in resolver and '"kind_unresolved"' in resolver
+    assert "NodeId(0, 58)" not in resolver
+
+
+def test_bridge_validate_ops_reports_resolved_nodepointer_kind():
+    text = _bridge_cs_text()
+    case = _cs_region(text, 'if (verb == "create_variable")', 'case "create_widget":')
+    # same resolver as the write path, so dry_run cannot disagree with apply
+    assert "ResolveNodePointerKind(" in case and "IsNodePointerDataType(cvDt)" in case
+    # a target created earlier in the batch resolves through the hypothetical model
+    assert "HypoResolve(cvTarget" in case and "HypoKindName(" in case
+    assert '"kind_not_applicable"' in case
+    assert '\\"kind\\":' in case
+    report = _cs_region(text, 'bool ok = errCount == 0;', "catch (System.Text.Json.JsonException")
+    assert '\\"resolved\\":[' in report
+
+
+# -- expression pow, Studio 1.8 (ftx-mcp-8fy.7) ------------------------------------
+
+_POW_EXPR = "pow({0}, 2) + 1"
+_POW_V17_MSG = ("function_requires_version: 'pow' requires Optix Studio 1.8 or later "
+                "(this Studio is 1.7.4.32)")
+_POW_V17_BODY = {
+    "ok": True, "valid": False, "sources": 1, "error": _POW_V17_MSG,
+    "requires_version": {"function": "pow", "min_version": "1.8",
+                         "studio_version": "1.7.4.32"},
+}
+
+
+def test_validate_expression_pow_valid_on_studio_18(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(
+        {"/bridge/expr/validate": (200, {"ok": True, "valid": True, "sources": 1})}, capture=cap))
+    out = core.bridge_validate_expression(alpha, "Alpha", _POW_EXPR, sources="Model/X")
+    assert out["valid"] is True and "error" not in out
+    _m, path = next(c for c in cap if "/bridge/expr/validate" in c[1])
+    assert "expression=pow" in path
+
+
+def test_validate_expression_pow_on_studio_17_is_a_structured_error(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(
+        {"/bridge/expr/validate": (200, _POW_V17_BODY)}))
+    out = core.bridge_validate_expression(alpha, "Alpha", _POW_EXPR, sources="Model/X")
+    assert out["valid"] is False
+    assert out["error"].startswith("function_requires_version:")
+    assert "requires Optix Studio 1.8" in out["error"]
+    assert out["requires_version"] == {
+        "function": "pow", "min_version": "1.8", "studio_version": "1.7.4.32"}
+
+
+def test_attach_expression_pow_on_studio_17_refused_with_clear_message(alpha, monkeypatch):
+    body = {"error": {"code": "bad_expression", "message": _POW_V17_MSG,
+                      "requires_version": _POW_V17_BODY["requires_version"]}}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(
+        {"/bridge/node/attach-expression": (200, body)}))
+    with pytest.raises(core.BridgeWriteFailed) as exc:
+        core.bridge_attach_expression(
+            alpha, "Alpha", "UI/MainWindow/L1", "Text", _POW_EXPR, sources="Model/X")
+    msg = str(exc.value)
+    assert "bad_expression" in msg and "pow" in msg and "1.8" in msg
+
+
+def test_attach_expression_pow_on_studio_18_posts_the_expression(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(
+        {"/bridge/node/attach-expression": (200, {"ok": True, "path": "UI/MainWindow/L1"})},
+        capture=cap))
+    out = core.bridge_attach_expression(
+        alpha, "Alpha", "UI/MainWindow/L1", "Text", _POW_EXPR, sources="Model/X")
+    assert out.get("ok") is True
+    _m, path = next(c for c in cap if "/bridge/node/attach-expression" in c[1])
+    assert "expression=pow" in path
+
+
+def test_validate_expression_tool_docs_mention_pow_needs_18():
+    import inspect
+    from service import mcp_app
+    src = inspect.getsource(mcp_app)
+    for name in ("def optix_bridge_attach_expression(", "def optix_bridge_validate_expression("):
+        start = src.index(name)
+        doc = src[start:src.index('"""', src.index('"""', start) + 3)]
+        assert "pow" in doc and "1.8" in doc, name
+
+
+# -- source-level checks of the C# pow gating --------------------------------------
+
+def test_bridge_pow_is_a_version_gated_expression_function():
+    text = _bridge_cs_text()
+    # pow is NOT in the always-present set; it lives in the version table at 1.8
+    base = _cs_region(text, "ExprFunctions =", "ExprFunctionMinVersion")
+    assert '"pow"' not in base
+    table = _cs_region(text, "ExprFunctionMinVersion =", "private static string _studioVersionCache")
+    assert '{ "pow", "1.8" }' in table
+
+
+def test_bridge_validate_expression_syntax_gates_pow_on_studio_version():
+    text = _bridge_cs_text()
+    body = _cs_region(text, "private static string ValidateExpressionSyntax(",
+                      "// Class 1 (LiteralLintTable) helper")
+    assert "ExprFunctionMinVersion.ContainsKey(w)" in body
+    assert "ExprFunctionVersionErr(w, StudioVersionString())" in body
+    # the version check runs before the generic unknown-function error
+    assert body.index("ExprFunctionVersionErr(") < body.index('return "unknown function')
+    helper = _cs_region(text, "private static string ExprFunctionVersionErr(",
+                        "// LiteralLintTable --")
+    assert "function_requires_version: '" in helper and "requires Optix Studio" in helper
+    assert "VersionAtLeast(studioVersion, min)" in helper
+
+
+def test_bridge_version_compare_never_refuses_when_version_unknown():
+    text = _bridge_cs_text()
+    cmp_ = _cs_region(text, "private static bool VersionAtLeast(", "private static string NormalizeVersion(")
+    assert cmp_.count("return true;") >= 2          # unparseable -> do not block
+    assert "have.Major > need.Major" in cmp_ and "have.Minor >= need.Minor" in cmp_
+
+
+def test_bridge_requires_version_is_structured_in_validate_and_error_bodies():
+    text = _bridge_cs_text()
+    extra = _cs_region(text, "private static string RequiresVersionExtra(", "private static string Bool(")
+    for field in ("requires_version", "function", "min_version", "studio_version"):
+        assert f'\\"{field}\\"' in extra, field
+    validate = _cs_region(text, "private string ValidateExprJson(", "// Diagnostic: reflect a CLR type")
+    assert "RequiresVersionExtra(err)" in validate
+    err_json = _cs_region(text, "private static string ErrorJson(", "// 1.0.8: ValidateExpressionSyntax")
+    assert "RequiresVersionExtra(message)" in err_json
+    # attach_expression's gate surfaces it as bad_expression through ErrorJson
+    assert 'ErrorJson("bad_expression", exprErr)' in text
+
+
+def test_bridge_studio_version_is_the_process_product_version_not_the_ui_assembly():
+    text = _bridge_cs_text()
+    fn = _cs_region(text, "private static string StudioVersionString()",
+                    "private static string CleanProductVersion(")
+    # ftx-mcp-mnk.1: the Studio process version resource, not FTOptix.UI's 21.2.0.98
+    assert "Process.GetCurrentProcess().MainModule.FileVersionInfo" in fn
+    assert "ProductVersion" in fn
+    assert "FTOptix.UI" not in fn and "Assembly" not in fn
+    assert 'string version = "unknown"' in fn
+
+
+def test_bridge_clean_product_version_keeps_leading_numeric_version():
+    text = _bridge_cs_text()
+    fn = _cs_region(text, "private static string CleanProductVersion(",
+                    "// True iff `version`")
+    assert "char.IsDigit(raw[cut])" in fn and "raw[cut] == '.'" in fn
+
+
+def test_bridge_health_reports_studio_version():
+    text = _bridge_cs_text()
+    health = _cs_region(text, "private string HealthJson()", "private string NodeJson")
+    assert '\\"studio_version\\"' in health and "StudioVersionString()" in health
+
+
+# -- create_variable variable_type / array_dimensions / properties (1.0.9 5b, ftx-mcp-090.2) --
+
+def _var_path(cap):
+    return next(c for c in cap if "/bridge/model/variable" in c[1])[1]
+
+
+def test_create_variable_station_tag_array_posts_fields(alpha, monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {
+        "ok": True, "created_path": "Model/Tags", "datatype": "Int32",
+        "variable_type": "RAEtherNetIPTag", "array_dimensions": [4],
+        "properties_set": ["SymbolName"]})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_variable(
+        alpha, "Alpha", "Tags", "Model", "Int32",
+        variable_type="RAEtherNetIPTag", array_dimensions=4,
+        properties={"SymbolName": "MyTags", "Enabled": True})
+    assert out["variable_type"] == "RAEtherNetIPTag"
+    q = parse_qs(urlsplit(_var_path(cap)).query)
+    assert q["variable_type"] == ["RAEtherNetIPTag"]
+    assert q["array_dimensions"] == ["4"]
+    assert json.loads(q["properties"][0]) == {"SymbolName": "MyTags", "Enabled": "true"}
+    assert "dry_run" not in q
+
+
+def test_create_variable_plain_sends_no_station_tag_fields(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/F"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_create_variable(alpha, "Alpha", "F")
+    p = _var_path(cap)
+    assert "variable_type=" not in p and "array_dimensions=" not in p
+    assert "properties=" not in p and "dry_run=" not in p
+
+
+@pytest.mark.parametrize("dims", [4, "4", [4], "[4]", (4,)])
+def test_create_variable_array_dimensions_forms_normalise(alpha, monkeypatch, dims):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/A"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core.bridge_create_variable(alpha, "Alpha", "A", "Model", "Int32", array_dimensions=dims)
+    assert "array_dimensions=4" in _var_path(cap)
+
+
+@pytest.mark.parametrize("dims", [0, -1, "abc", [2, 3], [], True, 1.5, "0", {}])
+def test_create_variable_invalid_array_dimensions_structured_error(alpha, monkeypatch, dims):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_create_variable(alpha, "Alpha", "A", "Model", "Int32",
+                                      array_dimensions=dims)
+    assert out["ok"] is False and out["code"] == "invalid_array_dimensions"
+    assert out["errors"][0]["field"] == "array_dimensions"
+    assert not any("/bridge/model/variable" in c[1] for c in cap)
+
+
+@pytest.mark.parametrize("vt,code", [
+    ("Not A Type!", "unknown_variable_type"),
+    ("Bad Path/X", "unknown_variable_type"),
+    ("", "invalid_variable_type"),
+    (5, "invalid_variable_type"),
+])
+def test_create_variable_invalid_variable_type_structured_error(alpha, monkeypatch, vt, code):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_create_variable(alpha, "Alpha", "T", "Model", "Int32",
+                                      variable_type=vt)
+    assert out["ok"] is False and out["code"] == code
+    assert out["errors"][0]["field"] == "variable_type"
+    assert not any("/bridge/model/variable" in c[1] for c in cap)
+
+
+def test_validate_create_variable_properties_errors():
+    v = core.validate_create_variable_op
+    assert v("T", "Int32", variable_type="RAEtherNetIPTag",
+             properties={"SymbolName": "x", "N": 3, "B": False}) == []
+    assert [e["code"] for e in v("T", "Int32", properties=["SymbolName"])] == ["invalid_properties"]
+    errs = v("T", "Int32", properties={"Value": 1, "bad name": "x", "L": [1], "N": None})
+    assert [e["code"] for e in errs] == [
+        "invalid_property_name", "invalid_property_name",
+        "invalid_property_value", "invalid_property_value"]
+    assert errs[0]["field"] == "properties.Value"
+
+
+def test_validate_create_variable_station_fields_on_nodepointer_refused():
+    errs = core.validate_create_variable_op(
+        "P", "NodePointer", target="UI/A", variable_type="RAEtherNetIPTag",
+        array_dimensions=3)
+    assert [e["code"] for e in errs] == [
+        "variable_type_not_applicable", "array_dimensions_not_applicable"]
+
+
+def test_create_variable_dry_run_validates_then_asks_bridge(alpha, monkeypatch):
+    out = core.bridge_create_variable(alpha, "Alpha", "T", "Model", "Int32",
+                                      array_dimensions=0, dry_run=True)
+    assert out["ok"] is False and out["code"] == "invalid_array_dimensions"
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {
+        "ok": True, "dry_run": True, "would_create": True,
+        "created_path": "Model/T", "variable_type": "RAEtherNetIPTag"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_variable(
+        alpha, "Alpha", "T", "Model", "Int32", variable_type="RAEtherNetIPTag",
+        array_dimensions=2, properties={"SymbolName": "S"}, dry_run=True)
+    assert out["dry_run"] is True and out["would_create"] is True
+    assert "dry_run=true" in _var_path(cap)
+
+
+@pytest.mark.parametrize("code,field", [
+    ("unknown_variable_type", "variable_type"),
+    ("unknown_property", "properties"),
+])
+def test_create_variable_bridge_refusal_becomes_structured_error(alpha, monkeypatch, code, field):
+    routes = {"/bridge/model/variable": (200, {"error": {
+        "code": code, "message": "no such thing in this Studio"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_variable(
+        alpha, "Alpha", "T", "Model", "Int32", variable_type="NoSuchTag",
+        properties={"SymbolName": "S"})
+    assert out["ok"] is False and out["code"] == code
+    assert out["errors"][0]["field"] == field
+    assert "no such thing" in out["errors"][0]["message"]
+
+
+def test_apply_one_edit_create_variable_forwards_station_fields(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/T"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    core._apply_one_edit(alpha, "Alpha", {
+        "op": "create_variable", "parent": "Model", "name": "T", "datatype": "Int32",
+        "variable_type": "RAEtherNetIPTag", "array_dimensions": 3,
+        "properties": {"SymbolName": "S"}})
+    p = _var_path(cap)
+    assert "variable_type=RAEtherNetIPTag" in p and "array_dimensions=3" in p
+    assert "properties=" in p
+
+
+def test_apply_one_edit_create_variable_bad_dims_fails_the_op(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    with pytest.raises(core.BridgeWriteFailed, match="invalid_array_dimensions"):
+        core._apply_one_edit(alpha, "Alpha", {
+            "op": "create_variable", "parent": "Model", "name": "T",
+            "datatype": "Int32", "array_dimensions": "x"})
+
+
+def test_create_variable_station_tag_bridge_source():
+    """The C# resolves the VariableType, shapes the array and sets declared
+    properties before parent.Add (source-level; the bridge is not compiled in CI)."""
+    from pathlib import Path
+    cs = (Path(__file__).parent.parent.parent / "studio-bridge"
+          / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    start = cs.index("private string WriteVariableInline")
+    body = cs[start:cs.index("private static bool IsNodePointerDataType")]
+    for needle in ('"variable_type"', '"array_dimensions"', '"properties"',
+                   "PrepareVariableExtras", "ArrayDimensions", "dry_run"):
+        assert needle in body, needle
+    assert body.index("PrepareVariableExtras") < body.index("InformationModel.MakeVariable(name, ResolveDataType(dtName), vtId)")
+    assert body.rindex("parentNode.Add(v)") > body.index("v.Add(pchild)")
+    assert "unknown_variable_type" in cs and "unknown_property" in cs
+
+
+# ---- ftx-mcp-vvk.1: typed driver tag resolution ------------------------------
+
+def _bridge_source() -> str:
+    from pathlib import Path
+    return (Path(__file__).parent.parent.parent / "studio-bridge"
+            / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+
+
+def _cs_body(cs: str, start_marker: str, end_marker: str) -> str:
+    start = cs.index(start_marker)
+    return cs[start:cs.index(end_marker, start)]
+
+
+_RESOLVE_START = "private static IUANode ResolveVariableTypeNodeEx"
+_RESOLVE_END = "private static IUANode ResolveVariableTypeByPath"
+
+
+@pytest.mark.parametrize("vt", [
+    "RAEtherNetIPTag",                                   # short name
+    "FTOptix.RAEtherNetIP.RAEtherNetIPTag",              # Module.Type
+    "BaseVariableType/BaseDataVariableType/RAEtherNetIPTag",  # type-node path
+])
+def test_variable_type_forms_pass_service_validation(vt):
+    """name, Module.Type and type-path spellings all reach the bridge."""
+    assert core.validate_create_variable_op(
+        "T", "Boolean", variable_type=vt,
+        properties={"SymbolName": "S"}) == []
+
+
+def test_variable_type_resolves_by_short_name_source():
+    body = _cs_body(_bridge_source(), _RESOLVE_START, _RESOLVE_END)
+    assert "FindAllVariableTypesByBrowseName(searchRoot, name, hits)" in body
+    assert "hits.Count == 1" in body and "return hits[0]" in body
+
+
+def test_variable_type_resolves_by_module_type_source():
+    cs = _bridge_source()
+    body = _cs_body(cs, _RESOLVE_START, _RESOLVE_END)
+    assert "name.LastIndexOf('.')" in body
+    assert "ResolveModuleVariableTypeId(name.Substring(0, dot), name.Substring(dot + 1))" in body
+    cat = _cs_body(cs, "private static List<KeyValuePair<string, FieldInfo>> EnumerateModuleVariableTypes",
+                   "private static string VariableTypeLabel")
+    assert 't.Name != "VariableTypes"' in cat and 'StartsWith("FTOptix.")' in cat
+
+
+def test_variable_type_resolves_by_type_node_path_source():
+    cs = _bridge_source()
+    body = _cs_body(cs, _RESOLVE_START, _RESOLVE_END)
+    assert "name.IndexOf('/') >= 0" in body
+    assert "ResolveVariableTypeByPath(name, root)" in body
+    walk = _cs_body(cs, _RESOLVE_END, "private static NodeId ResolveModuleVariableTypeId")
+    assert "NodeClass.VariableType" in walk and "kid.BrowseName == segs[i]" in walk
+
+
+def test_ambiguous_variable_type_refused_source():
+    """A short name hit in >1 module is refused, never silently picked, in both
+    the write path and the batch validator (both go through PrepareVariableExtras)."""
+    cs = _bridge_source()
+    body = _cs_body(cs, "private string PrepareVariableExtras", "// POST /bridge/model/type?name=")
+    assert '"ambiguous_variable_type"' in body
+    assert "candidates: " in body and "ResolveVariableTypeNodeEx(vtName, out vtAmbiguous)" in body
+    assert body.index("ambiguous_variable_type") < body.index('"unknown_variable_type"')
+    res = _cs_body(cs, _RESOLVE_START, _RESOLVE_END)
+    assert "ambiguous = hits.Select(" in res and "ambiguous.Count > 1 ? null" in res
+
+
+def test_typed_tag_made_with_makevariable_and_symbolname_set_source():
+    cs = _bridge_source()
+    body = _cs_body(cs, "private string WriteVariableInline", "private static bool IsNodePointerDataType")
+    assert "InformationModel.MakeVariable(name, ResolveDataType(dtName), vtId)" in body
+    assert "CoerceAssign(pchild, extraProps[pi].Value" in body
+    assert body.index("CoerceAssign(pchild") < body.rindex("parentNode.Add(v)")
+
+
+def test_describe_node_reports_variable_type_source():
+    cs = _bridge_source()
+    assert "LinkTargetJson(sv) + VariableTypeJson(sv)" in cs
+    assert "private static string VariableTypeJson" in cs
+
+
+def test_ambiguous_variable_type_becomes_structured_error_with_candidates(alpha, monkeypatch):
+    msg = ("variable_type 'RAEtherNetIPTag' is ambiguous: several modules define a "
+           "VariableType with that name; use Module.Type or a type path. candidates: "
+           "FTOptix.RAEtherNetIP.RAEtherNetIPTag, FTOptix.Other.RAEtherNetIPTag; "
+           "nothing was created")
+    routes = {"/bridge/model/variable": (200, {"error": {
+        "code": "ambiguous_variable_type", "message": msg}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_variable(
+        alpha, "Alpha", "T", "Model", "Boolean", variable_type="RAEtherNetIPTag",
+        properties={"SymbolName": "S"})
+    assert out["ok"] is False and out["code"] == "ambiguous_variable_type"
+    err = out["errors"][0]
+    assert err["field"] == "variable_type"
+    assert err["candidates"] == ["FTOptix.RAEtherNetIP.RAEtherNetIPTag",
+                                 "FTOptix.Other.RAEtherNetIPTag"]
+
+
+# ---- ftx-mcp-vvk.2: create_object refuses a VariableType ---------------------
+
+def test_create_object_validator_refuses_variable_type():
+    errs = core.validate_create_object_op("T", "RAEtherNetIPTag")
+    assert [e["code"] for e in errs] == ["variable_type_not_object"]
+    assert errs[0]["field"] == "object_type"
+    assert errs[0]["hint"] == 'use create_variable with variable_type: "RAEtherNetIPTag"'
+
+
+@pytest.mark.parametrize("t", [
+    "FTOptix.RAEtherNetIP.RAEtherNetIPTag",
+    "BaseVariableType/BaseDataVariableType/RAEtherNetIPTag",
+])
+def test_create_object_validator_refuses_variable_type_spellings(t):
+    errs = core.validate_create_object_op("T", t)
+    assert errs and errs[0]["code"] == "variable_type_not_object"
+    assert f'variable_type: "{t}"' in errs[0]["hint"]
+
+
+def test_create_object_validator_live_resolver_and_clean_cases():
+    assert core.validate_create_object_op("T", "Vendor.CustomTagType",
+                                          is_variable_type=lambda t: True)
+    assert core.validate_create_object_op("T", None) == []
+    assert core.validate_create_object_op("T", "UI/Templates/PumpCard") == []
+    assert core.validate_create_object_op("T", "FTOptix.Alarm.DigitalAlarm") == []
+
+
+def test_create_object_dry_run_batch_refuses_variable_type(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    ops = [{"op": "create_object", "parent": "Model", "name": "T",
+            "object_type": "RAEtherNetIPTag"}]
+    out = core.bridge_edit(alpha, "Alpha", ops, dry_run=True)
+    assert out["report"]["ok"] is False
+    errs = [e for e in out["report"]["errors"] if e["code"] == "variable_type_not_object"]
+    assert errs and errs[0]["op_index"] == 0
+    assert 'create_variable with variable_type: "RAEtherNetIPTag"' in errs[0]["hint"]
+
+
+def test_create_object_direct_route_refuses_before_any_write(alpha, monkeypatch):
+    capture: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=capture))
+    out = core.bridge_create_object(alpha, "Alpha", "Model", "T", "RAEtherNetIPTag")
+    assert out["ok"] is False and out["code"] == "variable_type_not_object"
+    assert 'create_variable with variable_type: "RAEtherNetIPTag"' in out["hint"]
+    assert not any("/bridge/model/object" in path for _m, path in capture)
+
+
+def test_create_object_bridge_refusal_becomes_structured_error(alpha, monkeypatch):
+    routes = {"/bridge/model/object": (200, {"error": {
+        "code": "variable_type_not_object", "message": "variable_type_not_object: x"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_object(alpha, "Alpha", "Model", "T", "Vendor.OtherTag")
+    assert out["ok"] is False and out["code"] == "variable_type_not_object"
+
+
+def test_create_object_variable_type_refusal_bridge_source():
+    cs = _bridge_source()
+    body = _cs_body(cs, "private string CreateObjectInline",
+                    "o = InformationModel.MakeObject(name, typeId)")
+    assert "VariableTypeNotObjectMessage(typePath)" in body
+    assert '"variable_type_not_object"' in body
+    # ftx-mcp-aaw.6: the dry-run validator must NOT repeat the service's error.
+    assert 'addErr(idx, "variable_type_not_object"' not in cs
+
+
+def test_create_object_variable_type_error_reported_once(alpha, monkeypatch):
+    """The service validator is the single source of variable_type_not_object."""
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    ops = [{"op": "create_object", "parent": "Model", "name": "T",
+            "object_type": "RAEtherNetIPTag"}]
+    out = core.bridge_edit(alpha, "Alpha", ops, dry_run=True)
+    errs = [e for e in out["report"]["errors"] if e["code"] == "variable_type_not_object"]
+    assert len(errs) == 1, errs
+
+
+# ---- 1.0.9 5c: bind raw_path with [i] array-element index -------------------
+
+def test_bind_raw_path_array_element_posts_literal_nodepath(alpha, monkeypatch):
+    """raw_path with an [i] index reaches the bridge verbatim as `raw=`."""
+    cap: list = []
+    routes = {"/bridge/node/bind": (200, {"ok": True,
+              "path": "UI/MainWindow/L1/Text", "raw": "Model/Tags[1]",
+              "mode": "Read", "via": "dynamiclink-raw"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_bind_property(alpha, "Alpha", "UI/MainWindow/L1", "Text",
+                                    raw_path="Model/Tags[1]")
+    assert out["via"] == "dynamiclink-raw"
+    _, path = next(c for c in cap if "/bridge/node/bind" in c[1])
+    assert "raw=Model%2FTags%5B1%5D" in path and "source=" not in path
+
+
+@pytest.mark.parametrize("raw", [
+    "Model/Tags[0]", "Model/Tags[12]", "{Alias1}/Tags[1]",
+    "../../Alias1/Tags[3]", "Model/Sub/Arr[7]", "{Alias1}/MyInt", "Model/V"])
+def test_validate_raw_path_accepts(raw):
+    assert core.validate_raw_path(raw) == []
+
+
+@pytest.mark.parametrize("raw,code", [
+    ("Model/Tags[x]", "invalid_raw_path_index"),
+    ("Model/Tags[-1]", "invalid_raw_path_index"),
+    ("Model/Tags[]", "invalid_raw_path_index"),
+    ("Model/Tags[1.5]", "invalid_raw_path_index"),
+    ("Model/Tags[1][2]", "invalid_raw_path_index"),
+    ("Model/Tags[99999999999]", "invalid_raw_path_index"),
+    ("Model/Tags[1", "invalid_raw_path"),
+    ("Model/Tags1]", "invalid_raw_path"),
+    ("Model/[1]", "invalid_raw_path"),
+    ("../[1]", "invalid_raw_path"),
+    ("Model//Tags", "invalid_raw_path"),
+    ("/Model/Tags", "invalid_raw_path"),
+    ("{Alias1/MyInt", "invalid_raw_path"),
+    (" Model/Tags[1]", "invalid_raw_path"),
+    ("   ", "invalid_raw_path"),
+])
+def test_validate_raw_path_rejects_malformed(raw, code):
+    errs = core.validate_raw_path(raw)
+    assert errs and errs[0]["code"] == code and errs[0]["field"] == "raw_path", errs
+
+
+def test_bind_raw_path_malformed_index_is_structured_error_and_writes_nothing(
+        alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_bind_property(alpha, "Alpha", "UI/X", "Text",
+                                    raw_path="Model/Tags[abc]")
+    assert out["ok"] is False and out["code"] == "invalid_raw_path_index"
+    assert out["errors"][0]["field"] == "raw_path"
+    assert not cap          # the bridge was never contacted
+    out = core.bridge_bind_property(alpha, "Alpha", "UI/X", "Text",
+                                    raw_path="Model//Tags")
+    assert out["ok"] is False and out["code"] == "invalid_raw_path"
+    assert not cap
+
+
+def test_bind_raw_path_dry_run_returns_plan_without_bridge(alpha, monkeypatch):
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    out = core.bridge_bind_property(alpha, "Alpha", "UI/X", "Text",
+                                    raw_path="Model/Tags[1]", dry_run=True)
+    assert out["ok"] is True and out["dry_run"] is True and out["would_bind"] is True
+    assert out["plan"]["raw"] == "Model/Tags[1]"
+    assert out["plan"]["via"] == "dynamiclink-raw"
+    assert not cap
+    bad = core.bridge_bind_property(alpha, "Alpha", "UI/X", "Text",
+                                    raw_path="Model/Tags[-1]", dry_run=True)
+    assert bad["ok"] is False and bad["code"] == "invalid_raw_path_index"
+
+
+def test_bridge_edit_dry_run_rejects_bad_bind_raw_path(alpha, monkeypatch):
+    """A malformed raw_path in a batch bind op is a per-op validation error
+    (dry_run and apply alike); a valid [i] path passes validation."""
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (
+                            200, {"ok": True, "op_count": len(payload["ops"]),
+                                  "errors": [], "warnings": []}))
+    bad = core.bridge_edit(alpha, "Alpha", [{
+        "op": "bind", "path": "UI/X", "name": "Text",
+        "raw_path": "Model/Tags[oops]"}], dry_run=True)
+    assert bad["applied"] == 0 and bad["state"] == "validated", bad
+    assert [e["code"] for e in bad["report"]["errors"]] == ["invalid_raw_path_index"], bad
+    ok = core.bridge_edit(alpha, "Alpha", [{
+        "op": "bind", "path": "UI/X", "name": "Text",
+        "raw_path": "Model/Tags[1]"}], dry_run=True)
+    assert ok["report"]["errors"] == [] and ok["state"] == "validated", ok
+
+
+def _patch_validate_clean(monkeypatch):
+    monkeypatch.setattr(core, "_bridge_post_body",
+                        lambda cfg, path, payload, timeout=20.0: (
+                            200, {"ok": True, "op_count": len(payload["ops"]),
+                                  "errors": [], "warnings": []}))
+
+
+_NODE_MISSING = (404, {"error": {"code": "node_not_found", "message": "no node"}})
+
+
+def test_bridge_edit_dry_run_rejects_unresolvable_bind_source(alpha, monkeypatch):
+    """create_widget + bind with a bad source_path: dry_run returns a structured
+    source_not_found error on the bind op, and nothing is applied."""
+    routes = {
+        "/bridge/nodes?path=Model/Missing": _NODE_MISSING,
+        "/bridge/nodes?path=Model/Real": (200, {"path": "Model/Real", "node_class": "Variable"}),
+    }
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    _patch_validate_clean(monkeypatch)
+    ops = [
+        {"op": "create_widget", "screen": "UI/Screens/S", "name": "L1", "widget_type": "Label"},
+        {"op": "bind", "path": "UI/Screens/S/L1", "name": "Text",
+         "source_path": "Model/Missing"},
+    ]
+    out = core.bridge_edit(alpha, "Alpha", ops, dry_run=True)
+    assert out["state"] == "validated" and out["applied"] == 0, out
+    assert out["report"]["ok"] is False
+    errs = out["report"]["errors"]
+    assert [(e["op_index"], e["code"], e["field"]) for e in errs] == [
+        (1, "source_not_found", "source_path")], errs
+    assert errs[0]["source_path"] == "Model/Missing"
+    # A resolvable live source on the same batch shape is clean.
+    ops[1]["source_path"] = "Model/Real"
+    ok = core.bridge_edit(alpha, "Alpha", ops, dry_run=True)
+    assert ok["report"]["ok"] is True and ok["report"]["errors"] == [], ok
+
+
+def test_bridge_edit_dry_run_resolves_in_batch_bind_source(alpha, monkeypatch):
+    """A bind source created earlier in the same batch resolves in dry_run even
+    though the live model has no such node; a non-variable or later-created
+    source does not."""
+    cap: list = []
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}, capture=cap))
+    _patch_validate_clean(monkeypatch)
+    bind = {"op": "bind", "path": "UI/Screens/S/L1", "name": "Text",
+            "source_path": "Model/NewVar"}
+    create_var = {"op": "create_variable", "parent": "Model", "name": "NewVar",
+                  "datatype": "String"}
+    create_lbl = {"op": "create_widget", "screen": "UI/Screens/S", "name": "L1",
+                  "widget_type": "Label"}
+    ok = core.bridge_edit(alpha, "Alpha", [create_var, create_lbl, bind], dry_run=True)
+    assert ok["report"]["ok"] is True and ok["report"]["errors"] == [], ok
+    assert not [c for c in cap if "Model/NewVar" in c[1]]  # resolved in-batch, no live call
+    # Reverse order: the source does not exist yet when the bind runs.
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(
+        {"/bridge/nodes?path=Model/NewVar": _NODE_MISSING}))
+    late = core.bridge_edit(alpha, "Alpha", [create_lbl, bind, create_var], dry_run=True)
+    assert [e["code"] for e in late["report"]["errors"]] == ["source_not_found"], late
+    # In-batch source that is a widget, not a variable.
+    notvar = core.bridge_edit(alpha, "Alpha", [create_lbl, {**bind, "source_path": "UI/Screens/S/L1"}],
+                              dry_run=True)
+    assert [e["code"] for e in notvar["report"]["errors"]] == ["source_not_variable"], notvar
+
+
+# -- create_variable datatype validation (ftx-mcp-xk7.3) ---------------------------
+
+def _bridge_resolve_datatype_names() -> list[str]:
+    import re
+    body = _cs_region(_bridge_cs_text(), "private static NodeId ResolveDataType(",
+                      "// Shared duplicate-sibling refusal")
+    return re.findall(r'case "(\w+)":', body)
+
+
+def test_create_variable_datatypes_match_bridge_source():
+    """The Python list is the bridge's ResolveDataType case list (drift guard)."""
+    bridge = _bridge_resolve_datatype_names()
+    assert len(bridge) == 18
+    assert list(core.CREATE_VARIABLE_DATATYPES) == bridge
+
+
+def test_create_variable_datatypes_match_bridge_error_message():
+    import re
+    body = _cs_region(_bridge_cs_text(), "unsupported datatype '", "// Shared duplicate-sibling")
+    tail = body.split("expected one of:", 1)[1]
+    names = re.findall(r"[A-Za-z0-9]+", tail.replace('" +', "").replace('"', ""))
+    assert sorted(names) == sorted(core.CREATE_VARIABLE_DATATYPES)
+
+
+@pytest.mark.parametrize("dt", _bridge_resolve_datatype_names() + ["NodePointer"])
+def test_validate_create_variable_accepts_every_bridge_datatype(dt):
+    kw = {"kind": "Button"} if dt == "NodePointer" else {}
+    assert core.validate_create_variable_op("V", dt, **kw) == []
+
+
+@pytest.mark.parametrize("dt", ["Color2", "int32", "Bool", "", "Variant", "Struct", 5])
+def test_validate_create_variable_rejects_unsupported_datatype(dt):
+    errs = core.validate_create_variable_op("V", dt)
+    assert [(e["code"], e["field"]) for e in errs] == [("invalid_datatype", "datatype")]
+    assert "Int32" in errs[0]["allowed"] and "NodePointer" in errs[0]["allowed"]
+
+
+def test_validate_create_variable_default_datatype_is_clean():
+    assert core.validate_create_variable_op("V", None) == []
+
+
+def test_dry_run_rejects_create_variable_unsupported_datatype(alpha, monkeypatch):
+    applied: list = []
+    monkeypatch.setattr(core, "_bridge_post_body", _fake_validate(_OK_REPORT))
+    monkeypatch.setattr(core, "_use_bridge_for", lambda cfg, project: True)
+    monkeypatch.setattr(core, "_bridge_write_guard", lambda cfg, project: cfg)
+    monkeypatch.setattr(core, "_apply_one_edit",
+                        lambda cfg, project, op: applied.append(op["op"]))
+    ops = [{"op": "create_variable", "parent": "Model", "name": "V", "datatype": "Bogus"}]
+    out = core.bridge_edit(alpha, "Alpha", ops, dry_run=True)
+    assert applied == [] and out["report"]["ok"] is False, out
+    err = out["report"]["errors"][0]
+    assert (err["code"], err["field"], err["op_index"]) == ("invalid_datatype", "datatype", 0)
+
+    ok_ops = [{"op": "create_variable", "parent": "Model", "name": f"V{i}", "datatype": dt}
+              for i, dt in enumerate(core.CREATE_VARIABLE_DATATYPES)]
+    out = core.bridge_edit(alpha, "Alpha", ok_ops, dry_run=True)
+    assert out["report"]["ok"] is True, out
+
+
+# --- #34: create_netlogic must not blindly re-send the POST after a timeout ---
+
+_NL_PATH = "/bridge/model/netlogic"
+
+
+def _timeout_then_routes(routes, calls):
+    """Fake _bridge_http: the netlogic POST times out like the real helper does
+    for retry_ambiguous=False (BridgeWriteTimeout); other paths use `routes`."""
+    base = _fake_bridge(routes)
+
+    def fake(cfg, path, method="GET", timeout=5.0, **kw):
+        calls.append((method, path, timeout, kw))
+        if path.startswith(_NL_PATH):
+            raise core.BridgeWriteTimeout("timed out")
+        return base(cfg, path, method=method, timeout=timeout, **kw)
+    return fake
+
+
+def test_create_netlogic_timeout_verifies_node_and_succeeds(alpha, monkeypatch):
+    calls: list = []
+    routes = {"/bridge/nodes": (200, {"path": "Model/Slow", "browse_name": "Slow",
+                                      "node_class": "Object", "children": [],
+                                      "properties": []})}
+    monkeypatch.setattr(core, "_bridge_http", _timeout_then_routes(routes, calls))
+    out = core.bridge_create_netlogic(alpha, "Alpha", "Model", "Slow")
+    assert out["ok"] is True and out["created_path"] == "Model/Slow"
+    assert out["verified_after_timeout"] is True
+    posts = [c for c in calls if c[0] == "POST"]
+    assert len(posts) == 1  # never re-sent
+    assert posts[0][2] >= 30  # long timeout for the compile
+
+
+def test_create_netlogic_timeout_node_missing_raises(alpha, monkeypatch):
+    monkeypatch.setattr(core, "_NETLOGIC_VERIFY_DELAY", 0)
+    calls: list = []
+    monkeypatch.setattr(core, "_bridge_http", _timeout_then_routes({}, calls))
+    with pytest.raises(core.BridgeWriteTimeout):
+        core.bridge_create_netlogic(alpha, "Alpha", "Model", "Slow")
+    assert len([c for c in calls if c[0] == "POST"]) == 1
+
+
+def test_create_netlogic_genuine_name_exists_still_error(alpha, monkeypatch):
+    routes = {_NL_PATH: (200, {"error": {"code": "name_exists", "message": "dup"}}),
+              "/bridge/nodes": (200, {"path": "Model/Dup", "children": [],
+                                      "properties": []})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core.bridge_create_netlogic(alpha, "Alpha", "Model", "Dup")
+    assert "name_exists" in str(e.value)
+
+
+def _urlopen_timeouts(monkeypatch, counter):
+    import urllib.request
+
+    def boom(req, timeout=None):
+        counter.append(req.full_url)
+        raise TimeoutError("timed out")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(core.time, "sleep", lambda *_: None)
+
+
+def test_bridge_http_non_idempotent_post_timeout_not_retried(alpha, monkeypatch):
+    hits: list = []
+    _urlopen_timeouts(monkeypatch, hits)
+    with pytest.raises(core.BridgeWriteTimeout):
+        core._bridge_http(alpha, "/x", method="POST", timeout=1, retries=3,
+                          retry_ambiguous=False)
+    assert len(hits) == 1
+
+
+def test_bridge_http_default_post_still_retries_timeouts(alpha, monkeypatch):
+    hits: list = []
+    _urlopen_timeouts(monkeypatch, hits)
+    with pytest.raises(core.BridgeUnavailable):
+        core._bridge_http(alpha, "/x", method="POST", timeout=1, retries=3)
+    assert len(hits) == 4
+
+
+# -- add_translations updates existing keys in place (ftx-mcp-aqs.3, #38) --------
+
+def _bridge_method_body(src: str, signature: str) -> str:
+    """Return the C# text of the method starting at ``signature`` (brace-matched)."""
+    start = src.index(signature)
+    open_i = src.index("{", start)
+    depth = 0
+    for i in range(open_i, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def _bridge_src() -> str:
+    from pathlib import Path
+    return (Path(__file__).parent.parent.parent / "studio-bridge" / "StudioMCPBridge.cs"
+            ).read_text(encoding="utf-8")
+
+
+class _FakeTranslationTable:
+    """In-memory stand-in for the bridge's translation table (SDK semantics:
+    AddTranslation throws on an existing key; SetTranslation updates it).
+    ``fail_keys`` make a row error, like the SDK rejecting that one row."""
+
+    def __init__(self, existing=(), fail_keys=()):
+        self.rows = {k: "old" for k in existing}
+        self.fail_keys = set(fail_keys)
+        self.set_calls: list = []
+        self.add_calls: list = []
+
+    def post(self, cfg, path, payload, timeout=20.0):
+        added = updated = 0
+        for n, row in enumerate(payload["rows"]):
+            k = row["key"]
+            if k in self.fail_keys:
+                return 200, {"error": {"code": "row_failed", "message":
+                             f"rows[{n}] key '{k}' failed after {n} row(s) were applied"}}
+            if k in self.rows:                       # LookupTranslation hit -> SetTranslation
+                self.set_calls.append(k)
+                updated += 1
+            else:
+                self.add_calls.append(k)
+                added += 1
+            self.rows[k] = row["value"]
+        return 200, {"ok": True, "count": len(payload["rows"]), "added": added, "updated": updated}
+
+
+def test_add_translations_existing_key_calls_set_translation_and_counts_updated(alpha, monkeypatch):
+    # C#: an existing key goes through SetTranslation and is counted in `updated`.
+    src = _bridge_src()
+    upsert = _bridge_method_body(src, "private static bool UpsertTranslation(")
+    assert "TranslationRowExists(key)" in upsert     # the one shared existence check
+    assert upsert.count("NoteTranslationWritten(key, locale, text)") == 3     # every write path records the key
+    assert upsert.index("InformationModel.SetTranslation(lt)") < upsert.index("InformationModel.AddTranslation(lt)")
+    assert "already contains" in upsert               # Lookup miss on an existing key still updates
+    bulk = _bridge_method_body(src, "private string AddTranslationsInline(")
+    assert "UpsertTranslation(" in bulk
+    assert "InformationModel.AddTranslation(" not in bulk      # no direct Add that can throw
+    assert "if (isNew) added++; else updated++;" in bulk
+
+    # Python side: the counts the bridge reports reach the caller untouched.
+    table = _FakeTranslationTable(existing=["k1"])
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body", table.post)
+    out = core.bridge_add_translations(alpha, "Alpha", [{"key": "k1", "value": "new"}])
+    assert out["ok"] is True and out["updated"] == 1 and out["added"] == 0
+    assert table.set_calls == ["k1"] and table.rows["k1"] == "new"
+
+
+def test_add_translations_new_keys_count_as_added(alpha, monkeypatch):
+    table = _FakeTranslationTable(existing=["old"])
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body", table.post)
+    out = core.bridge_add_translations(
+        alpha, "Alpha", [{"key": "n1", "value": "A"}, {"key": "n2", "value": "B"},
+                         {"key": "old", "value": "C"}])
+    assert out["added"] == 2 and out["updated"] == 1
+    assert table.add_calls == ["n1", "n2"] and table.set_calls == ["old"]
+    # the single-key route also reports new vs existing via UpsertTranslation
+    single = _bridge_method_body(_bridge_src(), "private string AddTranslationInline(")
+    assert "bool isNew = UpsertTranslation(lt, locale, value);" in single
+
+
+def test_add_translations_row_error_does_not_abort_rows_already_applied(alpha, monkeypatch):
+    table = _FakeTranslationTable(existing=["a"], fail_keys=["bad"])
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+    monkeypatch.setattr(core, "_bridge_post_body", table.post)
+    with pytest.raises(core.BridgeWriteFailed) as ei:
+        core.bridge_add_translations(
+            alpha, "Alpha", [{"key": "a", "value": "A2"}, {"key": "bad", "value": "x"},
+                             {"key": "z", "value": "Z"}])
+    assert "row_failed" in str(ei.value) and "1 row(s) were applied" in str(ei.value)
+    assert table.rows["a"] == "A2"                   # the row before the error stays applied
+    assert "z" not in table.rows                     # rows after it are not attempted
+    # C#: the failing row returns row_failed from inside the loop, never rolling back
+    bulk = _bridge_method_body(_bridge_src(), "private string AddTranslationsInline(")
+    assert 'row_failed' in bulk and '\\"partial\\":' in bulk     # reports partial/written
+    assert "rollback" not in bulk.lower()
+
+
+def test_add_translations_edit_op_behaves_like_dedicated_tool(alpha, monkeypatch):
+    rows = [{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}]
+    results = []
+    for use_edit_op in (False, True):
+        table = _FakeTranslationTable(existing=["k1"])
+        monkeypatch.setattr(core, "_bridge_http", _fake_bridge({}))
+        monkeypatch.setattr(core, "_bridge_post_body", table.post)
+        if use_edit_op:
+            res = core._apply_one_edit(alpha, "Alpha", {"op": "add_translations", "rows": rows})
+        else:
+            res = core.bridge_add_translations(alpha, "Alpha", rows)
+        results.append((res["added"], res["updated"], table.rows, table.set_calls, table.add_calls))
+    assert results[0] == results[1] == (1, 1, {"k1": "v1", "k2": "v2"}, ["k1"], ["k2"])
+    # both reach the same bridge routine (one C# code path)
+    assert core._BRIDGE_EDIT_OPS["add_translations"][0] == "bridge_add_translations"
+
+
+# ---- #48: create_object / create_variable never report success without a node ----
+
+_NODE_ABSENT_ROUTE = {"/bridge/nodes": (404, {"error": {"code": "node_not_found"}})}
+
+
+def test_create_object_post_check_finds_no_node_returns_not_created(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": "Model/Pens/Pen1"}),
+              **_NODE_ABSENT_ROUTE}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_object(alpha, "Alpha", "Model/Pens", "Pen1", "SomeType")
+    assert out["ok"] is False
+    assert out["code"] == "create_object_not_created"
+    assert out["parent"] == "Model/Pens" and out["type"] == "SomeType"
+    assert "Nothing was created" in out["message"]
+    assert any(p.startswith("/bridge/nodes?path=Model/Pens/Pen1") for _, p in cap)
+
+
+def test_create_object_post_check_node_present_returns_ok(alpha, monkeypatch):
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": "Model/Motor1",
+                                             "type": "BaseObjectType"}),
+              "/bridge/nodes": (200, {"path": "Model/Motor1", "node_class": "Object"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_object(alpha, "Alpha", "Model", "Motor1")
+    assert out["ok"] is True and out["created_path"] == "Model/Motor1"
+
+
+def test_create_object_post_check_unverifiable_does_not_fail_create(alpha, monkeypatch):
+    # Only an explicit node_not_found counts as "nothing created".
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": "Model/M"}),
+              "/bridge/nodes": (500, {"error": {"code": "boom"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    assert core.bridge_create_object(alpha, "Alpha", "Model", "M")["ok"] is True
+
+
+def test_create_object_ui_namespace_child_also_post_checked(alpha, monkeypatch):
+    routes = {"/bridge/model/object": (200, {"ok": True,
+              "created_path": "UI/W/G/GridLayoutProperties", "via": "x"}),
+              **_NODE_ABSENT_ROUTE}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_object(alpha, "Alpha", "UI/W/G", "GridLayoutProperties")
+    assert out["code"] == "create_object_not_created"
+
+
+def test_batch_create_object_post_check_fails_the_op(alpha, monkeypatch):
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": "Model/Pen1"}),
+              **_NODE_ABSENT_ROUTE}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed) as e:
+        core._apply_one_edit(alpha, "Alpha", {
+            "op": "create_object", "parent": "Model", "name": "Pen1",
+            "object_type": "SomeType"})
+    assert "create_object_not_created" in str(e.value)
+    assert e.value.op_result["parent"] == "Model"
+
+
+@pytest.mark.parametrize("parent,otype", [
+    ("Model", None),                                   # container
+    ("UI/Screens/S", "UI/Templates/CardType"),         # project type
+    ("CommDrivers", "FTOptix.RAEtherNetIP.RAEtherNetIPDriver"),  # driver
+    ("CommDrivers/D", "FTOptix.RAEtherNetIP.RAEtherNetIPStation"),  # station
+])
+def test_create_object_successful_kinds_still_ok(alpha, monkeypatch, parent, otype):
+    routes = {"/bridge/model/object": (200, {"ok": True, "created_path": f"{parent}/N1"}),
+              "/bridge/nodes": (200, {"node_class": "Object"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    assert core.bridge_create_object(alpha, "Alpha", parent, "N1", otype)["ok"] is True
+
+
+def test_create_variable_post_check_finds_no_node_returns_not_created(alpha, monkeypatch):
+    routes = {"/bridge/model/variable": (200, {"ok": True, "created_path": "Model/Flag"}),
+              **_NODE_ABSENT_ROUTE}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_variable(alpha, "Alpha", "Flag")
+    assert out["ok"] is False and out["code"] == "create_variable_not_created"
+    assert out["parent"] == "Model" and "Nothing was created" in out["message"]
+
+
+def test_create_variable_dry_run_skips_post_check(alpha, monkeypatch):
+    cap: list = []
+    routes = {"/bridge/model/variable": (200, {"ok": True, "dry_run": True}),
+              **_NODE_ABSENT_ROUTE}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_create_variable(alpha, "Alpha", "Flag", dry_run=True)
+    assert out["ok"] is True
+    assert not any(p.startswith("/bridge/nodes") for _, p in cap)
+
+
+def test_create_object_trendpen_is_variable_type_not_object(alpha):
+    out = core.bridge_create_object(alpha, "Alpha", "Model/T/Pens", "Pen1", "TrendPen")
+    assert out["code"] == "variable_type_not_object"
+    assert "create_variable" in out["hint"]
+    assert core.validate_create_object_op("Pen1", "TrendPen")[0]["code"] \
+        == "variable_type_not_object"
+
+
+# ---- set_property: on-demand creation of type-declared optional children ----
+# (ftx-mcp-wvk.2). The creation itself runs in the C# bridge against real Studio
+# (live test: test_trend_pen_set_property_creates_color_live); these cover the
+# Python pass-through and pin the C# decision structure.
+
+def _bridge_cs() -> str:
+    from pathlib import Path
+    return (Path(__file__).resolve().parents[2] / "studio-bridge"
+            / "StudioMCPBridge.cs").read_text(encoding="utf-8-sig")
+
+
+def test_set_property_creates_optional_child_reports_name(alpha, monkeypatch):
+    """The bridge's created_optional_child field reaches the caller untouched."""
+    cap: list = []
+    routes = {"/bridge/node/property": (200, {
+        "ok": True, "via": "created_optional_child", "datatype": "Color",
+        "value": "#ff0000", "created_optional_child": "Color"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes, capture=cap))
+    out = core.bridge_set_property(alpha, "Alpha", "Model/T/Pens/Pen1", "Color", "#ff0000")
+    assert out["ok"] is True
+    assert out["created_optional_child"] == "Color"
+    posts = [p for m, p in cap if m == "POST" and p.startswith("/bridge/node/property")]
+    assert len(posts) == 1 and "name=Color" in posts[0]
+
+
+def test_set_property_undeclared_property_still_property_not_found(alpha, monkeypatch):
+    """A name the type does not declare keeps failing with property_not_found."""
+    routes = {"/bridge/node/property": (200, {
+        "error": {"code": "property_not_found",
+                  "message": "node Model/T/Pens/Pen1 has no variable or "
+                             "materializable property Bogus"}})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    with pytest.raises(core.BridgeWriteFailed) as ei:
+        core.bridge_set_property(alpha, "Alpha", "Model/T/Pens/Pen1", "Bogus", "1")
+    assert "property_not_found" in str(ei.value)
+
+
+def test_bridge_set_property_creates_only_type_declared_children():
+    """C# structure: the on-demand create is gated on a TYPE declaration, runs
+    before the variable-node guard, coerces before attaching, and the undeclared
+    fall-through still ends in property_not_found."""
+    src = _bridge_cs()
+    body = src[src.index("private string SetPropertyInline"):]
+    body = body[:body.index("// ---- typed string[] write")]
+    assert "FindDeclaredOptionalChild(node, name)" in body
+    # variable nodes: declared-child creation precedes the unknown_property guard
+    assert body.index("FindDeclaredOptionalChild(node, name)") \
+        < body.index("DeclaredPropertyGuard(node, name)")
+    assert "IsNodeAttributeName(name)" in body[:body.index("DeclaredPropertyGuard(node, name)")]
+    assert 'ErrorJson("property_not_found"' in body
+
+    helper = src[src.index("private static IUAVariable FindDeclaredOptionalChild"):]
+    helper = helper[:helper.index("private static string WithCreatedOptionalChild")]
+    assert "FindDeclaredVariableTypeProperty(uv.VariableType, name)" in helper
+    assert "uo.ObjectType" in helper and "SuperType" in helper
+    # no per-type special case
+    assert "TrendPen" not in helper and "Color" not in helper
+    # coerce BEFORE node.Add so a bad value leaves the model untouched
+    assert helper.index("CoerceAssign(child") < helper.index("node.Add(child)")
+    assert '"created_optional_child"' in helper
+
+
+# --- routed_into_collection at apply time (#84 E) ---------------------------
+
+def test_create_widget_routed_reply_carries_routed_into_collection_warning(alpha, monkeypatch):
+    """A widget the bridge routed into a placeholder collection (e.g. a
+    NavigationPanelItem under a NavigationPanel lands in Panels) reports a
+    `routed_into_collection` warning with `routed_path`."""
+    routes = {"/bridge/ui/widget": (200, {
+        "ok": True, "created_path": "UI/Nav/Panels/Tab1",
+        "type": "NavigationPanelItem", "routed_into": "Panels"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_widget(alpha, "Alpha", "UI/Nav", "Tab1",
+                                    "NavigationPanelItem")
+    warns = [w for w in out["warnings"] if w["code"] == "routed_into_collection"]
+    assert len(warns) == 1
+    assert warns[0]["routed_path"] == "UI/Nav/Panels/Tab1"
+    assert warns[0]["routed_into"] == "Panels"
+
+
+def test_create_widget_not_routed_has_no_routed_warning(alpha, monkeypatch):
+    routes = {"/bridge/ui/widget": (200, {
+        "ok": True, "created_path": "UI/MainWindow/L2", "type": "Label"})}
+    monkeypatch.setattr(core, "_bridge_http", _fake_bridge(routes))
+    out = core.bridge_create_widget(alpha, "Alpha", "UI/MainWindow", "L2", "Label")
+    assert not any(w.get("code") == "routed_into_collection"
+                   for w in out.get("warnings") or [])
+
+
+def test_batch_apply_surfaces_routed_into_collection_warning():
+    """_surface_op_warnings copies the apply-time routed warning into the batch
+    result, so a forward-referenced NavigationPanel (not predicted at validate
+    time) is still reported."""
+    out: dict = {}
+    res = core._add_routed_warning({
+        "ok": True, "created_path": "UI/Nav/Panels/Tab1", "routed_into": "Panels"})
+    core._surface_op_warnings(out, 3, {"op": "create_widget"}, res)
+    w = out["warnings"][0]
+    assert w["op_index"] == 3 and w["code"] == "routed_into_collection"
+    assert w["routed_path"] == "UI/Nav/Panels/Tab1"
+
+
+def test_validate_ops_routed_warning_emits_routed_path_in_csharp():
+    """The C# validator's routed_into_collection warning carries `routed_path`
+    (the doc promises it); pending live bench check of the JSON itself."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "studio-bridge"
+           / "StudioMCPBridge.cs").read_text(encoding="utf-8")
+    m = re.search(r'addWarnX\(idx, "routed_into_collection".*?routed_path', src, re.S)
+    assert m, "routed_into_collection warning must include routed_path"

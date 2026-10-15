@@ -1,0 +1,7 @@
+# sdist contents. The wheel gets skills/ and the bridge source via setup.py
+# (copied into service/_bundled/ in the build dir only); service/static is
+# package data.
+recursive-include skills *.md
+include studio-bridge/StudioMCPBridge.cs
+recursive-include service/static *
+include server.json

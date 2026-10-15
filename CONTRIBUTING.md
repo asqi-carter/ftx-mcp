@@ -55,6 +55,14 @@ A full smoke checklist is rehearsed cold on a clean Windows user account
 before every release tag. If you ship something new to a critical path, call
 it out in the PR so it gets a checklist entry.
 
+## Bridge C# changes and the compile gate
+
+The executor/dev sandbox has no `dotnet`, so the bench `build_check`
+(`ci/w11-validate.sh <sha>`) is the ONLY compile gate for the bridge C#
+(`studio-bridge/StudioMCPBridge.cs`). Do not tag a release, or call a bridge change
+"compiling", until it has passed on the bench (see `ci/README.md`). Every PRD
+touching `studio-bridge/` must name the SDK members it uses.
+
 ## Code style
 
 - Ruff handles formatting and linting (`ruff check .`)

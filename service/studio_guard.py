@@ -45,8 +45,8 @@ STUDIO_PROCS = ("ftoptixstudio.exe",)
 # (cmdline-attributable, unlike Studio).
 EDITOR_PROCS = ("devenv.exe", "code.exe")
 
-# Snapshots are cheap (~50ms) but the guard fires on every read; cache so
-# a burst of optix_read_file calls costs one scan.
+# Snapshots are cheap (~50ms warm) but the guard fires on every read; cache
+# so a burst of optix_read_file calls costs one scan.
 CACHE_TTL_SECONDS = 2.0
 
 _cache: dict | None = None
@@ -56,16 +56,26 @@ ScanFn = Callable[[], list[dict]]
 
 
 def _scan() -> list[dict]:
-    """Enumerate guard-relevant processes: [{pid, name, cmdline}, ...]."""
+    """Enumerate guard-relevant processes: [{pid, name, cmdline}, ...].
+
+    Name-filter FIRST, then read the command line of the few matches only.
+    Asking process_iter for "cmdline" up front makes psutil open a handle on
+    EVERY process on the box (~540 of them) before the name filter ever runs;
+    with endpoint protection hooking OpenProcess that measured 7-11 s per
+    scan (2026-10-13), and this scan sits on the path of every bridge call
+    via resolve_project's open-in-Studio fallback. A name-only pass is ~70 ms
+    warm, and cmdline for the one or two hits is ~10 ms more.
+    """
     out: list[dict] = []
-    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+    for p in psutil.process_iter(["pid", "name"]):
         name = (p.info.get("name") or "").lower()
-        if name in STUDIO_PROCS or name in EDITOR_PROCS:
-            out.append({
-                "pid": p.info["pid"],
-                "name": name,
-                "cmdline": p.info.get("cmdline") or [],
-            })
+        if name not in STUDIO_PROCS and name not in EDITOR_PROCS:
+            continue
+        try:
+            cmdline = p.cmdline() or []
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            cmdline = []
+        out.append({"pid": p.info["pid"], "name": name, "cmdline": cmdline})
     return out
 
 

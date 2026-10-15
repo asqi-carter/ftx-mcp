@@ -296,6 +296,8 @@ def test_error_lists_projects_root_and_the_projects_studio_has_open(
     b = make_outside_project(tmp_path, "FloatPrecisionLab")
     monkeypatch.setattr(studio_guard, "_scan", fake_studio_scan(
         studio_open_cmdline(a), studio_open_cmdline(b)))
+    monkeypatch.setattr(core, "_project_loaded_identity",
+                        lambda *a_, **k: {"source": "bridge_health", "pid": 1})
 
     with pytest.raises(core.ProjectNotFound) as exc:
         core.resolve_project(cfg, "Nope")
@@ -305,6 +307,41 @@ def test_error_lists_projects_root_and_the_projects_studio_has_open(
     assert "Line4_HMI" in msg and "FloatPrecisionLab" in msg
     # project NAMES only — not a directory listing back to the caller
     assert str(a) not in msg and str(b) not in msg
+
+
+def test_project_not_found_lists_only_projects_that_are_loaded(
+    cfg: core.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRD 0053 D5: a Studio launched on a project that never loaded (empty /
+    invalid .optix, upgrade dialog) is not "open" and is not listed."""
+    a = make_outside_project(tmp_path, "Line4_HMI")
+    b = make_outside_project(tmp_path, "NeverLoaded")
+    monkeypatch.setattr(studio_guard, "_scan", fake_studio_scan(
+        studio_open_cmdline(a), studio_open_cmdline(b)))
+    monkeypatch.setattr(
+        core, "_project_loaded_identity",
+        lambda cfg_, project, project_dir, names, **k:
+            {"source": "window_title", "pid": 1} if project == "Line4_HMI" else None)
+
+    with pytest.raises(core.ProjectNotFound) as exc:
+        core.resolve_project(cfg, "Nope")
+    msg = str(exc.value)
+    assert "Line4_HMI" in msg
+    assert "NeverLoaded" not in msg
+
+
+def test_project_not_found_with_no_loaded_studio_lists_nothing(
+    cfg: core.Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    b = make_outside_project(tmp_path, "NeverLoaded")
+    monkeypatch.setattr(studio_guard, "_scan", fake_studio_scan(studio_open_cmdline(b)))
+    monkeypatch.setattr(core, "_project_loaded_identity", lambda *a, **k: None)
+
+    with pytest.raises(core.ProjectNotFound) as exc:
+        core.resolve_project(cfg, "Nope")
+    msg = str(exc.value)
+    assert "NeverLoaded" not in msg
+    assert "none has a project loaded" in msg
 
 
 def test_enumeration_failure_is_a_miss_not_a_crash(
@@ -332,6 +369,7 @@ def test_doctor_reports_the_resolution_source(
     monkeypatch.setattr(studio_guard, "_scan",
                         fake_studio_scan(studio_open_cmdline(outside)))
     monkeypatch.setattr(core, "_scan_bridge_ports", lambda _cfg, force=False: [])
+    monkeypatch.setattr(core, "_port_listener", lambda port: None)
 
     def row(rep: dict) -> dict:
         return next(c for c in rep["checks"] if c["name"] == "project")
@@ -699,6 +737,7 @@ def test_registry_source_in_doctor(
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr(studio_guard, "_scan", lambda: [])
     monkeypatch.setattr(core, "_scan_bridge_ports", lambda _cfg, force=False: [])
+    monkeypatch.setattr(core, "_port_listener", lambda port: None)
 
     rep = core.doctor(cfg, project="Line4_HMI")
     row = next(c for c in rep["checks"] if c["name"] == "project")

@@ -210,6 +210,42 @@ def test_describe_node_wraps_property_values_as_untrusted(
     assert out["properties"][0]["value"] == core._untrusted("800 (Float)", "bridge")
 
 
+def test_describe_variable_int32_value_wrapped(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """Describing an Int32 Variable returns its own datatype and value, the
+    value inside the untrusted envelope (datatype/name stay raw)."""
+    make_project(projects_root, "Alpha")
+    node = {"path": "Model/X", "browse_name": "X", "node_class": "Variable",
+            "dotnet_type": "BaseDataVariable", "children": [], "properties": [],
+            "datatype": "Int32", "value": "180", "truncated": False}
+    routes = {**_HEALTHY, "/bridge/nodes": (200, node)}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.describe_node(cfg, "Alpha", "Model/X")
+    assert out["datatype"] == "Int32"
+    assert out["value"] == core._untrusted("180", "bridge")
+    assert "target_path" not in out
+
+
+def test_describe_variable_link_value_includes_target_path(
+    cfg: core.Config, projects_root: Path, monkeypatch
+) -> None:
+    """A Variable whose value is a link carries target_path (resolved browse
+    path), and the printed value is that path inside the envelope."""
+    make_project(projects_root, "Alpha")
+    node = {"path": "Model/Holder/Source0", "browse_name": "Source0",
+            "node_class": "Variable", "dotnet_type": "BaseDataVariable",
+            "children": [], "properties": [], "datatype": "NodePath",
+            "value": "{NodeId:ns=3;g=abc}", "target_path": "Model/Target",
+            "truncated": False}
+    routes = {**_HEALTHY, "/bridge/nodes": (200, node)}
+    monkeypatch.setattr(core, "_bridge_http", _bridge(routes))
+    out = core.describe_node(cfg, "Alpha", "Model/Holder/Source0")
+    assert out["target_path"] == "Model/Target"
+    assert out["value"] == core._untrusted("Model/Target", "bridge")
+    assert "diagnostics" not in out
+
+
 def test_describe_node_raises_when_bridge_down(cfg: core.Config, projects_root: Path, monkeypatch) -> None:
     make_project(projects_root, "Alpha")
     monkeypatch.setattr(core, "_bridge_http", _bridge({}, unreachable=True))
@@ -448,3 +484,72 @@ def test_list_screens_falls_back_to_file(cfg: core.Config, projects_root: Path, 
     out = core.list_screens(cfg, "Alpha")
     assert out["source"] == "file"
     assert any(s["name"] == "Overview" for s in out["screens"])
+
+
+# ---- describe_node: relative NodePath links ---------------------------
+
+def _link_node(props: list) -> dict:
+    return {"path": "UI/Screens/F20/F02Lbl/Text", "browse_name": "Text",
+            "node_class": "Variable", "dotnet_type": "BaseDataVariable",
+            "children": [], "properties": props, "truncated": False}
+
+
+def _describe_with(cfg, projects_root, monkeypatch, props, existing):
+    """Describe UI/Screens/F20/F02Lbl/Text; `existing` = paths the bridge knows."""
+    make_project(projects_root, "Alpha")
+    node = _link_node(props)
+
+    def fake(cfg_, path, timeout=5.0, **_kw):
+        if path.startswith("/bridge/health"):
+            return 200, json.dumps(_HEALTHY["/bridge/health"][1]).encode()
+        if path.startswith("/bridge/nodes?path="):
+            p = path.split("path=", 1)[1]
+            if p == "UI/Screens/F20/F02Lbl/Text":
+                return 200, json.dumps(node).encode()
+            if p in existing:
+                return 200, json.dumps({"path": p, "properties": [], "children": []}).encode()
+        return 404, b'{"error":{"code":"node_not_found"}}'
+
+    monkeypatch.setattr(core, "_bridge_http", fake)
+    return core.describe_node(cfg, "Alpha", "UI/Screens/F20/F02Lbl/Text")
+
+
+_REL = "../../../../../Model/F01Val"
+
+
+def test_describe_relative_nodepath_link_resolves(cfg, projects_root, monkeypatch) -> None:
+    props = [{"name": "DynamicLink", "datatype": "NodePath", "value": _REL,
+              "target_path": None, "target_missing": True}]
+    out = _describe_with(cfg, projects_root, monkeypatch, props, {"Model/F01Val"})
+    p = out["properties"][0]
+    assert p["target_path"] == "Model/F01Val"
+    assert p["target_missing"] is False
+    assert "diagnostics" not in out
+
+
+def test_describe_relative_nodepath_link_to_deleted_target_still_dangling(
+    cfg, projects_root, monkeypatch
+) -> None:
+    props = [{"name": "DynamicLink", "datatype": "NodePath", "value": _REL,
+              "target_path": None, "target_missing": True}]
+    out = _describe_with(cfg, projects_root, monkeypatch, props, set())
+    assert out["properties"][0]["target_missing"] is True
+    assert [d["code"] for d in out["diagnostics"]] == ["dangling_link"]
+
+
+def test_describe_formatter_source_row_not_falsely_dangling(
+    cfg, projects_root, monkeypatch
+) -> None:
+    props = [{"name": "Source0", "datatype": "NodePath", "value": "../Model/Nowhere",
+              "target_path": None, "target_missing": True}]
+    out = _describe_with(cfg, projects_root, monkeypatch, props, set())
+    assert out["properties"][0]["target_unchecked"] is True
+    assert "diagnostics" not in out
+
+
+def test_resolve_relative_nodepath() -> None:
+    f = core._resolve_relative_nodepath
+    assert f("UI/Screens/F20/F02Lbl/Text", _REL) == "Model/F01Val"
+    assert f("A/B", "./C") == "A/B/C"
+    assert f("A", "../../X") is None
+    assert f("A/B", "/Objects/P/X") is None

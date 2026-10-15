@@ -7,14 +7,23 @@ import pytest
 from service import core
 
 
+@pytest.fixture(autouse=True)
+def _f5_target_autouse(f5_target_studio) -> None:
+    """A Studio is attributed to every project so F5 is reachable (#92 guard)."""
+
+
 def test_restart_emulator_stops_then_runs(cfg: core.Config, monkeypatch) -> None:
     calls = []
+    monkeypatch.setattr(core, "_tcp_probe", lambda host, port, *a, **k: True)
+    monkeypatch.setattr(core, "_wait_runtime_port", lambda *a, **k: True)
+    monkeypatch.setattr(core, "attach_mode", lambda c: True)
+    pids = iter([[111], [222]])   # before the restart / the NEW runtime
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, r=None: {"pids": [111], "state": "running"})
+                        lambda c, r=None, project=None: {"pids": next(pids), "state": "running"})
     monkeypatch.setattr(core, "stop_emulator",
-                        lambda c, r=None, status=None: calls.append("stop") or {"stopped": True, "killed_pids": [111]})
+                        lambda c, r=None, status=None, project=None: calls.append("stop") or {"stopped": True, "killed_pids": [111]})
     monkeypatch.setattr(core, "run_emulator",
-                        lambda c, p, save_first=False, wait_ready=True, runner=None:
+                        lambda c, p, save_first=False, wait_ready=True, runner=None, wait_page=True:
                         calls.append("run") or {"launched": True, "serving": True})
     out = core.restart_emulator(cfg, "P")
     assert calls == ["stop", "run"]
@@ -22,35 +31,46 @@ def test_restart_emulator_stops_then_runs(cfg: core.Config, monkeypatch) -> None
     assert out["serving"] is True
 
 
-def test_restart_emulator_refuses_when_foreign_emulator_running(
+def test_restart_emulator_only_stops_its_own_projects_emulator(
     cfg: core.Config, monkeypatch
 ) -> None:
-    """If an emulator for a DIFFERENT project is running, restart_emulator must
-    return a mismatch error BEFORE issuing the stop action — stopping the wrong
-    project's runtime is silent data loss on a multi-Studio box."""
+    """With Beta's emulator also running, restarting Alpha stops only Alpha's
+    pid (project-scoped) and is NOT refused as runtime_project_mismatch."""
+    entries = [
+        {"pid": 1111, "project_resolved": "Alpha", "matched_path": None},
+        {"pid": 7777, "project_resolved": "Beta", "matched_path": None},
+    ]
     monkeypatch.setattr(core, "_emulator_entries", lambda project=None: [
-        {"pid": 7777, "project_resolved": "Beta",
-         "matched_path": r"\Emulator\Projects\Beta\ApplicationFiles"},
-    ])
-    stop_called = []
-    monkeypatch.setattr(core, "stop_emulator",
-                        lambda c, r=None, status=None: stop_called.append(True) or {})
+        e for e in entries
+        if project is None or e["project_resolved"].lower() == project.lower()])
+    monkeypatch.setattr(core, "_tcp_probe", lambda host, port, *a, **k: True)
+    monkeypatch.setattr(core, "_tail_last_lifecycle_line", lambda p: None)
+    monkeypatch.setattr(core, "_wait_runtime_port", lambda *a, **k: True)
+    monkeypatch.setattr(core, "attach_mode", lambda c: True)
+    stopped_pids: list = []
+
+    def fake_stop(c, r=None, status=None, project=None):
+        stopped_pids.extend(status["pids"])
+        entries[0]["pid"] = 2222       # the NEW runtime process
+        return {"stopped": True, "killed_pids": status["pids"]}
+
+    monkeypatch.setattr(core, "stop_emulator", fake_stop)
+    monkeypatch.setattr(core, "run_emulator",
+                        lambda c, p, save_first=False, wait_ready=True, runner=None, wait_page=True:
+                        {"launched": True, "serving": True})
     out = core.restart_emulator(cfg, "Alpha")
-    assert out["ok"] is False
-    assert out["error"] == "runtime_project_mismatch"
-    assert out["requested"] == "Alpha"
-    assert out["resolved"] == "Beta"
-    assert out["pid"] == 7777
-    assert stop_called == []  # stop must NOT have been called
+    assert stopped_pids == [1111]
+    assert out["restarted"] is True and out["stopped_pids"] == [1111]
+    assert "error" not in out
 
 
 def test_restart_emulator_skips_stop_when_idle(cfg: core.Config, monkeypatch) -> None:
     monkeypatch.setattr(core, "emulator_status",
-                        lambda c, r=None: {"pids": [], "state": "stopped"})
+                        lambda c, r=None, project=None: {"pids": [], "state": "stopped"})
     monkeypatch.setattr(core, "stop_emulator",
-                        lambda c, r=None, status=None: (_ for _ in ()).throw(AssertionError("no stop when idle")))
+                        lambda c, r=None, status=None, project=None: (_ for _ in ()).throw(AssertionError("no stop when idle")))
     monkeypatch.setattr(core, "run_emulator",
-                        lambda c, p, save_first=False, wait_ready=True, runner=None:
+                        lambda c, p, save_first=False, wait_ready=True, runner=None, wait_page=True:
                         {"launched": True, "serving": True})
     out = core.restart_emulator(cfg, "P")
     assert out["restarted"] is False and "stopped_pids" not in out

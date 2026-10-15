@@ -236,7 +236,8 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         if action == "doctor":
             return core.doctor(cfg, project=project)
         if action == "services":
-            return core.services_status(cfg)
+            return core.with_external_change_check(
+                cfg, lambda: core.services_status(cfg))
         # action == "version"
         return core.studio_version(cfg)
 
@@ -338,9 +339,14 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         THE discovery primitive: locate which file and line hold a screen,
         widget, node name, or property before reading or editing. Case-
         insensitive by default. Literal only — no regex, single-line queries.
-        Refuses with `studio_open` (409) while Studio is running (disk state
-        is stale while Studio holds the project in memory; close Studio, no
-        override exists).
+        While Studio is open and its bridge is serving this project, the
+        search runs against the LIVE model through the bridge (node
+        browse-name / path / property name+value) instead of the files, so it
+        does NOT refuse. Only when no bridge serves the project does it scan
+        the files on disk, and that scan refuses with `studio_open` (409)
+        while Studio is running (disk state is stale while Studio holds the
+        project in memory; close Studio or arm the bridge, no override
+        exists).
 
         Use this when:
           - you need to find which Nodes/*.yaml defines a screen or widget
@@ -584,7 +590,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         return hdr + "\n" + res["map"]
 
     @mcp.tool(annotations=_RO)
-    def optix_bridge_status() -> dict:
+    def optix_bridge_status(project: str | None = None) -> dict:
         """Status of the design-time read-bridge(s) (NetLogic HTTP listener(s)
         in Studio).
 
@@ -592,13 +598,24 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         can each have an armed bridge SIMULTANEOUSLY, one per project, so this
         now returns `bridges`: a list, one entry per port currently answering
         {available, project, bridge_version, port, reason, source}, plus
-        `count`.  `bridges[0]` (or {} when count==0) is echoed at the top
+        `count`.  With exactly ONE bridge armed it is echoed at the top
         level under the pre-1.0.7 single-bridge field names (`available`/
-        `project`/`bridge_version`/`port`/`reason`/`source`) so an existing
-        caller reading those still gets a sane single answer — but with more
-        than one bridge armed, read `bridges` for the full picture; the
-        top-level fields alone don't say WHICH project they describe among
-        several.
+        `project`/`bridge_version`/`port`/`reason`/`source`). With several
+        armed no bridge is singled out (top-level `project`/`port` are None):
+        read `bridges`; each entry carries `studio_pid`, `project_name` and
+        `project_dir` (the identity every project-targeted call is routed by).
+
+        `bridge_source` (per bridge entry and top-level aggregate) reports
+        whether the project's StudioMCPBridge.cs matches the shipped bridge
+        (normalized hash): `"current"`, `"stale"` (differs — re-arm to sync),
+        or `"unknown"` (comparison not possible / nothing armed). The comparison
+        ignores `using ...;` directive lines, blank lines, line endings and
+        leading/trailing whitespace (Studio rewrites those on save); any other
+        difference is `"stale"`.
+
+        `project` (optional) scopes the call to that project's bridge: one
+        health probe at the registry port with a 0.5 s timeout instead of a
+        scan. Omit it to list every armed bridge (probed in parallel).
 
         `source` reports how the bridge was discovered: `"registry"` when it
         was found via the per-port JSON registry files written by the C# bridge
@@ -616,9 +633,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
           - you just want to read a node — call optix_describe_node and handle
             the bridge_unavailable error instead of pre-checking
         """
-        bridges = core.list_bridges(cfg)
-        primary = bridges[0] if bridges else core.bridge_state(cfg)
-        return {**primary, "bridges": bridges, "count": len(bridges)}
+        return core.bridge_status(cfg, project)
 
     @mcp.tool(annotations=_RO)
     @_with_project
@@ -810,10 +825,15 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         The bridge lives in the user's Studio, so we never auto-restart — we
         classify (down / wrong-project / loading / per-op) and tell the user
         exactly what to do. See core.classify_bridge_failure."""
+        # Re-check NetLogic sources restored by an earlier delete in the last
+        # 60 s; a drifted file is restored and reported on THIS call's result.
+        late = core._netlogic_late_guard(cfg, project)
         try:
-            return fn()
+            res = fn()
         except (core.BridgeUnavailable, core.BridgeWriteFailed) as e:
-            return core.classify_bridge_failure(cfg, project, e)
+            res = core.classify_bridge_failure(cfg, project, e)
+        core._attach_late_warnings(res, late)
+        return res
 
     @mcp.tool(annotations=_RW)
     @_with_project
@@ -974,7 +994,11 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         (Text, Width, FontSize, ...), `value` a string coerced to the
         property's type. Materializes a freshly-created instance's inherited
         property (e.g. a new Label's Text) so it persists AND renders — the
-        fix for the GetVariable-null trap. Requires Studio open with this
+        fix for the GetVariable-null trap. An optional child the node's TYPE
+        declares but the instance lacks (e.g. a TrendPen's Color) is created
+        on demand and set; the result carries created_optional_child with its
+        name. A name the type does not declare still fails (property_not_found
+        / unknown_property). Requires Studio open with this
         project AND the bridge running (else bridge_unavailable). To SEE it
         in a running emulator: needs a restart cycle (optix_emulator(action=
         "restart")) — the emulator renders its own loaded snapshot, not the
@@ -987,6 +1011,8 @@ def make_mcp(cfg: core.Config) -> FastMCP:
           - Studio is closed (live authoring needs Studio + the bridge)
           - the property is ARRAY-typed (String[]/NodeId[], "[]" suffix in
             describe): returns unsupported_array_write; author in Studio directly
+            (sole exception: GridLayout Rows/Columns as a JSON string array
+            when the operator enabled FTX_GRID_STRING_ARRAY)
           - you're DIAGNOSING why something doesn't render: read current
             values with optix_describe_node instead of writing presumed
             defaults "to rule things out" — each such write MATERIALIZES the
@@ -1000,14 +1026,42 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     @_with_project
     def optix_bridge_create_variable(
         name: str, parent: str = "Model", datatype: str = "Boolean",
+        target: str | None = None, kind: str | None = None,
+        variable_type: str | None = None,
+        array_dimensions: int | str | list[int] | None = None,
+        properties: dict | None = None, dry_run: bool = False,
         project: str | None = None,
     ) -> dict:
         """Create a model variable in the LIVE model via the design-time bridge.
 
-        Adds a variable `name` of `datatype` (Boolean/Int32/Double/String) under
-        `parent` (an Optix path, default "Model"). Live-model write, export-safe
-        by construction. Requires Studio open with this project AND the bridge
-        running. Persist with optix_save.
+        Adds a variable `name` of `datatype` (Boolean/Int32/Double/String/
+        NodePointer/...) under `parent` (an Optix path, default "Model").
+        Live-model write, export-safe by construction. Requires Studio open
+        with this project AND the bridge running. Persist with optix_save.
+
+        `datatype="NodePointer"` makes a typed NodePointer whose Kind is the
+        type of the node it points at (never unset/BaseObjectType): pass
+        `target` (the node to point at, e.g. "UI/Screens/ScreenA"), or an
+        explicit `kind` (builtin UI type name / path to a type node). A
+        NodePointer with neither is refused (`kind_required`). `dry_run` in
+        optix_bridge_edit reports the resolved Kind under `report.resolved`.
+
+        DRIVER STATION TAGS AND ARRAYS: `variable_type` is any VariableType by
+        name (default BaseDataVariableType), e.g. "RAEtherNetIPTag", a
+        Module.Type or a type path (ambiguous short name: refused);
+        `array_dimensions` (one positive integer, e.g. 4 or [4]) makes a
+        one-dimensional array; `properties` is a {name: scalar} map of child
+        properties the type declares, e.g. {"SymbolName": "MyTags"}. Example: a
+        4-element RAEtherNetIPTag array: datatype="Int32",
+        variable_type="RAEtherNetIPTag", array_dimensions=4,
+        properties={"SymbolName": "MyTags"}. Bad input returns {ok: False, code,
+        errors: [{code, message, field}]} and writes nothing: invalid_variable_type
+        / unknown_variable_type (also when the live type tree has no such type),
+        ambiguous_variable_type, invalid_array_dimensions, invalid_properties / invalid_property_name /
+        invalid_property_value, unknown_property (the type does not declare it).
+        `dry_run=True` validates and resolves the type and property names on the
+        bridge without creating anything; the same fields work in
+        optix_bridge_edit create_variable ops (dry_run covers them).
 
         Use this when:
           - adding a model variable while Studio is open
@@ -1019,7 +1073,9 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             folder (optix_bridge_create_folder)
         """
         return _bridge_guarded(project, lambda: core.bridge_create_variable(
-            cfg, project, name, parent, datatype))
+            cfg, project, name, parent, datatype, target=target, kind=kind,
+            variable_type=variable_type, array_dimensions=array_dimensions,
+            properties=properties, dry_run=dry_run))
 
     @mcp.tool(annotations=_RW)
     @_with_project
@@ -1075,6 +1131,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     @mcp.tool(annotations=_RW)
     def optix_bridge_create_netlogic(
         parent: str, name: str, project: str | None = None,
+        kind: str | None = None, dry_run: bool = False,
     ) -> dict:
         """Register a NetLogic (C#) node in the LIVE model via the bridge — the
         authoring step that used to require Studio's "New -> NetLogic" menu.
@@ -1093,7 +1150,23 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         object as `parent`, e.g. a screen). A self-contained one can live under
         any loaded container (a NetLogic category folder runs at app start).
 
-        Returns {ok, created_path, bound_class, node_class}. After a C# rebuild
+        `kind` is "runtime" (default) or "design_time". design_time also mints
+        the BehaviourStartPriority child with VariableType
+        BehaviourStartPriorityVariableType (Value 180), so the class's
+        [ExportMethod]s can be run by optix_execute_method /
+        optix_bridge_invoke_method once Studio has loaded them. A REOPEN of the
+        project is required for that: optix_save alone does not make them
+        executable, and optix_execute_method returns export_method_not_loaded
+        (with a reopen nudge) until then. Any other
+        `kind` returns {ok: False, code: "invalid_kind", errors: [{code, message,
+        field, allowed}]} and writes nothing. dry_run=True validates and returns
+        the `plan` (path, kind, the priority child) without writing.
+
+        Returns {ok, created_path, bound_class, node_class}; every create (either kind)
+        also returns `netsolution_build: {state: "building", note}` - Studio
+        rebuilds the user .NET solution afterwards (about 30 s) and drops Ctrl+S
+        meanwhile; optix_save re-sends until it lands. The call does not wait.
+        After a C# rebuild
         the design-time bridge unloads (see the bridge note on emulator
         restart); restart it before further authoring.
 
@@ -1110,7 +1183,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         if not project:
             return _NO_PROJECT
         return _bridge_guarded(project, lambda: core.bridge_create_netlogic(
-            cfg, project, parent, name))
+            cfg, project, parent, name, kind, dry_run))
 
     @mcp.tool(annotations=_RW)
     @_with_project
@@ -1166,6 +1239,12 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             — rebind after, or restructure around it)
           - you want a reusable template (optix_bridge_convert_to_type)
           - you only want z-order (optix_bridge_reorder)
+
+        REFUSALS: a subtree holding a NetLogic or an EventHandler is refused
+        with code `contains_netlogic` / `contains_event_handler` (a top-level
+        NetLogic: `refused_netlogic_move`) — nothing changes; the result
+        carries the code and a hint. Move the NetLogic out / re-wire the
+        handler afterwards, or use Studio's own UI.
         """
         return _bridge_guarded(project, lambda: core.bridge_move_node(
             cfg, project, node_path, new_parent, new_name))
@@ -1198,6 +1277,9 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         Do NOT use this when:
           - nothing is built yet (optix_bridge_create_type + author into it)
           - the node is already an ObjectType (already_a_type)
+
+        REFUSALS: subtrees holding a NetLogic or an EventHandler are refused
+        (`contains_netlogic` / `contains_event_handler`), changing nothing.
         """
         return _bridge_guarded(project, lambda: core.bridge_convert_to_type(
             cfg, project, node_path, type_name, types_folder, replace))
@@ -1207,7 +1289,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     def optix_bridge_bind_property(
         node_path: str, name: str, source_path: str | None = None,
         mode: str = "Read", raw_path: str | None = None,
-        project: str | None = None,
+        dry_run: bool = False, project: str | None = None,
     ) -> dict:
         """Bind a node's property to a model variable (DynamicLink) via the bridge.
 
@@ -1222,7 +1304,12 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         resolves PER INSTANCE at runtime — deliberately NOT resolvable at
         bind time; that late binding is what makes a template reusable. A
         source_path THROUGH an alias always fails source_not_variable — the
-        signal to switch to raw_path. No validation on raw paths: render-verify.
+        signal to switch to raw_path. A raw_path's target is never resolved
+        (render-verify), but its SYNTAX is validated: a segment may end in one
+        `[i]` index to bind an ARRAY ELEMENT, e.g. raw_path="Model/Tags[1]" or
+        "{Alias1}/Tags[1]". Malformed paths/indexes return {ok: False, code:
+        invalid_raw_path | invalid_raw_path_index, errors: [...]}, nothing
+        written. dry_run=True validates and returns the plan, no bridge call.
 
         Use this when:
           - wiring a UI property to live data
@@ -1236,7 +1323,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             screen; the composite rolls it back automatically
         """
         return _bridge_guarded(project, lambda: core.bridge_bind_property(
-            cfg, project, node_path, name, source_path, mode, raw_path))
+            cfg, project, node_path, name, source_path, mode, raw_path, dry_run))
 
     @mcp.tool(annotations=_RW)
     @_with_project
@@ -1290,6 +1377,219 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         return _bridge_guarded(project, lambda: core.bridge_add_translation(
             cfg, project, key, value, locale))
 
+    @mcp.tool(annotations=_RW)
+    @_with_project
+    def optix_bridge_add_translations(
+        rows: list[dict], locale: str = "en-US", dry_run: bool = False,
+        project: str | None = None,
+    ) -> dict:
+        """Add (or overwrite) SEVERAL translation rows in one call via the bridge.
+
+        `rows` is a list of {key, value[, locale]}; a row without `locale` uses
+        the call-level `locale`. Each row is added if its key is new and set if
+        it exists (like optix_bridge_add_translation); the result lists
+        per row whether it was `new`. The whole list is validated before
+        anything is written — a bad list returns {ok: False, code:
+        "invalid_translation_rows", errors: [{code, message, row_index, field}]}
+        and changes nothing. dry_run=True validates (including against the live
+        table) and reports what would happen without writing. Persist with
+        optix_save. optix_bridge_edit op `add_translations` does the same inside
+        a batch.
+
+        Use this when:
+          - seeding a screen's i18n strings (several keys / locales at once)
+        Do NOT use this when:
+          - adding one row (optix_bridge_add_translation)
+        """
+        return _bridge_guarded(project, lambda: core.bridge_add_translations(
+            cfg, project, rows, locale, dry_run))
+
+    @mcp.tool(annotations=_RW_DESTRUCTIVE)
+    @_with_project
+    def optix_bridge_remove_translation(
+        key: str, dry_run: bool = False, project: str | None = None,
+    ) -> dict:
+        """NOT SUPPORTED: the Optix SDK cannot remove a translation row.
+
+        Always changes nothing. A malformed key returns {ok: False, code:
+        "invalid_translation_key"}; a key with no row returns {ok: False, code:
+        "translation_not_found", key, message, nudge}; an existing key (dry_run
+        included) returns {ok: False, code: "not_supported", key, message, nudge}.
+        optix_bridge_edit op `remove_translation` is refused the same way
+        (report.errors, with op_index).
+
+        Use this when:
+          - never; to change a row, edit the key in Studio's Translations editor
+            or overwrite its text with optix_bridge_add_translation
+        """
+        return _bridge_guarded(project, lambda: core.bridge_remove_translation(
+            cfg, project, key, dry_run))
+
+    @mcp.tool(annotations=_RW)
+    @_with_project
+    def optix_bridge_set_text_key(
+        node_path: str, name: str, key: str, locale: str = "en-US",
+        project: str | None = None,
+    ) -> dict:
+        """Set a text property to a TRANSLATION KEY (LocalizedText with a TextId).
+
+        Writes a LocalizedText whose TextId is `key` into the LocalizedText
+        property `name` (e.g. Label.Text) of `node_path`, so the runtime
+        resolves the string through the translation table per session locale.
+        optix_bridge_set_property writes LITERAL text instead. The key need
+        not exist yet — register it with optix_bridge_add_translation (the
+        result's `translated` says whether a row exists now; a key with no row
+        renders blank). Persist with optix_save.
+
+        BrowseName / DisplayName / Description / NodeId / NodeClass are
+        node attributes and are never written (refused). A malformed request
+        returns {ok: False, code: "invalid_text_key", errors: [{code,
+        message, field}]}; optix_bridge_edit op `set_text_key` validates the
+        same way under dry_run.
+
+        Use this when:
+          - a label/caption must follow the session language
+        Do NOT use this when:
+          - you want literal text (use optix_bridge_set_property)
+          - the property is not LocalizedText (bridge: not_localized_text)
+        """
+        return _bridge_guarded(project, lambda: core.bridge_set_text_key(
+            cfg, project, node_path, name, key, locale))
+
+    @mcp.tool(annotations=_RW)
+    @_with_project
+    def optix_bridge_set_modelling_rule(
+        node_path: str, rule: str, dry_run: bool = False,
+        project: str | None = None,
+    ) -> dict:
+        """Set the ModellingRule of a TYPE MEMBER via the bridge.
+
+        `rule` is Mandatory (every instance of the type carries the member),
+        Optional (instances may carry it) or None (a plain child, not
+        instantiated from the type). Case-insensitive. `node_path` must be a
+        member under an ObjectType/VariableType; elsewhere the bridge returns
+        `not_a_type_member`. An invalid rule returns {ok: False, code:
+        "invalid_modelling_rule", errors: [{code, message, field, allowed}]}
+        and changes nothing. dry_run=True resolves the node and reports
+        `previous` / `would_set` without changing it. Persist with optix_save.
+        optix_bridge_edit op `set_modelling_rule` {path, rule} does the same
+        inside a batch (validated under dry_run).
+
+        Use this when:
+          - a member added to a type must be required (Mandatory) on instances
+        Do NOT use this when:
+          - the node is an instance, not a type member (bridge: not_a_type_member)
+        """
+        return _bridge_guarded(project, lambda: core.bridge_set_modelling_rule(
+            cfg, project, node_path, rule, dry_run))
+
+    @mcp.tool(annotations=_RW)
+    @_with_project
+    def optix_bridge_import_tags(
+        station: str, mode: str, tags: list[str], file: str | None = None,
+        timeout_s: float | None = None, replace: bool = False,
+        dry_run: bool = False, project: str | None = None,
+    ) -> dict:
+        """Import PLC tags into a driver station with its design-time Tag Importer.
+
+        `station` is the path of an RA EtherNet/IP or TwinCAT station (e.g.
+        "CommDrivers/RAEtherNet_IPDriver1/Station1"). `mode` is "offline"
+        (reads `file`: an L5X for RA, a TPY for TwinCAT; absolute or
+        project-relative; required) or "online" (reads the controller; `file`
+        ignored; not covered by a live test - the bench has no controller).
+        `tags` are symbol names; each one is imported with its parents and
+        children on '.' boundaries (Motor1 never brings in Motor10). Waits for
+        the importer at most `timeout_s` (default 120) without blocking Studio's
+        UI thread.
+
+        MERGE BY DEFAULT; `replace=true` drops tags not requested. The importer
+        rewrites the station's tag tree from the file, so a file that lacks a
+        tag removes it: with replace=false (default) tags already on the station
+        are kept, and a call whose file lacks one of them is refused with
+        {ok: False, error: "would_remove_tags", removed_would_be: [...], hint}
+        before anything is imported (pass replace=true to accept, or import from
+        a file that still contains them). With replace=true only the requested
+        tags (plus parents/children) remain. An offline `file` that is missing,
+        empty, not XML, or whose root is not RSLogix5000Content (L5X) /
+        PlcProjectInfo (TPY) is refused with {ok: False, error:
+        "invalid_import_file", path, detail} and no bridge call.
+
+        `dry_run=true` runs the pre-flight (argument checks, the file parse, the
+        station's current tags read from the live model) and returns {ok: True,
+        dry_run: True, would_add, would_remove, would_skip} WITHOUT importing:
+        symbols the import would add, root station tags it would drop (with
+        replace=false a non-empty list also sets would_refuse:
+        "would_remove_tags"), and requested tags the file lacks
+        ([{symbol, reason}]). Online mode cannot be predicted (empty lists + note).
+
+        Returns {ok, added, already_present, not_found, removed, skipped,
+        elapsed_ms}: node paths added under the station's Tags (before/after
+        snapshot), tag nodes that already existed for the request, requested
+        names the source did not contain, `removed` (paths on the station before
+        and gone after; only non-empty with replace=true) and `skipped`
+        ([{symbol, reason}]: symbols the filter kept that do not exist
+        afterwards, e.g. an unknown DataType). Failures return {ok: False, code,
+        errors}: missing_field /
+        invalid_mode / invalid_file / invalid_tags / invalid_timeout /
+        invalid_replace (nothing sent), requires_optix_1_8 (RA station on Studio below 1.8; TwinCAT works
+        from 1.7), station_not_found, not_a_tag_station, file_not_found,
+        import_timeout, import_failed / import_cancelled (message carries the
+        base exception). Persist with optix_save. For one or two members
+        create_variable with variable_type is lighter.
+        optix_bridge_edit op `import_tags` does the same inside a batch (it also
+        takes `dry_run`).
+
+        Use this when:
+          - several PLC tags (or a UDT member tree) must appear under a station
+        Do NOT use this when:
+          - one or two tags are enough (use create_variable + variable_type)
+        """
+        return _bridge_guarded(project, lambda: core.bridge_import_tags(
+            cfg, project, station, mode, tags, file, timeout_s, replace, dry_run))
+
+    @mcp.tool(annotations=_RW)
+    @_with_project
+    def optix_bridge_retype(
+        node_path: str, datatype: str, dims: str | None = None,
+        dry_run: bool = False, allow_value_loss: bool = False,
+        project: str | None = None,
+    ) -> dict:
+        """Change an existing VARIABLE's DataType in place via the bridge.
+
+        `datatype` is one of Boolean, Int16, Int32, Int64, UInt16, UInt32,
+        UInt64, Float, Double, String, DateTime, LocalizedText (case-insensitive).
+        The node, its children and every inbound link are kept; the value is
+        converted element-wise. Retyping to LocalizedText carries a String /
+        number / Boolean / DateTime / LocalizedText value over as text. A value
+        with no text form (NodeId, ByteString, ...) or an array that would lose
+        elements collapsing to a scalar is REFUSED, nothing changed, with
+        {ok: False, code: "value_not_convertible", errors: [{code, message,
+        field}]}. An unsupported type is {ok: False, code: "invalid_datatype",
+        errors: [{..., allowed}]}. `dims` omitted keeps the shape; "scalar"
+        collapses to a scalar; "N" makes an array of N. dry_run=True runs every
+        check on the bridge and reports `from` / `to` / `would_retype` without
+        changing anything. optix_bridge_edit op `retype` {path, datatype[, dims
+        [, allow_value_loss]]} does the same inside a batch (validated under
+        dry_run). Persist with optix_save.
+
+        VALUE LOSS: a current value that cannot be converted to the new type
+        (e.g. the text 'true' -> Int32) used to be reset to the type's default
+        while the call said ok. It is now REFUSED, nothing changed, with
+        {ok: False, error/code: "value_unconvertible", count, samples: [...]}.
+        Pass allow_value_loss=True to accept the reset: the result then carries
+        `values_reset: n` and a `warning` (dry_run reports `would_reset: n`).
+
+        Use this when:
+          - a variable must hold translatable text (LocalizedText) but exists as String
+          - moving values to String storage without recreating the node
+        Do NOT use this when:
+          - the node is not a variable (bridge: not_a_variable)
+          - you only want to change the VALUE, not the type (use set_property)
+        """
+        return _bridge_guarded(project, lambda: core.bridge_retype(
+            cfg, project, node_path, datatype, dims, dry_run,
+            allow_value_loss=allow_value_loss))
+
     @mcp.tool(annotations=_RW_DESTRUCTIVE)
     @_with_project
     def optix_bridge_delete_node(node_path: str, project: str | None = None) -> dict:
@@ -1336,6 +1636,16 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         `args`, if given, is a comma-separated string of positional input
         argument values. Whatever the method does is NOT undoable by this
         tool, so optix_save first when the method mutates the model.
+
+        `ok: true` means the method really ran. The call is refused WITHOUT
+        executing anything, as {ok: false, error: "method_not_found", object,
+        method, available: [...]} when the object exposes no such method (a
+        NetLogic whose exports Studio has not loaded: "export_method_not_loaded"
+        + reopen_required), or {ok: false, error: "argument_count_mismatch",
+        expected, given} when `args` has the wrong number of values. If the
+        method throws, or Studio logs an error line during the call (Optix
+        catches and logs a method's exception), the result is {ok: false,
+        error: "method_failed", detail}.
         `unsafe` is a legacy flag and has no effect.
 
         `timeout_seconds` defaults to 60 (an arbitrary method's runtime is
@@ -1398,7 +1708,8 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         LinearConverter, etc. `expression` uses `{0}`,`{1}`,... placeholders
         bound in order to `sources` (comma-separated paths). Functions:
         max/min/avg/abs/trunc/ceil/floor/round/sqrt/sign/like/isempty/`if`/
-        left_of/right_of. Colors are `0xAARRGGBB`. Example: conditional color
+        left_of/right_of, plus `pow(base, exp)` on Studio 1.8+ (on 1.7 the
+        bridge refuses it with `function_requires_version`: pow needs 1.8). Colors are `0xAARRGGBB`. Example: conditional color
         expression="if({0} > 40, 0xFFFF0000, 0xFF00FF00)", sources="Model/Speed"
         on FillColor. Requires Studio open + the bridge. Persist with
         optix_save. IMPORTANT: a converter no-ops SILENTLY if mis-wired —
@@ -1422,6 +1733,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         node_path: str, prop_name: str,
         format: str, sources: str | None = None,
         mode: str | None = None,
+        fix_format_paths: bool = False,
         project: str | None = None,
     ) -> dict:
         """Attach a FORMATTED DYNAMIC LINK to a property via the bridge.
@@ -1444,7 +1756,11 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         node-relative ("../NavPanel{#i}@NodeId") or absolute
         ("/Objects/<Project>/Model/Folder/{#key}"). The project-relative form
         `sources` accepts ("Model/Folder/{#key}") resolves against the property
-        itself and renders BLANK — ok:true, no runtime log line.
+        itself and renders BLANK — ok:true, no runtime log line. The service
+        REFUSES it with `format_path_not_runtime_resolvable` (the message carries
+        the exact absolute rewrite); `fix_format_paths=true` applies the rewrite
+        `Model/X/{#k}` -> `/Objects/<Project>/Model/X/{#k}` using the project
+        name the bridge reports.
 
         THE indirect-address pattern: a PanelLoader's `Panel` chosen by an
         integer, with the candidate panels as readable named variables on the
@@ -1467,9 +1783,11 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             (optix_bridge_attach_expression)
           - Studio is closed
         """
+        # Only forwarded when set, so the default call shape is unchanged.
+        extra = {"fix_format_paths": True} if fix_format_paths else {}
         return _bridge_guarded(project, lambda: core.bridge_attach_formatter(
             cfg, project, node_path, prop_name, format,
-            sources=sources, mode=mode))
+            sources=sources, mode=mode, **extra))
 
     @mcp.tool(annotations=_RO)
     @_with_project
@@ -1482,7 +1800,9 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         Optix validates a formula only at RUNTIME, where a bad one silently
         no-ops (the classic converter trap). This catches common author-time
         mistakes up front: unbalanced ()/{}, a placeholder {N} beyond the
-        number of sources, an unknown function name, an unterminated string.
+        number of sources, an unknown function name, an unterminated string, and
+        `pow` on a Studio older than 1.8 (`function_requires_version`, with a
+        structured `requires_version` field).
         The SAME check gates optix_bridge_attach_expression — this tool is for
         checking BEFORE you commit.
 
@@ -1505,6 +1825,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         variable: str | None = None, value: str | None = None,
         args: str | None = None, object_raw: str | None = None,
         replace: bool = False,
+        calls: list[dict] | None = None, append: bool = False,
         project: str | None = None,
     ) -> dict:
         """Wire a UI event on a node — to a NATIVE command or a NetLogic method.
@@ -1531,6 +1852,17 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         default (replace=False); pass replace=True to delete the existing
         handler first and create a fresh one (delete-then-create).
 
+        MULTI-STEP handlers: pass `calls` — a list of call objects, each with
+        the single-call fields (method_path | command [+ variable/value],
+        args, object_raw) — to make the event run SEVERAL calls IN ORDER, all
+        under ONE EventHandler (MethodsToCall: MethodContainer1..N). `calls`
+        replaces the single-call arguments. append=True adds the call(s) AFTER
+        the calls an existing handler already has, without replacing them
+        (a single call + append=True appends just that one). A bad list comes
+        back as {ok: False, code: "invalid_wire_calls", errors: [{call_index,
+        code, message}]} with nothing written; optix_bridge_edit dry_run
+        reports the same errors per op.
+
         Use this when:
           - a button should set/toggle a variable (native command — no NetLogic)
           - a button should open/close a dialog or the keyboard (UI command + args)
@@ -1545,16 +1877,31 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             cfg, project, node_path, event_type, method_path,
             command=command, variable=variable, value=value,
             args=args, object_raw=object_raw, replace=replace,
+            calls=calls, append=append,
         ))
 
     @mcp.tool(annotations=_RW)
-    def optix_save(project: str | None = None) -> dict:
+    def optix_save(project: str | None = None, timeout: float = 30.0,
+                   debug: bool = False) -> dict:
         """Persist the open project to disk (sends Ctrl+S to Studio).
 
         Studio has no programmatic save API, so this focuses the project's
         window and sends ^s, then verifies by watching the node-YAML mtime
-        advance. Call this AFTER bridge authoring when you need the edit ON
-        DISK without running anything. Requires an interactive session and
+        advance. If the mtime has not advanced it re-sends Ctrl+S every 5 s
+        until `timeout` (default 30 s): the second keystroke first clicks the
+        project-tree row in that Studio's window (Studio 1.8 has no File menu),
+        later ones are plain Ctrl+S. Studio drops Ctrl+S while it rebuilds the
+        user NetSolution (right after a design-time NetLogic create), hence the
+        re-sends; polling continues 15 s after the last keystroke because Studio
+        can write the YAML ~10 s after it (wall time <= timeout + 15 s). The
+        result has `method` ("ctrl_s", or "tree_focus_ctrl_s" when the write came
+        after the second keystroke), `keystrokes_sent`, `attempts` and
+        `write_latency_s` (write minus last keystroke); `saved` is mtime-based.
+        On saved=false the `hint` lists, in order: Studio busy with the
+        NetSolution build (see optix_studio_log(contains="solution")), focus,
+        then UIPI only when unfocused or integrity levels differ. `debug` is
+        accepted for compatibility. Call this AFTER bridge authoring when you need
+        the edit ON DISK without running anything. Requires an interactive session and
         the project open in Studio.
 
         You usually DON'T need this: optix_emulator(action="run")'s F5 saves
@@ -1572,7 +1919,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         project = project or core.default_project(cfg)
         if not project:
             return {"saved": False, "error": "no project given and no bridge serving one — pass project or start the bridge"}
-        return core.save(cfg, project)
+        return core.save(cfg, project, timeout=timeout, debug=debug)
 
     # ---- consolidated emulator-lifecycle surface -------------------------
     # optix_emulator collapses optix_run_emulator / optix_restart_emulator /
@@ -1676,7 +2023,19 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         Automation — it briefly takes the foreground and moves the cursor, then
         restores both.
 
-        `ok: true` means THE CLICK LANDED, not that the method succeeded:
+        After the click the Studio log (FTOptixStudio.0.log) is checked: when
+        Studio REJECTED the call the result is `ok: false, state: "rejected"`
+        with the log line in `log_line` (read more with optix_studio_log).
+        `studio_log_checked: false` means the log could not be read.
+
+        When the armed bridge shows the live node has NO UAMethod child of that
+        name, returns `ok: false, error: "export_method_not_loaded"` with a
+        nudge: optix_save does NOT make a freshly created design-time
+        NetLogic's [ExportMethod] executable and the bridge has no refresh
+        trigger, so the project must be REOPENED (then re-armed) first.
+
+        `ok: true` (state "executed") means THE CLICK LANDED and the log showed
+        no rejection, not that the method succeeded:
         arbitrary methods expose no signal to verify against (unlike the bridge
         port for arm/stop), and a mis-wired converter no-ops silently. Confirm
         the effect with optix_describe_node or a render, and read Studio's
@@ -1710,10 +2069,28 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             really loaded. The CLI returns immediately while Studio is still
             loading, so readiness is the window's project identity appearing,
             not process existence and not a sleep. Returns state=already_open
-            when a window is already serving it.
+            (and launches nothing) when a Studio already has it loaded.
+            "Loaded" means bridge health identity, else the main-window
+            title / project tree, else the Studio log line - never the Home
+            screen's Recent list. When Studio refuses a second editor on the
+            same project, or stays on Home, returns state=not_opened with a
+            reason and holder_pid (the Studio holding the project) and closes
+            the second Studio the service launched.
           - "new"  — create a project under the projects root. REFUSES if the
             directory already exists; this tool never writes into one.
-            `template` maps to --template.
+            `template` maps to --template. NAME RULE: the name must be a
+            valid C# identifier - letters (any script), digits, underscore, not
+            starting with a digit, no spaces, no trailing dot, not a C#
+            keyword - and len(projects_root/name) must be <= 180, else
+            error "invalid_project_name" with the `rule`. "created" is
+            returned only when <name>.optix is non-empty and the Studio log
+            shows no "Error creating new project" for >= 5 s after the file
+            appears (or until the log shows the project loaded); on that
+            line the call returns "create_failed" with `detail`, `path` and
+            `partial_dir` (nothing is deleted). `open` on a directory whose
+            <name>.optix is missing or empty returns "project_file_missing"
+            (a Studio create/load error line returns "project_file_invalid")
+            with the path - never upgrade_required.
 
         Pair with optix_bridge_arm to go from nothing to an authorable project
         with no human at the keyboard: optix_project(action="open") then
@@ -1752,8 +2129,11 @@ def make_mcp(cfg: core.Config) -> FastMCP:
           - "run" — F5: launch the project in Studio's built-in emulator. THE
             default verify step — much cheaper and faster than a deploy. F5
             stages the in-Studio model (saves as part of staging) and spins up
-            a LOCAL FTOptixRuntime. F5 TOGGLES: check action="status" first so
-            a blind "run" doesn't stop a running emulator. A RUNNING emulator
+            a LOCAL FTOptixRuntime. `run` is safe to repeat: if this
+            project's emulator is already running or starting, NO F5 is sent
+            and it returns state="already_running" with `serving` and a hint
+            to use action="restart". `restart` reloads edits; status first is
+            optional. A RUNNING emulator
             does not pick up Studio edits (separate process, its own loaded
             snapshot) — structural changes (new widgets, bindings, layout)
             need action="restart". TARGET GUARD: F5 runs Studio's SELECTED
@@ -1764,14 +2144,19 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             call. THE way to make a STRUCTURAL edit visible (new widget,
             binding, layout) — removes the F5-toggle footgun. No save needed
             (starting stages and saves the current Studio model).
-          - "stop" — explicit, unambiguous stop (vs "run", which toggles and
-            is easy to double-fire). Terminates ONLY emulator instances
+          - "stop" — explicit, unambiguous stop. Terminates ONLY emulator instances
             (--application-name=Emulator); an UpdateSvc-deployed runtime is
             the same exe and is left alone.
-          - "status" — not_running / starting / running. Counts ONLY real
-            emulator processes. state=starting means the port isn't serving
-            yet — wait before screenshotting; running means safe to
-            screenshot. Check this before "run" to avoid the F5-toggle trap.
+          - "status" — state is one of stopped / starting / running /
+            zombie / demo_expired. Counts ONLY real emulator processes.
+            starting = process up, port not serving yet — wait before
+            screenshotting; running = safe to screenshot; zombie = process
+            with a window but no port listener (hung); demo_expired = the
+            FTOptix demo licence lapsed. With `project`, a project whose
+            name differs from its emulator cache folder is still reported
+            `running` (attribution="port") when an emulator serves its web
+            port. `run` is safe to repeat; `restart` reloads edits; status
+            first is optional.
           - "log" — tail the emulator's runtime log (NetLogic output,
             exceptions) — the debug signal when a preview misbehaves.
             Non-blocking: one brief shared read of the newest
@@ -1783,8 +2168,12 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         `project`: used by "run"/"restart" (defaults to the bridge's served
         project; a structured no-project error if neither is given) and "log"
-        (same resolution, required). Ignored by "stop"/"status" — those are
-        process-level, not project-scoped. `save_first` only applies to
+        (same resolution, required). "stop"/"status" with `project` act on
+        THAT project's emulator only (attributed by its emulator cache path):
+        its own pids, its own web port, and `external_change` scoped to it.
+        Without `project` they are host-wide. With several Studios open, each
+        project's emulator runs side by side; "run" is refused only when two
+        projects share a web port (web_port_taken, runtime none|zombie|running). `save_first` only applies to
         "run". `lines`/`contains` only apply to "log".
 
         An unknown `action` returns a structured error rather than raising.
@@ -1805,25 +2194,55 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                             f"{', '.join(_EMULATOR_ACTIONS)}"),
                 "valid_actions": list(_EMULATOR_ACTIONS),
             }
-        if action == "run":
-            proj = project or core.default_project(cfg)
+
+        def _do_emulator() -> dict:
+            if action == "run":
+                proj = project or core.default_project(cfg)
+                if not proj:
+                    return {"launched": False, "error": "no project given and no bridge serving one — pass project or start the bridge"}
+                return core.run_emulator(cfg, proj, save_first=save_first)
+            if action == "restart":
+                proj = project or core.default_project(cfg)
+                if not proj:
+                    return {"launched": False, "error": "no project given and no bridge serving one — pass project or start the bridge"}
+                return core.restart_emulator(cfg, proj)
+            if action == "stop":
+                return core.stop_emulator(cfg, project=project)
+            if action == "status":
+                return core.emulator_status(cfg, project=project)
+            # action == "log"
+            proj = _resolve_project(project)
             if not proj:
-                return {"launched": False, "error": "no project given and no bridge serving one — pass project or start the bridge"}
-            return core.run_emulator(cfg, proj, save_first=save_first)
-        if action == "restart":
-            proj = project or core.default_project(cfg)
-            if not proj:
-                return {"launched": False, "error": "no project given and no bridge serving one — pass project or start the bridge"}
-            return core.restart_emulator(cfg, proj)
-        if action == "stop":
-            return core.stop_emulator(cfg)
-        if action == "status":
-            return core.emulator_status(cfg)
-        # action == "log"
-        proj = _resolve_project(project)
-        if not proj:
-            return _NO_PROJECT
-        return core.runtime_log_tail(cfg, proj, lines=lines, contains=contains)
+                return _NO_PROJECT
+            return core.runtime_log_tail(cfg, proj, lines=lines, contains=contains)
+
+        # An emulator started/stopped outside MCP is reported on this call
+        # (external_change) and the record updated; no background polling.
+        scoped = project if action in ("run", "restart", "stop", "status") else None
+        if scoped is None and action in ("run", "restart"):
+            scoped = core.default_project(cfg)
+        return core.with_external_change_check(cfg, _do_emulator, project=scoped)
+
+    @mcp.tool(annotations=_RO)
+    def optix_studio_log(lines: int = 100, contains: str | None = None) -> dict:
+        """Tail Studio's own log, FTOptixStudio.0.log — the only place Studio
+        reports that it REJECTED an optix_execute_method call (which
+        optix_execute_method now surfaces itself as state="rejected").
+
+        `lines` is the last N lines (1..5000, default 100); `contains` an
+        optional case-insensitive filter applied before the tail. `lines` in
+        the result is one <untrusted>-delimited string. Errors are structured
+        {ok: false, code, errors}: invalid_lines, invalid_contains,
+        no_studio_log (file missing), studio_log_unreadable.
+
+        Use this when optix_execute_method says rejected, or a design-time
+        action did nothing and you need Studio's side of it.
+
+        Do NOT use this when you want the emulator/runtime log
+        (optix_emulator action="log") or the bridge's transport log
+        (optix_bridge_log_tail).
+        """
+        return core.studio_log_tail(cfg, lines=lines, contains=contains)
 
     @mcp.tool(annotations=_RO)
     def optix_bridge_log_tail(lines: int = 100, contains: str | None = None) -> dict:
@@ -2619,7 +3038,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         Matches screens by route key from each dir's manifest.json; a screen
         in only one dir is reported under `added`/`removed` (not an error).
-        With Pillow installed (`pip install ftx-mcp[visual]`), grayscale
+        With Pillow installed (a hard dependency of ftx-mcp), grayscale
         mean-pixel-difference vs `threshold` (percent, default 2.0) decides
         changed/same, with a size mismatch short-circuiting to
         'size_mismatch'. Without Pillow, degrades to a text-only compare
@@ -2680,12 +3099,14 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     # nested pydantic discriminated union: FastMCP builds the input schema from
     # the raw signature, and a flat param set with a runtime valid-vocab nudge
     # is the robust-and-shipping shape (see the invalid-mode branch).
-    _OBSERVE_MODES = ("screenshot", "ocr", "read_text", "find_text", "diff")
+    _OBSERVE_MODES = ("screenshot", "ocr", "read_text", "find_text", "diff",
+                      "dom_text")
     _INTERACT_ACTIONS = ("click", "fill", "type", "key", "navigate")
 
     @mcp.tool(annotations=_RO)
     def optix_observe(
-        mode: Literal["screenshot", "ocr", "read_text", "find_text", "diff"],
+        mode: Literal["screenshot", "ocr", "read_text", "find_text", "diff",
+                      "dom_text"],
         # screenshot / read_text
         region: list[float] | None = None,
         save_path: str | None = None, quality: int = 65,
@@ -2700,11 +3121,26 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         # shared CDP-capture params
         navigate_url: str | None = None, settle_seconds: float | None = None,
         project: str | None = None,
+        # which presentation engine to read
+        target: Literal["web", "native"] = "web",
     ):
-        """Read-side capture of the running Optix HMI via CDP — ONE tool, pick a
+        """Read-side capture of the running Optix HMI — ONE tool, pick a
         `mode`. Consolidates the optix_cdp_screenshot / _ocr / _read_text /
         _find_text / _diff family; the per-mode tools remain as deprecated
         aliases (FTXMCP_LEGACY_TOOLS).
+
+        `target="web"` (default) reads the WebPresentationEngine through
+        Chrome/CDP. `target="native"` reads the emulator's NATIVE
+        presentation engine window (FTOptixRuntime.exe's own desktop
+        window) straight from the window: no Chrome, no CDP, no web engine
+        needed; the window may be covered but must not be minimized. Every
+        mode except `diff` honors it (screenshot / ocr / read_text /
+        find_text all run on the native frame). The native frame is the
+        window's client area at physical resolution: its coordinates
+        (and find_text's center_px) feed optix_interact(target="native")
+        as-is, and are NOT the CDP viewport of target="web".
+        `navigate_url` / `fresh` are ignored natively and `settle_seconds`
+        defaults to 0 there (nothing to navigate).
 
         mode:
           - "screenshot" — full-canvas (or `region`) JPEG; THE visual-verify
@@ -2719,6 +3155,13 @@ def make_mcp(cfg: core.Config) -> FastMCP:
             centers) to drive a click or build a route. Requires `text`.
           - "diff" — compare two optix_cdp_sweep capture dirs screen-by-screen
             (pure file compare, no CDP). Requires `dir_a`, `dir_b`.
+          - "dom_text" — exact visible strings: `document.body.innerText` read
+            over CDP (the WebUI renders to the DOM, not a canvas), so no OCR
+            error and small controls read fine. Honors `navigate_url`,
+            `settle_seconds`, `project`; returns `text` (delimited as
+            untrusted runtime content) and `length`. Structured errors:
+            `invalid_dom_text_args` (bad navigate_url/settle_seconds),
+            `cdp_unavailable`, `dom_text_failed`.
 
         `region`: all four values <= 1.0 are normalized viewport fractions,
         any value > 1 is absolute pixels. An unknown `mode` returns a
@@ -2755,49 +3198,65 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                             f"{', '.join(_OBSERVE_MODES)}"),
                 "valid_modes": list(_OBSERVE_MODES),
             }
-        if mode == "screenshot":
-            sp = save_path
-            if not sp:
-                import tempfile
-                import time as _t
-                d = os.path.join(tempfile.gettempdir(), "ftx-cdp-screenshots")
-                os.makedirs(d, exist_ok=True)
-                sp = os.path.join(d, f"runtime-{int(_t.time() * 1000)}.jpg")
-            result = core.cdp_screenshot_runtime(
-                cfg, save_path=sp, quality=quality,
-                navigate_url=navigate_url, settle_seconds=settle_seconds,
-                fresh=fresh, region=region, project=_resolve_project(project))
-            if result.get("state") == "succeeded":
-                result["hint"] = (
-                    "JPEG written to `path` - read it with your file tool. If "
-                    "your file tool cannot reach that path, re-call with "
-                    "save_path inside your workspace, or return_image=true to "
-                    "receive the image inline."
-                )
-            if (return_image and result.get("state") == "succeeded"
-                    and result.get("path")):
-                # Typed MCP image content (see optix_cdp_screenshot) — the List
-                # return shape is why optix_observe carries NO -> dict.
-                from mcp.server.fastmcp import Image as _McpImage
-                return [json.dumps(result), _McpImage(path=result["path"])]
-            return result
-        if mode == "ocr":
-            return core.cdp_ocr_runtime(
-                cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
-                psm=psm, project=_resolve_project(project))
-        if mode == "read_text":
-            return core.cdp_read_text_runtime(
-                cfg, region=region, navigate_url=navigate_url,
-                settle_seconds=settle_seconds, psm=psm,
-                project=_resolve_project(project))
-        if mode == "find_text":
-            return core.cdp_find_text_runtime(
-                cfg, text, navigate_url=navigate_url,
-                settle_seconds=settle_seconds,
-                project=_resolve_project(project))
-        # mode == "diff"
-        return core.cdp_diff_runtime(dir_a, dir_b, threshold=threshold)
+        def _do_observe():
+            if mode == "screenshot":
+                sp = save_path
+                if not sp:
+                    import tempfile
+                    import time as _t
+                    sub = "ftx-native-screenshots" if target == "native" else "ftx-cdp-screenshots"
+                    d = os.path.join(tempfile.gettempdir(), sub)
+                    os.makedirs(d, exist_ok=True)
+                    sp = os.path.join(d, f"runtime-{int(_t.time() * 1000)}.jpg")
+                if target == "native":
+                    result = core.native_screenshot_runtime(
+                        cfg, save_path=sp, quality=quality, region=region,
+                        project=_resolve_project(project),
+                        settle_seconds=settle_seconds)
+                else:
+                    result = core.cdp_screenshot_runtime(
+                        cfg, save_path=sp, quality=quality,
+                        navigate_url=navigate_url, settle_seconds=settle_seconds,
+                        fresh=fresh, region=region, project=_resolve_project(project))
+                if result.get("state") == "succeeded" and "hint" not in result:
+                    result["hint"] = (
+                        "JPEG written to `path` - read it with your file tool. If "
+                        "your file tool cannot reach that path, re-call with "
+                        "save_path inside your workspace, or return_image=true to "
+                        "receive the image inline."
+                    )
+                if (return_image and result.get("state") == "succeeded"
+                        and result.get("path")):
+                    # Typed MCP image content (see optix_cdp_screenshot) — the List
+                    # return shape is why optix_observe carries NO -> dict.
+                    from mcp.server.fastmcp import Image as _McpImage
+                    return [json.dumps(result), _McpImage(path=result["path"])]
+                return result
+            if mode == "ocr":
+                return core.cdp_ocr_runtime(
+                    cfg, navigate_url=navigate_url, settle_seconds=settle_seconds,
+                    psm=psm, project=_resolve_project(project), target=target)
+            if mode == "read_text":
+                return core.cdp_read_text_runtime(
+                    cfg, region=region, navigate_url=navigate_url,
+                    settle_seconds=settle_seconds, psm=psm,
+                    project=_resolve_project(project), target=target)
+            if mode == "find_text":
+                return core.cdp_find_text_runtime(
+                    cfg, text, navigate_url=navigate_url,
+                    settle_seconds=settle_seconds,
+                    project=_resolve_project(project), target=target)
+            if mode == "dom_text":
+                return core.cdp_dom_text_runtime(
+                    cfg, navigate_url=navigate_url,
+                    settle_seconds=settle_seconds,
+                    project=_resolve_project(project))
+            # mode == "diff"
+            return core.cdp_diff_runtime(dir_a, dir_b, threshold=threshold)
 
+
+        # Report an emulator started/stopped outside MCP (external_change).
+        return core.with_external_change_check(cfg, _do_observe)
     @mcp.tool(annotations=_RW_DESTRUCTIVE)
     def optix_interact(
         action: Literal["click", "fill", "type", "key", "navigate"],
@@ -2814,10 +3273,29 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         # shared CDP params
         navigate_url: str | None = None, settle_seconds: float | None = None,
         project: str | None = None,
+        # which presentation engine to drive
+        target: Literal["web", "native"] = "web",
     ) -> dict:
-        """Act on the running Optix HMI via CDP — ONE tool, pick an `action`.
+        """Act on the running Optix HMI — ONE tool, pick an `action`.
         Consolidates optix_cdp_click / _fill / _type / _key / _navigate; the
         per-action tools remain as deprecated aliases (FTXMCP_LEGACY_TOOLS).
+
+        `target="web"` (default) drives the WebPresentationEngine through
+        Chrome/CDP. `target="native"` drives the emulator's NATIVE
+        presentation engine window (FTOptixRuntime.exe's own desktop window)
+        by posting input straight to it: no Chrome, no CDP, the window may
+        be behind others and the user's focus is never taken. Native
+        supports click / fill / type / key (not navigate: click the HMI's
+        nav buttons). Native coordinates are the client-area frame of
+        optix_observe(target="native") — fractions when both <= 1,
+        else pixels of that frame — and the result reports them as
+        `px`/`py` with `frame: {w, h}`. Native fill = click + type + `submit`
+        (an Optix field selects its content on focus, so no select-all
+        step; `select_all` is ignored). `navigate_url` is ignored natively.
+        Native `type` has no focus of its own: it needs a prior `click`
+        (focus) on the field; `fill` does that click for you (click + type +
+        submit). Whether Enter commits a TextBox to its bound variable is the
+        project's binding mode, not the tool's.
 
         action:
           - "click" — trusted CDP mouse click at (`x`, `y`); the reliable path
@@ -2886,13 +3364,19 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         locals_map = {"x": x, "y": y, "text": text, "key": key,
                       "route": route, "routes_path": routes_path}
+        if target == "native":
+            return core.native_interact(
+                cfg, action, x=x, y=y, text=text, submit=submit, key=key,
+                project=_resolve_project(project),
+                settle_seconds=settle_seconds)
         if action == "click":
             err = _missing("x", "y")
             if err:
                 return err
             return core.cdp_click_runtime(
                 cfg, x=x, y=y, navigate_url=navigate_url,
-                settle_seconds=settle_seconds)
+                settle_seconds=settle_seconds,
+                project=_resolve_project(project))
         if action == "fill":
             err = _missing("x", "y", "text")
             if err:
@@ -2907,14 +3391,16 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                 return err
             return core.cdp_type_runtime(
                 cfg, text=text, navigate_url=navigate_url,
-                settle_seconds=settle_seconds)
+                settle_seconds=settle_seconds,
+                project=_resolve_project(project))
         if action == "key":
             err = _missing("key")
             if err:
                 return err
             return core.cdp_key_runtime(
                 cfg, key=key, navigate_url=navigate_url,
-                settle_seconds=settle_seconds)
+                settle_seconds=settle_seconds,
+                project=_resolve_project(project))
         # action == "navigate"
         err = _missing("route", "routes_path")
         if err:
@@ -2955,7 +3441,46 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         Valid ops: set_property, bind, create_widget, create_variable,
         create_folder, create_object, create_type, create_alias, delete, move,
         rename, reorder, wire_event, attach_expression, attach_formatter,
-        attach_string_formatter, retype, add_translation.
+        attach_string_formatter, retype, add_translation, add_translations,
+        remove_translation, set_text_key, set_modelling_rule, import_tags,
+        create_netlogic, convert_to_type.
+
+        NETLOGIC: {"op": "create_netlogic", "parent": "Model", "name":
+        "MyLogic", "kind": "design_time"} creates a NetLogic node bound to the
+        C# class `name` (kind: runtime (default) | design_time). Same
+        implementation, validation, `netsolution_build` note and result as
+        optix_bridge_create_netlogic; a bad parent/name/kind is a validation
+        error so dry_run catches it.
+
+        IMPORT PLC TAGS: {"op": "import_tags", "station":
+        "CommDrivers/RAEtherNet_IPDriver1/Station1", "mode": "offline", "file":
+        "plc/Line1.L5X", "tags": ["Motor1.Speed"]} runs the station's design-time
+        Tag Importer (see optix_bridge_import_tags); `file` is required for
+        offline mode (L5X for RA, TPY for TwinCAT), bad arguments (and an unusable
+        file: invalid_import_file) are validation errors so dry_run catches them.
+        Merge by default; add "replace": true to drop tags not requested (the
+        importer rewrites the station's tag tree from the file, so a file that
+        lacks a station tag is refused with would_remove_tags unless replace is
+        true). Add "dry_run": true to preview it: the op returns {dry_run: true,
+        would_add, would_remove, would_skip} and the importer is not called.
+        Slow: it waits (bounded) on the importer.
+
+        TRANSLATION KEY: {"op": "set_text_key", "path": "UI/.../Label1",
+        "name": "Text", "key": "greeting"} sets a LocalizedText property to a
+        translation KEY (TextId) instead of literal text; pair it with an
+        add_translation op for the key. Never valid on BrowseName/DisplayName.
+
+        MODELLING RULE: {"op": "set_modelling_rule", "path": "Types/MyType/Speed",
+        "rule": "Mandatory"} sets the ModellingRule (Mandatory / Optional / None)
+        of a type member; any other rule is a validation error
+        `invalid_modelling_rule`, so dry_run catches it.
+
+        TRANSLATION ROWS: {"op": "add_translations", "rows": [{"key": "greeting",
+        "value": "Hello"}, {"key": "greeting", "value": "Ciao", "locale":
+        "it-IT"}]} adds/overwrites many rows in one op; {"op": "remove_translation",
+        "key": "greeting"} is NOT SUPPORTED (the Optix SDK cannot remove a
+        translation row): it is refused as `not_supported` (a missing key as
+        `translation_not_found`) in report.errors, dry_run included.
 
         DISPLAY PRECISION: {"op": "attach_string_formatter", "path": "UI/.../Label1",
         "prop_name": "Text", "format": "{0:F1}", "sources": "Model/Temp"} puts a
@@ -2968,7 +3493,21 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         converters) and every inbound link; the value is converted
         element-wise (22.3f -> "22.3"). `dims` omitted keeps the array shape,
         "scalar" collapses it, "N" sets it. Works on StoreColumns too. THE way
-        to move recipe values to String storage.
+        to move recipe values to String storage. `"datatype": "LocalizedText"`
+        keeps a convertible value (as text) and refuses a non-convertible one
+        with `value_not_convertible`; an unsupported type is `invalid_datatype`;
+        dry_run checks both. A current value that cannot be converted
+        ("true" -> Int32) is refused with `value_unconvertible` (+ `samples`)
+        unless the op carries `"allow_value_loss": true`; then the result has
+        `values_reset: n` and a `warning` (dry_run: `would_reset`).
+
+        STATION TAGS / ARRAYS: {"op": "create_variable", "parent": "Model",
+        "name": "Tags", "datatype": "Int32", "variable_type": "RAEtherNetIPTag",
+        "array_dimensions": 4, "properties": {"SymbolName": "MyTags"}} creates
+        a driver tag array; an unknown variable_type, bad array_dimensions or
+        bad properties are validation errors (unknown_variable_type,
+        invalid_array_dimensions, invalid_property_name, ...), so dry_run
+        catches them.
 
         RENAME: {"op": "rename", "path": "UI/Screens/Foo", "new_name": "Bar"}
         renames a node (the name shown in Studio's tree). Rename re-authors
@@ -2997,8 +3536,10 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         CHUNKING: large batches stop early and return state="chunked" when the
         time limit (OPTIX_BATCH_CHUNK_SECONDS, default 90 s) or op-count limit
         (OPTIX_BATCH_CHUNK_OPS, default 40) is reached; use `chunk_seconds` /
-        `chunk_ops` to override per call. Pass the returned `batch_id` to
-        action="continue" to apply the next chunk. `applied` counts ops landed
+        `chunk_ops` to override per call; the overrides are persisted in the batch
+        journal and action="continue" honours them (no need to repeat them).
+        Pass the returned `batch_id` to action="continue" to apply the next
+        chunk. `applied` counts ops landed
         so far — read it the same way as state="partial". MCP progress
         notifications are best-effort and silently absent without a
         progressToken — the journal (action="status") is the authoritative
@@ -3006,13 +3547,33 @@ def make_mcp(cfg: core.Config) -> FastMCP:
 
         NOT ATOMIC, and the result says so: if op N fails at apply time, ops
         0..N-1 stay applied (state="partial", `applied` counting what landed).
-        Read `applied` — never assume a failure means nothing happened.
+        When op 0 fails (`applied == 0`) the state is "failed" and the model
+        is unchanged. Read `applied` — never assume a failure means nothing
+        happened.
+
+        VALIDATE-TIME REFUSALS (nothing applied, each error carries op_index):
+        invalid_widget_type / invalid_object_type (with did_you_mean),
+        missing_field (empty widget_type / object_type), invalid_browse_name
+        (name with '/', '\\', control chars or edge whitespace) and
+        bad_format_string (formatter `format` with a malformed placeholder).
+
+        REFUSED ITEMS: a move / rename / convert_to_type on a subtree holding a
+        NetLogic or EventHandler is refused by the bridge (`contains_netlogic` /
+        `contains_event_handler`) without changing anything. That item is
+        listed in `refused_ops` ({index, op, path, code, hint}) and the batch
+        CONTINUES with the other items (also when the refusal is found at
+        validation). `applied` counts only ops that landed and the nudge names
+        the refused indices. Other validation errors (unresolved_reference, bad
+        args) still refuse the WHOLE batch with applied=0.
 
         PER-OP OUTCOMES: each `op_timings` entry carries `detail` when the
         bridge reported how the op landed — `via` (wire_event:
         route token ending +existing / +replaced / no suffix = created), `relative_sources` (links made
         type-relative inside an ObjectType), `achieved` (reorder's final
-        index), `prior binding cleared` (bind).
+        index), `prior binding cleared` (bind). An `import_tags` entry carries
+        `added`, `already_present`, `not_found`, `removed`, `skipped`, `elapsed_ms` and `tag_importer`
+        (as the direct tool does); when it fails the entry carries `code` and
+        `detail` instead.
 
         action:
           - "apply"    — validate and begin applying `ops` (default).
@@ -3037,7 +3598,9 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                     "message": "action='continue' requires a batch_id",
                 }
             return _bridge_guarded(
-                project, lambda: core.bridge_edit_continue(cfg, project, batch_id))
+                project, lambda: core.bridge_edit_continue(
+                    cfg, project, batch_id,
+                    chunk_seconds=chunk_seconds, chunk_ops=chunk_ops))
 
         if action == "status":
             return _bridge_guarded(
@@ -3080,29 +3643,10 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                 ctx.report_progress, ev["index"], ev["total"], ev.get("message"))
         )
 
-        # C.5: apply chunk-threshold overrides via env vars for the duration of
-        # this call. Not thread-safe for concurrent callers with different
-        # overrides, but acceptable: defaults are per-process constants and
-        # overrides are rare per-call adjustments.
-        _env_backup: dict[str, str | None] = {}
-        if chunk_seconds is not None:
-            _env_backup["OPTIX_BATCH_CHUNK_SECONDS"] = os.environ.get(
-                "OPTIX_BATCH_CHUNK_SECONDS")
-            os.environ["OPTIX_BATCH_CHUNK_SECONDS"] = str(chunk_seconds)
-        if chunk_ops is not None:
-            _env_backup["OPTIX_BATCH_CHUNK_OPS"] = os.environ.get(
-                "OPTIX_BATCH_CHUNK_OPS")
-            os.environ["OPTIX_BATCH_CHUNK_OPS"] = str(chunk_ops)
-        try:
-            return _bridge_guarded(project, lambda: core.bridge_edit(
-                cfg, project, ops, dry_run=dry_run, strict=strict,
-                on_progress=on_progress, batch_id=batch_id))
-        finally:
-            for _k, _v in _env_backup.items():
-                if _v is None:
-                    os.environ.pop(_k, None)
-                else:
-                    os.environ[_k] = _v
+        return _bridge_guarded(project, lambda: core.bridge_edit(
+            cfg, project, ops, dry_run=dry_run, strict=strict,
+            on_progress=on_progress, batch_id=batch_id,
+            chunk_seconds=chunk_seconds, chunk_ops=chunk_ops))
 
     if not cfg.enable_deploy:
         # MCP deploy integration is statically disabled in this distribution. The
@@ -3155,7 +3699,7 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         for _sk in ("optix_list_skills", "optix_get_skill"):
             mcp._tool_manager._tools.pop(_sk, None)
 
-    # FTXMCP_BRIDGE_PRIMITIVES=1 restores the 16 per-noun bridge primitives
+    # FTXMCP_BRIDGE_PRIMITIVES=1 restores the 22 per-noun bridge primitives
     # (set_property/bind_property/attach_expression/attach_formatter/
     # wire_event/delete_node/
     # move_node/reorder/create_variable/create_folder/create_object/
@@ -3182,6 +3726,10 @@ def make_mcp(cfg: core.Config) -> FastMCP:
         "optix_bridge_create_folder", "optix_bridge_create_object",
         "optix_bridge_create_type", "optix_bridge_create_alias",
         "optix_bridge_create_widget", "optix_bridge_add_translation",
+        "optix_bridge_set_text_key",
+        "optix_bridge_add_translations", "optix_bridge_remove_translation",
+        "optix_bridge_set_modelling_rule", "optix_bridge_retype",
+        "optix_bridge_import_tags",
         "optix_bridge_create_netlogic",
     )
     if os.environ.get("FTXMCP_BRIDGE_PRIMITIVES") != "1":
@@ -3251,6 +3799,24 @@ def make_mcp(cfg: core.Config) -> FastMCP:
     # without touching the registrations above.
     _dispatch = mcp._tool_manager.call_tool
 
+    def _unknown_argument_check(name: str, arguments) -> dict | None:
+        """``unknown_argument`` refusal when ``arguments`` carries a key the tool's
+        input schema does not declare, else None. FastMCP's argument model
+        silently drops unknown keys, so without this a misspelled argument
+        (``dry_runn``, ``projct``) ran the tool with its default. Unknown tool
+        names and tools that declare ``additionalProperties`` fall through."""
+        tool = mcp._tool_manager.get_tool(name)
+        if tool is None or not isinstance(arguments, dict):
+            return None
+        schema = tool.parameters if isinstance(tool.parameters, dict) else {}
+        props = schema.get("properties")
+        if not isinstance(props, dict) or schema.get("additionalProperties") not in (None, False):
+            return None
+        unknown = [k for k in arguments if k not in props]
+        if not unknown:
+            return None
+        return core.unknown_argument_refusal(unknown, props.keys())
+
     async def _measured_dispatch(name, arguments, *args, **kwargs):
         t0 = time.monotonic()
         try:
@@ -3276,6 +3842,14 @@ def make_mcp(cfg: core.Config) -> FastMCP:
                         f"(requires {required!r}); re-issue with a higher scope "
                         "(deploy superset of author superset of read superset of health)"
                     )
+            refusal = _unknown_argument_check(name, arguments)
+            if refusal is not None:
+                # Before any side effect: the tool function never runs.
+                core.traffic(cfg, tool=name, chars_in=chars_in, chars_out=0,
+                             ms=int((time.monotonic() - t0) * 1000), ok=False)
+                if kwargs.get("convert_result"):
+                    return mcp._tool_manager.get_tool(name).fn_metadata.convert_result(refusal)
+                return refusal
             result = await _dispatch(name, arguments, *args, **kwargs)
         except Exception:
             core.traffic(cfg, tool=name, chars_in=chars_in, chars_out=0,

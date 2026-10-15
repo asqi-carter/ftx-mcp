@@ -4,15 +4,44 @@ from __future__ import annotations
 import threading
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field, model_validator
 
 from . import __version__, core
 from ._client_registry import current_client
 from .deploy_lock import DeployLockEvicted, LockHeld
 
 
-class Edit(BaseModel):
+class UnknownArgument(Exception):
+    """A JSON body key no field of the request model declares. Raised from the
+    model's ``before`` validator (not a ValueError, so pydantic lets it through
+    untouched) and turned into the ``unknown_argument`` refusal by the app's
+    exception handler, before the route function (and any side effect) runs."""
+
+    def __init__(self, unknown: list[str], accepted: list[str]) -> None:
+        super().__init__(f"unknown argument(s): {', '.join(unknown)}")
+        self.unknown = unknown
+        self.accepted = accepted
+
+
+class StrictModel(BaseModel):
+    """Request body base: an unknown key is refused, not silently dropped."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unknown_keys(cls, data):
+        if isinstance(data, dict):
+            known = set(cls.model_fields)
+            for f in cls.model_fields.values():
+                if f.alias:
+                    known.add(f.alias)
+            unknown = [k for k in data if k not in known]
+            if unknown:
+                raise UnknownArgument(unknown, sorted(cls.model_fields))
+        return data
+
+
+class Edit(StrictModel):
     """One edit. Exactly one mode per edit (docs/architecture.md, Edit modes):
     content -> full replace; find+replace -> anchored replace;
     insert_after_anchor+block -> anchored insert. Mode validation lives in
@@ -31,51 +60,52 @@ class Edit(BaseModel):
         return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
-class DeployRequest(BaseModel):
+class DeployRequest(StrictModel):
     edits: list[Edit] = Field(default_factory=list)
     commit_message: str = "Automated edit"
     run_after_deploy: bool = True
 
 
-class AddWidgetRequest(BaseModel):
+class AddWidgetRequest(StrictModel):
     screen: str
     widgets: list[dict] = Field(..., description="[{kind:'label'|'switch', name, ...}]")
     screen_file: str | None = None
 
 
-class AddModelVarRequest(BaseModel):
+class AddModelVarRequest(StrictModel):
     name: str
     datatype: str = "Boolean"
     value: bool = False
     model_file: str = "Nodes/Model/Model.yaml"
 
 
-class SetPropertyRequest(BaseModel):
+class SetPropertyRequest(StrictModel):
     file: str
     widget: str
     property: str
     value: str
 
 
-class BridgeWidgetRequest(BaseModel):
+class BridgeWidgetRequest(StrictModel):
     screen: str
     name: str
     widget_type: str = "Label"
 
 
-class BridgeSetPropertyRequest(BaseModel):
+class BridgeSetPropertyRequest(StrictModel):
     node_path: str
     name: str
     value: str
     locale: str = "en-US"
 
 
-class BridgeBindRequest(BaseModel):
+class BridgeBindRequest(StrictModel):
     node_path: str
     name: str
     source_path: str | None = None
     mode: str = "Read"
     raw_path: str | None = None   # literal NodePath (alias/template late binding)
+    dry_run: bool = False
 
 
 def make_app(cfg: core.Config) -> FastAPI:
@@ -96,6 +126,13 @@ def make_app(cfg: core.Config) -> FastAPI:
         if exc.docs_anchor:
             body["docs_url"] = f"docs/troubleshooting.md#{exc.docs_anchor}"
         return JSONResponse(status_code=exc.http_status, content=body)
+
+    @app.exception_handler(UnknownArgument)
+    async def _unknown_argument_handler(_: Request, exc: UnknownArgument) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content=core.unknown_argument_refusal(
+                exc.unknown, exc.accepted, what="request body"))
 
     @app.exception_handler(LockHeld)
     async def _lock_handler(_: Request, exc: LockHeld) -> JSONResponse:
@@ -124,6 +161,22 @@ def make_app(cfg: core.Config) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         return core.health(cfg)
+
+    @app.get("/bridge-source")
+    def bridge_source_endpoint():
+        """The shipped StudioMCPBridge.cs as text/plain (for pip installs,
+        which have no checkout to copy it from). 404 if it is not packaged."""
+        path = core._shipped_bridge_cs()
+        if path is None:
+            return JSONResponse(
+                status_code=404,
+                content={"code": "bridge_source_missing",
+                         "message": "StudioMCPBridge.cs is not packaged with this install",
+                         "hint": "fetch studio-bridge/StudioMCPBridge.cs from the repo"})
+        return PlainTextResponse(
+            path.read_text(encoding="utf-8-sig"),
+            media_type="text/plain",
+            headers={"X-Ftx-Mcp-Version": __version__})
 
     @app.get("/skills")
     def list_skills_endpoint() -> dict:
@@ -330,11 +383,14 @@ def make_app(cfg: core.Config) -> FastAPI:
 
     @app.post("/projects/{project}/run/emulator")
     def run_emulator_endpoint(project: str, save_first: bool = False) -> dict:
-        return core.run_emulator(cfg, project, save_first=save_first)
+        return core.with_external_change_check(
+            cfg, lambda: core.run_emulator(cfg, project, save_first=save_first),
+            project=project)
 
     @app.get("/emulator/status")
-    def emulator_status_endpoint() -> dict:
-        return core.emulator_status(cfg)
+    def emulator_status_endpoint(project: str | None = None) -> dict:
+        return core.with_external_change_check(
+            cfg, lambda: core.emulator_status(cfg, project=project), project=project)
 
     @app.post("/projects/{project}/bridge/add-bound-widget")
     def bridge_add_bound_widget_endpoint(
@@ -390,11 +446,13 @@ def make_app(cfg: core.Config) -> FastAPI:
 
     @app.post("/projects/{project}/emulator/restart")
     def restart_emulator_endpoint(project: str) -> dict:
-        return core.restart_emulator(cfg, project)
+        return core.with_external_change_check(
+            cfg, lambda: core.restart_emulator(cfg, project), project=project)
 
     @app.post("/emulator/stop")
-    def stop_emulator_endpoint() -> dict:
-        return core.stop_emulator(cfg)
+    def stop_emulator_endpoint(project: str | None = None) -> dict:
+        return core.with_external_change_check(
+            cfg, lambda: core.stop_emulator(cfg, project=project), project=project)
 
     @app.get("/projects/{project}/runtime/log-tail")
     def runtime_log_tail_endpoint(
@@ -431,7 +489,7 @@ def make_app(cfg: core.Config) -> FastAPI:
     def bridge_bind_endpoint(project: str, req: BridgeBindRequest) -> dict:
         return core.bridge_bind_property(
             cfg, project, req.node_path, req.name, req.source_path, req.mode,
-            req.raw_path)
+            req.raw_path, req.dry_run)
 
     @app.post("/projects/{project}/bridge/ensure-web-engine")
     def bridge_ensure_web_engine_endpoint(

@@ -110,8 +110,10 @@ def test_serving_port_for_matches_project_not_port(monkeypatch) -> None:
     project', never 'is the base port open'. With another Studio already on
     8768, asking the port question reports success having armed nothing."""
     monkeypatch.setattr(studio_arm, "bound_ports", lambda *a, **k: {8768, 8769})
-    monkeypatch.setattr(studio_arm, "bridge_project",
-                        lambda p: {8768: "Other", 8769: "Mine"}[p])
+    monkeypatch.setattr(studio_arm, "_bridge_health",
+                        lambda p, timeout=0.5: (
+                            {"project": {8768: "Other", 8769: "Mine"}[p]}
+                            if p in (8768, 8769) else None))
     assert studio_arm.serving_port_for("Mine") == 8769
     assert studio_arm.serving_port_for("Nobody") is None
 
@@ -144,7 +146,7 @@ def test_project_new_rejects_path_like_names(cfg: core.Config, name: str) -> Non
 def test_project_open_without_an_optix_file(cfg: core.Config) -> None:
     (cfg.projects_root / "Empty").mkdir(parents=True, exist_ok=True)
     out = core.project_open(cfg, "Empty")
-    assert out["ok"] is False and out["error"] == "no_optix_file"
+    assert out["ok"] is False and out["error"] == "project_file_missing"
 
 
 def test_project_new_polls_the_tree_not_process_exit(cfg: core.Config, monkeypatch) -> None:
@@ -158,10 +160,11 @@ def test_project_new_polls_the_tree_not_process_exit(cfg: core.Config, monkeypat
 
     def fake_launch(_cfg, _args):
         dest.mkdir(parents=True, exist_ok=True)
-        (dest / "Fresh.optix").write_text("", encoding="utf-8")
+        (dest / "Fresh.optix").write_text("project", encoding="utf-8")
         return {"ok": True, "pid": 4321}
 
     monkeypatch.setattr(core, "_studio_launch", fake_launch)
+    monkeypatch.setattr(core, "_CREATE_GRACE_S", 0.0)  # grace is tested elsewhere
     out = core.project_new(cfg, "Fresh", wait_seconds=5)
     assert out["ok"] and out["state"] == "created"
     assert out["pid"] == 4321 and out["studio_left_open"] is True
@@ -176,7 +179,8 @@ def test_project_new_reports_timeout_without_the_optix(cfg: core.Config, monkeyp
 def test_project_open_surfaces_a_launch_failure(cfg: core.Config, monkeypatch) -> None:
     d = cfg.projects_root / "HasOptix"
     d.mkdir(parents=True, exist_ok=True)
-    (d / "HasOptix.optix").write_text("", encoding="utf-8")
+    (d / "HasOptix.optix").write_text("Name: HasOptix", encoding="utf-8")
+    (d / "IDEVersion.txt").write_text("1.8.0.555", encoding="utf-8")
     monkeypatch.setattr(core, "_studio_launch",
                         lambda *a: {"ok": False, "error": "studio_exe_missing"})
     out = core.project_open(cfg, "HasOptix", wait_seconds=1)
@@ -330,7 +334,8 @@ def test_serving_port_for_accepts_browsename_aliases(monkeypatch) -> None:
     """Line4_HMI's bridge reports "Line4". Without the alias the arm would click
     Execute, then report verify_timeout while the bridge was already up."""
     monkeypatch.setattr(studio_arm, "bound_ports", lambda *a, **k: {8769})
-    monkeypatch.setattr(studio_arm, "bridge_project", lambda p: "Line4")
+    monkeypatch.setattr(studio_arm, "_bridge_health",
+                        lambda p, timeout=0.5: {"project": "Line4"} if p == 8769 else None)
     assert studio_arm.serving_port_for("Line4_HMI") is None
     assert studio_arm.serving_port_for("Line4_HMI", aliases={"line4"}) == 8769
 
@@ -362,6 +367,19 @@ class _Ctl:
         return True
 
 
+class _FocusableEdit(_Ctl):
+    """Search box: reports keyboard focus only while the fake's last click
+    landed on it (mirrors UIA HasKeyboardFocus)."""
+
+    def __init__(self, studio, rect):
+        super().__init__("", "EditControl", rect)
+        self._studio = studio
+
+    @property
+    def HasKeyboardFocus(self):  # noqa: N802 -- mirrors uiautomation
+        return self._studio.focus == "search"
+
+
 class _FakeStudio:
     """One Studio window, half-screen at x=961 like the measured one, with
     `Misc.` COLLAPSED: `DesignTimeNetLogic` exists only after a click lands on
@@ -370,7 +388,11 @@ class _FakeStudio:
     the Execute entries. Clicking `Execute StartBridge` arms."""
 
     def __init__(self, root_row="Cell_v5", path_label=None, show_root=True,
-                 search_box=False):
+                 search_box=False, nested=False):
+        # nested=True is the 1.8 row shape: each tree label sits inside a
+        # grouping child (ListItem > Group > Text) instead of directly under
+        # the window (1.7).
+        self.nested = nested
         self.root_row, self.path_label, self.show_root = root_row, path_label, show_root
         self.search_box = search_box
         self.expanded = False
@@ -388,7 +410,7 @@ class _FakeStudio:
         if self.path_label:
             rows.append(_Ctl(self.path_label, "TextControl", (1084, 10, 499, 18)))
         if self.search_box:
-            rows.append(_Ctl("", "EditControl", (961, 99, 349, 27)))
+            rows.append(_FocusableEdit(self, (961, 99, 349, 27)))
         if self.filter:
             # Filtered tree: the match with its ancestors, match bolded.
             rows.append(_Ctl(self.root_row, "TextControl", (1008, 126, 297, 28)))
@@ -411,12 +433,22 @@ class _FakeStudio:
         # Measured to poison the indent estimate (1040 -> 1046 = "6 px").
         for i, n in enumerate(("User interface", "Model", "Security", "Database")):
             rows.append(_Ctl(n, "TextControl", (966 + 80 * i, 959, 70, 28)))
+        if self.nested:
+            rows = [self._group(c) if c.ControlTypeName == "TextControl"
+                    and c.Name != self.path_label else c for c in rows]
         if self.menu is not None:
             rows.append(self.menu)
         return rows
 
+    @staticmethod
+    def _group(text):
+        r = text.BoundingRectangle
+        rect = (r.left, r.top, r.width(), r.height())
+        inner = _Ctl("", "GroupControl", rect, [text])
+        return _Ctl("", "ListItemControl", rect, [inner])
+
     def _row_at(self, x, y):
-        for c in self._rows():
+        for c in studio_arm._row_texts(self.win):
             r = c.BoundingRectangle
             if c.ControlTypeName == "TextControl" and r.left <= x < r.left + r.width() \
                     and r.top <= y < r.top + r.height():
@@ -510,6 +542,20 @@ def test_arm_expands_a_collapsed_tree_down_to_the_category_folder(tmp_path, monk
     assert fake.expanded and fake.armed
 
 
+def test_arm_expands_a_collapsed_tree_down_to_the_category_folder_18_shape(
+        tmp_path, monkeypatch) -> None:
+    """Same gesture as above with every label nested in a grouping child."""
+    _fork_tree(tmp_path)
+    fake = _FakeStudio(nested=True)
+    _wire(monkeypatch, fake)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] and out["state"] == "armed", out
+    assert out["expanded"] == ["Misc."]
+    assert [t["row"] for t in out["tried"]] == ["Misc.", "DesignTimeNetLogic"]
+    assert (990, 196) in fake.clicks     # chevron: indent step still 16
+    assert fake.expanded and fake.armed
+
+
 def test_arm_prefers_the_search_box_and_clears_it_afterwards(tmp_path, monkeypatch) -> None:
     """Default path: the leaf name is typed into the Search box, and the leaf's
     OWN short menu is right-clicked (never the ancestor folder's, which can
@@ -542,6 +588,114 @@ def test_arm_names_the_ancestor_it_could_not_see(tmp_path, monkeypatch) -> None:
     out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
     assert out["ok"] is False and out["error"] == "menu_item_not_found"
     assert out["tried"] == [{"row": "Misc.", "visible": False}]
+
+
+def _menu_missing_fake(tmp_path, build: bool = True):
+    """The 'No results' tree: menu step fails with menu_item_not_found."""
+    if build:
+        _fork_tree(tmp_path)
+    fake = _FakeStudio(path_label=str(tmp_path), show_root=False)
+    fake._rows = lambda: [_Ctl(fake.path_label, "TextControl", (1084, 10, 499, 18)),
+                          _Ctl('No results found for "x"', "TextControl", (966, 131, 300, 17))]
+    fake.win.GetChildren = fake._rows
+    return fake
+
+
+def test_arm_menu_failure_reports_os_dialog_when_foreign_window_in_front(
+        tmp_path, monkeypatch) -> None:
+    """Window enumeration mocked: a non-Studio foreground window turns the bare
+    menu_item_not_found into probable_cause os_dialog + blocking_window + hint."""
+    fake = _menu_missing_fake(tmp_path)
+    _wire(monkeypatch, fake)
+    monkeypatch.setattr(studio_arm, "_foreground_window",
+                        lambda auto: {"title": "Windows Security Alert", "pid": 4242})
+    monkeypatch.setattr(studio_arm, "_process_name", lambda pid: "wf.exe")
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] is False and out["error"] == "menu_item_not_found"
+    assert out["probable_cause"] == "os_dialog"
+    assert out["blocking_window"] == {"title": "Windows Security Alert",
+                                      "process": "wf.exe", "pid": 4242,
+                                      "class": "", "source": "uia"}
+    assert "Windows Security Alert" in out["hint"] and "dismiss" in out["hint"]
+
+
+def test_arm_menu_failure_unchanged_without_foreign_window(
+        tmp_path, monkeypatch) -> None:
+    """No foreground window, or Studio's own: the original error is untouched."""
+    _fork_tree(tmp_path)
+    for fg, name in ((None, None),
+                     ({"title": "Cell_v5 - FactoryTalk Optix Studio", "pid": 77},
+                      "FTOptixStudio.exe")):
+        fake = _menu_missing_fake(tmp_path, build=False)
+        _wire(monkeypatch, fake)
+        monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto, fg=fg: fg)
+        monkeypatch.setattr(studio_arm, "_process_name", lambda pid, n=name: n)
+        out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+        assert out["error"] == "menu_item_not_found"
+        assert "probable_cause" not in out and "blocking_window" not in out
+        assert "hint" not in out
+
+
+def test_blocking_window_for_ignores_studio_pid_and_falls_back_to_pid() -> None:
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(studio_arm, "_foreground_window",
+                       lambda auto: {"title": "Dlg", "pid": 9})
+        monkey.setattr(studio_arm, "_process_name", lambda pid: None)
+        monkey.setattr(studio_arm, "_win32_top_level_windows", lambda: [])
+        assert studio_arm.blocking_window_for(None, 9) is None
+        assert studio_arm.blocking_window_for(None, 1) == {
+            "title": "Dlg", "process": "9", "pid": 9, "class": "", "source": "uia"}
+    finally:
+        monkey.undo()
+
+
+_STUDIO_WIN = {"title": "Cell_v5 - FactoryTalk Optix Studio", "pid": 77,
+               "rect": (0, 0, 1000, 800), "foreground": False}
+
+
+def _win32_env(monkeypatch, windows) -> None:
+    """No UIA foreground; Win32 enumeration returns `windows`."""
+    monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto: None)
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows", lambda: windows)
+    monkeypatch.setattr(studio_arm, "_process_name", lambda pid: {
+        77: "FTOptixStudio.exe", 4242: "OneDrive.exe", 5: "notepad.exe"}.get(pid))
+
+
+def test_win32_foreign_window_over_studio_is_os_dialog(tmp_path, monkeypatch) -> None:
+    """A fake Win32 enumeration with a visible foreign window overlapping Studio
+    gives probable_cause os_dialog and blocking_window.source == 'win32'."""
+    _win32_env(monkeypatch, [
+        {"title": "Sign in to OneDrive", "pid": 4242,
+         "rect": (400, 300, 700, 500), "foreground": False},
+        _STUDIO_WIN])
+    out = studio_arm.annotate_os_dialog({"ok": False, "error": "menu_item_not_found"},
+                                        None, 77)
+    assert out["probable_cause"] == "os_dialog"
+    assert out["blocking_window"] == {"title": "Sign in to OneDrive",
+                                      "process": "OneDrive.exe", "pid": 4242,
+                                      "class": "", "source": "win32"}
+    assert "Sign in to OneDrive" in out["hint"] and "dismiss" in out["hint"]
+
+
+def test_win32_foreground_foreign_window_counts_without_overlap(monkeypatch) -> None:
+    _win32_env(monkeypatch, [
+        {"title": "Far away", "pid": 5, "rect": (2000, 0, 2200, 100),
+         "foreground": True}, _STUDIO_WIN])
+    got = studio_arm.blocking_window_for(None, 77)
+    assert got and got["source"] == "win32" and got["pid"] == 5
+
+
+def test_win32_nothing_visible_leaves_behaviour_unchanged(monkeypatch) -> None:
+    """No windows, only Studio's own, or foreign windows that neither overlap nor
+    hold the foreground: no blocker and the failure dict is untouched."""
+    for wins in ([], [_STUDIO_WIN],
+                 [{"title": "Elsewhere", "pid": 5, "rect": (2000, 0, 2200, 100),
+                   "foreground": False}, _STUDIO_WIN]):
+        _win32_env(monkeypatch, wins)
+        assert studio_arm.blocking_window_for(None, 77) is None
+        base = {"ok": False, "error": "menu_item_not_found"}
+        assert studio_arm.annotate_os_dialog(dict(base), None, 77) == base
 
 
 def test_window_identity_accepts_browsename_alias_and_path_label() -> None:
@@ -868,3 +1022,1157 @@ def test_optix_execute_method_verify_none_skips_port_guard(
         "serving_port_for must not be called when verify='none': "
         f"got {port_guard_calls}"
     )
+
+
+# -- row shapes: 1.7 (label is a direct child) vs 1.8 (label in a group) -----
+
+def _shape_pair():
+    return _FakeStudio(), _FakeStudio(nested=True)
+
+
+def test_row_texts_reads_direct_and_grouped_labels() -> None:
+    flat, nested = _shape_pair()
+    assert [c.Name for c in studio_arm._row_texts(flat.win)] == \
+        [c.Name for c in studio_arm._row_texts(nested.win)]
+    assert any(c.ControlTypeName == "ListItemControl" for c in nested.win.GetChildren())
+
+
+def test_row_texts_is_depth_bounded() -> None:
+    deep = _Ctl("t", "TextControl", (0, 0, 10, 10))
+    for _ in range(3):
+        deep = _Ctl("", "GroupControl", (0, 0, 10, 10), [deep])
+    root = _Ctl("", "WindowControl", children=[deep])   # text at depth 4
+    assert studio_arm._row_texts(root, max_depth=4) == [deep.GetChildren()[0]
+                                                         .GetChildren()[0].GetChildren()[0]]
+    assert studio_arm._row_texts(root, max_depth=3) == []
+
+
+def test_row_texts_skips_menus() -> None:
+    menu = _Ctl("", "MenuControl", children=[_Ctl("Misc.", "TextControl", (1, 1, 5, 5))])
+    assert studio_arm._row_texts(_Ctl("", "WindowControl", children=[menu])) == []
+
+
+def test_candidate_rows_pick_the_same_row_in_both_shapes() -> None:
+    flat, nested = _shape_pair()
+    flat.expanded = nested.expanded = True
+    for names in (["Misc."], ["DesignTimeNetLogic"], ["studiomcpbridge"]):
+        a = studio_arm._candidate_rows(flat.win, names)
+        b = studio_arm._candidate_rows(nested.win, names)
+        assert [(c.Name, c.BoundingRectangle.left, c.BoundingRectangle.top) for c in a] == \
+            [(c.Name, c.BoundingRectangle.left, c.BoundingRectangle.top) for c in b]
+        assert a
+    # leftmost first: the tree's own copy before the Properties-pane copy
+    rows = studio_arm._candidate_rows(nested.win, ["StudioMCPBridge"])
+    assert rows[0].BoundingRectangle.left == 1666
+
+
+def test_candidate_rows_strip_search_highlight_in_nested_shape() -> None:
+    fake = _FakeStudio(search_box=True, nested=True)
+    fake.filter = "StudioMCPBridge"
+    rows = studio_arm._candidate_rows(fake.win, ["StudioMCPBridge"])
+    assert [studio_arm._strip_tags(r.Name) for r in rows][0] == "StudioMCPBridge"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_indent_step_measures_both_shapes(nested: bool) -> None:
+    fake = _FakeStudio(nested=nested)
+    fake.expanded = True
+    row = studio_arm._candidate_rows(fake.win, ["DesignTimeNetLogic"])[0]
+    assert studio_arm._indent_step(fake.win, row) == 16
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_click_chevron_works_in_both_shapes(nested: bool) -> None:
+    fake = _FakeStudio(nested=nested)
+    row = studio_arm._candidate_rows(fake.win, ["Misc."])[0]
+    x = studio_arm._click_chevron(fake, fake.win, row)
+    assert x == 1024 - 34 and fake.expanded
+
+
+def test_arm_resolves_the_same_chain_in_both_shapes(tmp_path, monkeypatch) -> None:
+    _fork_tree(tmp_path)
+    results = []
+    for nested in (False, True):
+        for box in (False, True):
+            fake = _FakeStudio(nested=nested, search_box=box)
+            _wire(monkeypatch, fake)
+            out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+            assert out["ok"] and out["state"] == "armed", out
+            results.append((box, out["chain"], out["expanded"],
+                            [t["row"] for t in out["tried"]]))
+    assert results[0] == results[2] and results[1] == results[3]
+
+
+# --- keyboard-focus gating for editing keys (ftx-mcp-we6.2) -----------------
+
+class _FocusRect:
+    left, top = 10, 10
+
+    def width(self) -> int:
+        return 100
+
+    def height(self) -> int:
+        return 20
+
+
+class _FakeAuto:
+    """Records SendKeys / Click; GetFocusedControl returns what the test sets."""
+
+    def __init__(self) -> None:
+        self.keys: list[str] = []
+        self.clicks = 0
+        self.focused = None
+
+    def Click(self, x, y) -> None:
+        self.clicks += 1
+
+    def SendKeys(self, keys) -> None:
+        self.keys.append(keys)
+
+    def GetFocusedControl(self):
+        return self.focused
+
+
+class _FakeBox:
+    """Gains keyboard focus on the Nth click (None = never)."""
+
+    BoundingRectangle = _FocusRect()
+
+    def __init__(self, auto: _FakeAuto, focus_on_attempt: int | None,
+                 value_pattern: bool = False) -> None:
+        self.auto = auto
+        self.focus_on_attempt = focus_on_attempt
+        self.HasKeyboardFocus = False
+        self.value: str | None = None
+        self._vp = value_pattern
+
+    def SetFocus(self) -> None:
+        if self.focus_on_attempt is not None and self.auto.clicks >= self.focus_on_attempt:
+            self.HasKeyboardFocus = True
+
+    def GetValuePattern(self):
+        if not self._vp:
+            raise RuntimeError("ValuePattern not supported")
+        box = self
+
+        class _VP:
+            def SetValue(self, v) -> None:
+                box.value = v
+
+        return _VP()
+
+
+def test_never_focused_box_receives_no_keystrokes() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, None)
+    with pytest.raises(studio_arm.FocusError, match="refusing to send keys blind"):
+        studio_arm._set_filter(auto, box, "Leaf", settle=0)
+    assert auto.keys == []
+
+
+def test_box_focused_on_second_attempt_receives_keys_exactly_once() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, 2)
+    studio_arm._set_filter(auto, box, "Leaf", settle=0)
+    assert auto.clicks == 2
+    assert auto.keys == ["{Ctrl}a{Delete}", "Leaf"]
+
+
+def test_value_pattern_sets_value_without_keystrokes() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, None, value_pattern=True)
+    studio_arm._set_filter(auto, box, "Leaf", settle=0)
+    assert box.value == "Leaf"
+    assert auto.keys == []
+
+
+def test_no_focus_and_no_value_pattern_raises_clear_error() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, None, value_pattern=False)
+    with pytest.raises(studio_arm.FocusError, match="no ValuePattern"):
+        studio_arm._set_filter(auto, box, "", settle=0)
+    assert auto.keys == []
+
+
+def test_focused_control_equal_to_box_counts_as_focus() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, None)
+    auto.focused = box
+    studio_arm._set_filter(auto, box, "", settle=0)
+    assert auto.keys == ["{Ctrl}a{Delete}"]
+
+
+def test_focus_lost_before_typing_sends_no_text() -> None:
+    auto = _FakeAuto()
+    box = _FakeBox(auto, 1)
+
+    def drop_focus(keys) -> None:
+        auto.keys.append(keys)
+        box.HasKeyboardFocus = False
+
+    auto.SendKeys = drop_focus  # type: ignore[method-assign]
+    with pytest.raises(studio_arm.FocusError):
+        studio_arm._set_filter(auto, box, "Leaf", settle=0.001)
+    assert auto.keys == ["{Ctrl}a{Delete}"]
+
+
+def test_every_editing_sendkeys_in_studio_arm_is_gated() -> None:
+    """Only the focus-gated _set_filter may send Ctrl+A/Delete/typed text."""
+    import inspect
+    import re as _re
+
+    src = inspect.getsource(studio_arm)
+    calls = _re.findall(r"auto\.SendKeys\(([^)]*)\)", src)
+    assert sorted(calls) == sorted(['"{Ctrl}a{Delete}"', "text", '"{Esc}"', '"{Esc}"', '"{Esc}"'])
+    body = inspect.getsource(studio_arm._set_filter)
+    assert body.count("SendKeys(") == 2
+
+
+# ---- clear_consent project-directory resolution ------------------------------
+
+def _stub_uia(monkeypatch, seen: dict) -> None:
+    """Fake `uiautomation` and capture the args _studio_window_for receives."""
+    import sys
+    import types
+
+    mod = types.ModuleType("uiautomation")
+    monkeypatch.setitem(sys.modules, "uiautomation", mod)
+
+    def fake_window_for(auto, project, aliases=None, project_dir=None):
+        seen.update(project=project, aliases=aliases, project_dir=project_dir)
+        return None  # -> studio_window_not_found, after resolution
+
+    monkeypatch.setattr(studio_arm, "_studio_window_for", fake_window_for)
+
+
+def test_clear_consent_explicit_project_dir_is_used(monkeypatch) -> None:
+    seen: dict = {}
+    _stub_uia(monkeypatch, seen)
+
+    def boom(*a, **k):
+        raise AssertionError("resolve_project must not be called")
+
+    monkeypatch.setattr(core, "resolve_project", boom)
+    out = studio_arm.clear_consent("Line4", project_dir="C:/p/Line4")
+    assert out["error"] == "studio_window_not_found"
+    assert seen["project_dir"] == "C:/p/Line4"
+
+
+def test_clear_consent_name_only_resolves_via_resolve_project(
+        monkeypatch, tmp_path) -> None:
+    seen: dict = {}
+    _stub_uia(monkeypatch, seen)
+    cfg = object()
+    calls = []
+
+    def fake_resolve(c, project):
+        calls.append((c, project))
+        return tmp_path
+
+    monkeypatch.setattr(core, "resolve_project", fake_resolve)
+    out = studio_arm.clear_consent("Line4", cfg=cfg)
+    assert calls == [(cfg, "Line4")]
+    assert seen["project_dir"] == tmp_path
+    assert out["error"] == "studio_window_not_found"
+
+
+def test_clear_consent_unresolvable_project_returns_structured_error(
+        monkeypatch) -> None:
+    seen: dict = {}
+    _stub_uia(monkeypatch, seen)
+
+    def fake_resolve(c, project):
+        raise core.ProjectNotFound(f"project not found: {project}")
+
+    monkeypatch.setattr(core, "resolve_project", fake_resolve)
+    out = studio_arm.clear_consent("Ghost", cfg=object())
+    assert out["ok"] is False
+    assert out["error"] == "project_not_found"
+    assert out["project"] == "Ghost"
+    assert "Ghost" in out["detail"]
+    assert seen == {}  # never reached the window lookup
+
+
+def _fake_uia(monkeypatch, top_level) -> None:
+    """Install a fake `uiautomation` whose desktop root lists `top_level`."""
+    import sys
+    import types
+
+    class Ctrl:
+        def __init__(self, ctype, name, children=None):
+            self.ControlTypeName, self.Name = ctype, name
+            self.ProcessId = 1
+            self._c = children or []
+
+        def GetChildren(self):
+            return self._c
+
+    def build(spec):
+        ctype, name, kids = spec
+        return Ctrl(ctype, name, [build(k) for k in kids])
+
+    root = Ctrl("PaneControl", "Desktop", [build(s) for s in top_level])
+    mod = types.ModuleType("uiautomation")
+    mod.GetRootControl = lambda: root  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uiautomation", mod)
+
+
+def _project_with_optix(cfg: core.Config, name: str) -> None:
+    d = cfg.projects_root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.optix").write_text("Name: " + name, encoding="utf-8")
+    (d / "IDEVersion.txt").write_text("1.8.0.555", encoding="utf-8")
+
+
+def test_project_open_returns_upgrade_required_on_upgrade_modal(
+        cfg: core.Config, monkeypatch) -> None:
+    import time
+    _project_with_optix(cfg, "OldProj")
+    # A real project file is non-empty; an empty one is project_file_missing.
+    (cfg.projects_root / "OldProj" / "OldProj.optix").write_text("Name: OldProj")
+    (cfg.projects_root / "OldProj" / "IDEVersion.txt").write_text("1.7.4.32")
+    monkeypatch.setattr(core, "_studio_launch", lambda *a: {"ok": True, "pid": 1})
+    monkeypatch.setattr(core, "_studio_log_since", lambda mark, **k: [
+        "ERROR The project was created with an older version of FactoryTalk Optix Studio"])
+    monkeypatch.setattr(core, "studio_version",
+                        lambda *a, **k: {"ok": True, "stdout": "1.8.0.555"})
+    clicked: list[str] = []
+    monkeypatch.setattr(studio_arm, "_studio_window_for", lambda *a, **k: None)
+    _fake_uia(monkeypatch, [
+        ("WindowControl", "FactoryTalk Optix Studio", [
+            ("WindowControl", "Project Upgrade", [
+                ("TextControl", "This project was created with an older version. Upgrade it?", []),
+                ("ButtonControl", "Upgrade", []),
+            ]),
+        ]),
+    ])
+    monkeypatch.setattr(time, "sleep", lambda s: clicked.append("slept"))
+    t0 = time.time()
+    out = core.project_open(cfg, "OldProj", wait_seconds=90)
+    assert time.time() - t0 < 5
+    assert out["ok"] is False and out["error"] == "upgrade_required"
+    assert out["project"] == "OldProj"
+    assert out["studio_version"] == "1.8.0.555"
+    assert out["hint"]
+    assert clicked == []  # returned on the first poll, never waited, never clicked
+
+
+def test_project_open_still_times_out_without_upgrade_modal(
+        cfg: core.Config, monkeypatch) -> None:
+    _project_with_optix(cfg, "Plain")
+    monkeypatch.setattr(core, "_studio_launch", lambda *a: {"ok": True, "pid": 1})
+    monkeypatch.setattr(studio_arm, "_studio_window_for", lambda *a, **k: None)
+    _fake_uia(monkeypatch, [("WindowControl", "FactoryTalk Optix Studio", [])])
+    out = core.project_open(cfg, "Plain", wait_seconds=0.2)
+    assert out["ok"] is False and out["error"] == "open_timeout"
+
+
+# ---- acceptance tests: consent press by UIA InvokePattern + dismissal -------
+
+class _FakeInvoke:
+    def __init__(self, on_invoke=None) -> None:
+        self.invoked = 0
+        self._on_invoke = on_invoke
+
+    def Invoke(self) -> None:  # noqa: N802 -- mirrors uiautomation
+        self.invoked += 1
+        if self._on_invoke:
+            self._on_invoke()
+
+
+class _InvokableButton(_Ctl):
+    """ButtonControl exposing an InvokePattern (or not)."""
+
+    def __init__(self, name, rect, has_invoke=True, on_invoke=None) -> None:
+        super().__init__(name, "ButtonControl", rect)
+        self._ip = _FakeInvoke(on_invoke) if has_invoke else None
+
+    def GetInvokePattern(self):  # noqa: N802
+        if self._ip is None:
+            raise Exception("invoke pattern unavailable")
+        return self._ip
+
+
+def _popup_win(button, checkbox=None, dismiss_on_press=True):
+    kids = [checkbox, button] if checkbox is not None else [button]
+    popup = _Ctl("Security Warning", "PaneControl", (180, 180, 340, 400), kids)
+    win = _Ctl("FactoryTalk Optix Studio", "WindowControl", (0, 0, 800, 600), [popup])
+    if dismiss_on_press:
+        def _gone() -> None:
+            win._children.remove(popup)
+        return win, _gone
+    return win, None
+
+
+def test_consent_below_work_area_is_invoked_not_clicked(monkeypatch) -> None:
+    """Proceed centre at y=559, below the 800x600 work area (ends y=552):
+    InvokePattern presses it and no coordinate click is made."""
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    cb = _FakeCheckbox("Do not show this warning again")
+    holder: dict = {}
+    btn = _InvokableButton("Proceed", (360, 547, 80, 24),
+                           on_invoke=lambda: holder["gone"]())
+    win, holder["gone"] = _popup_win(btn, cb)
+    rep: dict = {}
+    assert studio_arm._click_consent(auto, win, attempts=1, report=rep) is True
+    assert btn._ip.invoked == 1
+    assert auto.clicks == []
+    assert cb._tp.toggled is True
+    assert rep["consent_dismissed"] is True
+
+
+def test_consent_button_without_invoke_pattern_falls_back_to_click(monkeypatch) -> None:
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    holder: dict = {}
+    btn = _InvokableButton("Proceed", (220, 240, 80, 24), has_invoke=False)
+    win, holder["gone"] = _popup_win(btn)
+    orig_click = auto.Click
+    auto.Click = lambda x, y: (orig_click(x, y), holder["gone"]())  # click dismisses
+    rep: dict = {}
+    assert studio_arm._click_consent(auto, win, attempts=1, report=rep) is True
+    assert auto.clicks == [(260, 252)]
+    assert rep["consent_dismissed"] is True
+
+
+def test_consent_ticks_toggle_before_invoking_proceed(monkeypatch) -> None:
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    log: list[str] = []
+    cb = _FakeCheckbox("Do not show this warning again")
+    orig = cb._tp.Toggle
+    cb._tp.Toggle = lambda: (log.append("toggle"), orig())
+    btn = _InvokableButton("Proceed", (220, 240, 80, 24),
+                           on_invoke=lambda: log.append("invoke"))
+    win, _ = _popup_win(btn, cb, dismiss_on_press=False)
+    studio_arm._click_consent(_SimpleAuto(), win, attempts=1)
+    assert log == ["toggle", "invoke"]
+
+
+def test_consent_surviving_dialog_reports_not_dismissed(monkeypatch) -> None:
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    btn = _InvokableButton("Proceed", (220, 240, 80, 24))
+    win, _ = _popup_win(btn, dismiss_on_press=False)
+    rep: dict = {}
+    assert studio_arm._click_consent(_SimpleAuto(), win, attempts=1, report=rep) is True
+    assert rep["consent_dismissed"] is False
+    assert rep["dialog_title"] == "Security Warning"
+
+
+def test_clear_consent_reports_dismissed_alongside_clicked(monkeypatch) -> None:
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    auto = _SimpleAuto()
+    auto.GetCursorPos = lambda: (0, 0)
+    auto.GetForegroundControl = lambda: None
+    auto.SetCursorPos = lambda x, y: None
+    monkeypatch.setitem(__import__("sys").modules, "uiautomation", auto)
+    btn = _InvokableButton("Proceed", (220, 240, 80, 24))
+    win, _ = _popup_win(btn, dismiss_on_press=False)
+    monkeypatch.setattr(studio_arm, "_studio_window_for", lambda *a, **k: win)
+    out = studio_arm.clear_consent("P", project_dir="x", attempts=1)
+    assert out["consent_clicked"] is True and out["consent_dismissed"] is False
+    assert out["error"] == "consent_not_dismissed" and out["dialog"] == "Security Warning"
+
+
+def test_arm_returns_consent_not_dismissed_with_dialog_title(tmp_path, monkeypatch) -> None:
+    """A dialog that survives the press fails the arm as consent_not_dismissed
+    (with the dialog title), not as a later verify_timeout."""
+    _fork_tree(tmp_path)
+    fake = _FakeStudio()
+    _wire(monkeypatch, fake)
+    monkeypatch.setattr(
+        studio_arm, "_click_consent",
+        lambda auto, win, *a, report=None, **k: (
+            report.update(consent_dismissed=False, dialog_title="Security Warning"),
+            True)[1])
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    timeout=0.2)
+    assert out["ok"] is False and out["error"] == "consent_not_dismissed", out
+    assert out["dialog"] == "Security Warning"
+    assert out["consent_clicked"] is True and out["consent_dismissed"] is False
+
+
+# ---- acceptance tests: expansion of collapsed ancestors (nested bridge) -----
+
+class _ExpandPattern:
+    def __init__(self, tree: _TreeStudio, i: int) -> None:
+        self._tree, self._i = tree, i
+
+    @property
+    def ExpandCollapseState(self) -> int:  # noqa: N802 -- mirrors uiautomation
+        return 1 if self._tree.expanded[self._i] else 0
+
+    def Expand(self) -> None:  # noqa: N802
+        self._tree.pattern_calls.append(self._i)
+        self._tree.expanded[self._i] = True
+
+
+class _TreeRow(_Ctl):
+    """Row label that may expose an ExpandCollapsePattern."""
+
+    def __init__(self, tree, i, name, rect) -> None:
+        super().__init__(name, "TextControl", rect)
+        self._tree, self._i = tree, i
+
+    def GetExpandCollapsePattern(self):  # noqa: N802
+        if not self._tree.has_pattern:
+            raise Exception("expand/collapse pattern unavailable")
+        return _ExpandPattern(self._tree, self._i)
+
+
+class _TreeStudio:
+    """Synthetic filtered Project tree for the 4-deep chain
+    NetLogic > Misc. > DesignTimeNetLogic > StudioMCPBridge (the NESTED yaml).
+
+    Row i is shown only while ancestors 0..i-1 are all expanded, and every
+    ancestor starts COLLAPSED. Expansion works through ExpandCollapsePattern
+    (`has_pattern`) and/or a click 34 px left of the row text (`has_chevron`).
+    `leaf_pinned` shows the filtered leaf row even with its ancestors closed;
+    `leaf_menu_needs_expand` gives it an empty menu until the chain is open;
+    `security_gate` makes Execute raise a top-level NetLogic security warning
+    that must be answered (Proceed, by InvokePattern) before the bridge serves.
+    """
+    NAMES = ["NetLogic", "Misc.", "DesignTimeNetLogic", "StudioMCPBridge"]
+
+    def __init__(self, has_pattern=True, has_chevron=True, leaf_pinned=False,
+                 leaf_menu_needs_expand=False, security_gate=False) -> None:
+        self.has_pattern, self.has_chevron = has_pattern, has_chevron
+        self.leaf_pinned = leaf_pinned
+        self.leaf_menu_needs_expand = leaf_menu_needs_expand
+        self.security_gate = security_gate
+        self.expanded = [False, False, False]
+        self.pattern_calls: list[int] = []
+        self.chevron_clicks: list[int] = []
+        self.right_clicks: list[str] = []
+        self.menu = None
+        self.armed = False
+        self.focus = None
+        self.filter = ""
+        self.keys: list[str] = []
+        self.foreign_pressed = 0
+        self.tops: list = []
+        self.win = _Ctl("FactoryTalk Optix Studio", "WindowControl", (961, 0, 958, 1031))
+        self.win.GetChildren = self._rows
+
+    def _shown(self, i: int) -> bool:
+        return all(self.expanded[:i]) or (i == len(self.NAMES) - 1 and self.leaf_pinned)
+
+    def _rect(self, i: int) -> tuple:
+        return (1008 + 16 * i, 126 + 28 * i, 297 - 16 * i, 28)
+
+    def _rows(self):
+        rows = [_FocusableEdit(self, (961, 99, 349, 27)),
+                _Ctl("Cell_v5", "TextControl", (1008, 98, 297, 20))]
+        for i, n in enumerate(self.NAMES):
+            if not self._shown(i):
+                continue
+            label = f"<b>{n}</b>" if i == len(self.NAMES) - 1 else n
+            rows.append(_TreeRow(self, i, label, self._rect(i)))
+        rows.append(_Ctl("StudioMCPBridge", "TextControl", (1666, 99, 243, 28)))
+        if self.menu is not None:
+            rows.append(self.menu)
+        return rows
+
+    def _row_at(self, x, y):
+        for c in self._rows():
+            r = c.BoundingRectangle
+            if c.ControlTypeName == "TextControl" and r.left <= x < r.left + r.width() \
+                    and r.top <= y < r.top + r.height():
+                return studio_arm._strip_tags(c.Name)
+        return None
+
+    def _menu(self, names):
+        items = [_Ctl(n, "MenuItemControl", (1100, 300 + 22 * i, 220, 22))
+                 for i, n in enumerate(names)]
+        return _Ctl("", "MenuControl", (1100, 300, 220, 22 * len(names)), items)
+
+    # --- uiautomation module surface
+    def GetRootControl(self):  # noqa: N802
+        return _Ctl("", "PaneControl", children=[self.win, *self.tops])
+
+    def GetCursorPos(self):  # noqa: N802
+        return (0, 0)
+
+    def SetCursorPos(self, x, y):  # noqa: N802
+        pass
+
+    def GetForegroundControl(self):  # noqa: N802
+        return None
+
+    def RightClick(self, x, y):  # noqa: N802
+        row = self._row_at(x, y)
+        self.right_clicks.append(str(row))
+        if row == self.NAMES[-1]:
+            if self.leaf_menu_needs_expand and not all(self.expanded):
+                self.menu = self._menu([])
+            else:
+                self.menu = self._menu(["NodeSet", "Rename", "Execute StopBridge",
+                                        "Execute StartBridge"])
+        elif row in self.NAMES:
+            self.menu = self._menu(["NodeSet", "Rename", "Delete", "New"])
+        else:
+            self.menu = None
+
+    def _raise_security_warning(self) -> None:
+        def _proceed():
+            self.armed = True
+            self.tops.remove(dlg)
+        btn = _InvokableButton("Proceed", (400, 500, 80, 24), on_invoke=_proceed)
+        dlg = _Ctl("NetLogic Security Warning", "WindowControl", (300, 300, 400, 260), [btn])
+        dlg.ProcessId = self.win.ProcessId
+        # Another application's look-alike dialog: must never be touched.
+        other_btn = _InvokableButton(
+            "Proceed", (400, 500, 80, 24),
+            on_invoke=lambda: setattr(self, "foreign_pressed", self.foreign_pressed + 1))
+        other = _Ctl("Security Warning", "WindowControl", (0, 0, 400, 260), [other_btn])
+        other.ProcessId = self.win.ProcessId + 1
+        self.tops.extend([other, dlg])
+
+    def Click(self, x, y):  # noqa: N802
+        self.focus = "search" if 99 <= y < 126 and x < 1310 else "tree"
+        if self.menu is not None:
+            for it in self.menu.GetChildren():
+                r = it.BoundingRectangle
+                if r.left <= x < r.left + r.width() and r.top <= y < r.top + r.height():
+                    if it.Name == "Execute StartBridge":
+                        if self.security_gate:
+                            self._raise_security_warning()
+                        else:
+                            self.armed = True
+                    self.menu = None
+                    return
+        if not self.has_chevron:
+            return
+        for i in range(len(self.expanded)):
+            if self._shown(i):
+                r = self._rect(i)
+                if abs(x - (r[0] - 34)) <= 4 and r[1] <= y < r[1] + r[3]:
+                    self.chevron_clicks.append(i)
+                    self.expanded[i] = not self.expanded[i]
+
+    def SendKeys(self, keys):  # noqa: N802
+        self.keys.append(keys)
+        if "{Esc}" in keys:
+            self.menu = None
+        elif self.focus == "search":
+            self.filter = "" if keys == "{Ctrl}a{Delete}" else (
+                self.filter if keys.startswith("{") else keys)
+
+
+def _tree_project(tmp_path: Path) -> Path:
+    nodes = tmp_path / "Nodes" / "NetLogic"
+    nodes.mkdir(parents=True)
+    (nodes / "NetLogic.yaml").write_text(NESTED, encoding="utf-8")
+    (tmp_path / "Cell_v5.optix").write_text("", encoding="utf-8")
+    return tmp_path
+
+
+def _wire_tree(monkeypatch, fake: _TreeStudio) -> None:
+    monkeypatch.setitem(__import__("sys").modules, "uiautomation", fake)
+    monkeypatch.setattr(studio_arm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(studio_arm, "bound_ports", lambda *a, **k: set())
+    monkeypatch.setattr(studio_arm, "serving_port_for",
+                        lambda *a, **k: 8768 if fake.armed else None)
+
+
+def test_four_deep_chain_with_collapsed_ancestors_resolves_leaf_and_menu(
+        tmp_path, monkeypatch) -> None:
+    """Every ancestor collapsed: each is expanded in order through
+    ExpandCollapsePattern (no chevron click), then the LEAF row's own context
+    menu supplies Execute StartBridge."""
+    _tree_project(tmp_path)
+    fake = _TreeStudio()
+    _wire_tree(monkeypatch, fake)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] and out["state"] == "armed", out
+    assert out["chain"] == _TreeStudio.NAMES
+    assert fake.pattern_calls == [0, 1, 2]          # in order, outermost first
+    assert fake.chevron_clicks == []
+    assert out["expanded"] == ["filter:StudioMCPBridge", "pattern:NetLogic",
+                               "pattern:Misc.", "pattern:DesignTimeNetLogic"]
+    assert fake.right_clicks == ["StudioMCPBridge"]  # only the leaf, never a folder
+    assert out["tried"][-1]["leaf"] is True and out["tried"][-1]["menu_items"] == 4
+    assert fake.filter == ""                         # operator's tree handed back
+
+
+def test_collapsed_ancestors_fall_back_to_chevron_click(tmp_path, monkeypatch) -> None:
+    _tree_project(tmp_path)
+    fake = _TreeStudio(has_pattern=False)
+    _wire_tree(monkeypatch, fake)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] and out["state"] == "armed", out
+    assert fake.pattern_calls == []
+    assert fake.chevron_clicks == [0, 1, 2]
+    assert out["expanded"][1:] == ["chevron:NetLogic", "chevron:Misc.",
+                                   "chevron:DesignTimeNetLogic"]
+
+
+def test_leaf_with_empty_menu_triggers_expansion_and_retry(tmp_path, monkeypatch) -> None:
+    """Ancestors all on screen but collapsed-state leaf shows 0 menu items:
+    expand, then retry the leaf."""
+    _tree_project(tmp_path)
+    fake = _TreeStudio(leaf_pinned=True, leaf_menu_needs_expand=True)
+    fake.expanded = [True, True, False]    # chain visible; 'DesignTimeNetLogic' closed
+    _wire_tree(monkeypatch, fake)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] and out["state"] == "armed", out
+    leaf_tries = [t for t in out["tried"] if t.get("leaf")]
+    counts = [t["menu_items"] for t in leaf_tries]
+    assert counts[0] == 0 and counts[-1] == 4   # empty menu, then retry after expanding
+    assert fake.pattern_calls == [2]
+
+
+def test_leaf_only_fallback_when_expansion_is_impossible(tmp_path, monkeypatch) -> None:
+    """No pattern, chevron inert: the filtered leaf row is right-clicked
+    directly and its menu still arms."""
+    _tree_project(tmp_path)
+    fake = _TreeStudio(has_pattern=False, has_chevron=False, leaf_pinned=True)
+    _wire_tree(monkeypatch, fake)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["ok"] and out["state"] == "armed", out
+    assert fake.right_clicks == ["StudioMCPBridge"]
+    leaf = [t for t in out["tried"] if t.get("leaf")]
+    assert len(leaf) == 1 and leaf[0]["direct"] is True
+    assert fake.expanded == [False, False, False]
+    assert not any(e.startswith(("pattern:", "chevron:")) for e in out["expanded"])
+
+
+def test_verify_timeout_presses_proceed_on_studio_owned_security_window(
+        tmp_path, monkeypatch) -> None:
+    """Execute raises a top-level NetLogic security-warning window (not an
+    in-scene popup). On verify timeout the one owned by the Studio pid is
+    answered through the UIA invoke helper; a same-titled foreign-pid dialog
+    is left alone."""
+    _tree_project(tmp_path)
+    fake = _TreeStudio(security_gate=True)
+    _wire_tree(monkeypatch, fake)
+    invoked: list[object] = []
+    orig_press = studio_arm._press
+    monkeypatch.setattr(studio_arm, "_press",
+                        lambda auto, b: (invoked.append(b), orig_press(auto, b))[1])
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    timeout=0.05)
+    assert out["ok"] and out["state"] == "armed", out
+    assert out["security_warning_cleared"] is True
+    assert out["security_warning"] == {"title": "NetLogic Security Warning",
+                                       "method": "invoke", "dismissed": True}
+    assert len(invoked) == 1 and fake.foreign_pressed == 0
+
+
+def test_verify_timeout_without_security_window_still_times_out(
+        tmp_path, monkeypatch) -> None:
+    _tree_project(tmp_path)
+    fake = _TreeStudio()
+    _wire_tree(monkeypatch, fake)
+    monkeypatch.setattr(studio_arm, "serving_port_for", lambda *a, **k: None)
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    timeout=0.05)
+    assert out["ok"] is False and out["error"] == "verify_timeout"
+    assert "security_warning" not in out
+
+
+def test_execute_method_uses_live_chain_without_yaml(tmp_path, monkeypatch) -> None:
+    """A live chain drives the gesture even when no YAML declares the node."""
+    (tmp_path / "Cell_v5.optix").write_text("", encoding="utf-8")
+    fake = _FakeStudio()
+    _wire(monkeypatch, fake)
+    out = studio_arm.execute_method(
+        "Cell_v5", str(tmp_path), method="StopBridge", node_name="StudioMCPBridge",
+        verify="none", live_chain=["Misc.", "DesignTimeNetLogic", "StudioMCPBridge"])
+    assert out["ok"] and out["state"] == "executed", out
+    assert out["chain"] == ["Misc.", "DesignTimeNetLogic", "StudioMCPBridge"]
+    assert out["chain_source"] == "bridge"
+
+
+def test_execute_method_without_live_chain_uses_yaml(tmp_path, monkeypatch) -> None:
+    _fork_tree(tmp_path)
+    _wire(monkeypatch, _FakeStudio())
+    out = studio_arm.execute_method(
+        "Cell_v5", str(tmp_path), method="StopBridge", node_name="StudioMCPBridge",
+        verify="none")
+    assert out["chain_source"] == "yaml"
+    assert out["chain"] == ["Misc.", "DesignTimeNetLogic", "StudioMCPBridge"]
+
+
+# ---- #24: elevated Studio vs non-elevated service ---------------------------
+
+def test_studio_elevated_service_not_decision() -> None:
+    probe = {"service_elevated": False,
+             "studio": [{"pid": 4242, "elevated": True, "denied": True}]}
+    out = studio_arm.window_missing_result("Line4", probe)
+    assert out["ok"] is False
+    assert out["error"] == "studio_elevated_service_not"
+    assert out["hint"] == ("Studio is running as administrator; start it "
+                           "without elevation, or run the service elevated")
+    assert out["studio_pids"] == [4242]
+
+
+def test_studio_window_not_found_without_elevation_mismatch() -> None:
+    for probe in (
+        None,
+        {"service_elevated": False, "studio": []},
+        {"service_elevated": False,
+         "studio": [{"pid": 1, "elevated": False, "denied": False}]},
+        {"service_elevated": True,
+         "studio": [{"pid": 1, "elevated": True, "denied": False}]},
+    ):
+        out = studio_arm.window_missing_result("Line4", probe)
+        assert out["error"] == "studio_window_not_found"
+        assert out["project"] == "Line4"
+
+
+def test_execute_method_uses_elevation_decision(monkeypatch) -> None:
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "uiautomation", types.ModuleType("uiautomation"))
+    monkeypatch.setattr(studio_arm, "_studio_window_for", lambda *a, **k: None)
+    monkeypatch.setattr(studio_arm, "probe_elevation", lambda *a, **k: {
+        "service_elevated": False,
+        "studio": [{"pid": 7, "elevated": True, "denied": True}]})
+    out = studio_arm.execute_method("Line4", "C:/p/Line4", verify="none",
+                                    live_chain=["StudioMCPBridge"])
+    assert out["error"] == "studio_elevated_service_not"
+
+
+def test_elevation_powershell_helper_reports_elevation() -> None:
+    ps = studio_arm._ELEVATION_PS
+    assert "OpenProcessToken" in ps and "GetTokenInformation" in ps
+    assert "elevated" in ps and "service_elevated" in ps
+    assert "FTOptixStudio" in ps
+
+
+def test_probe_elevation_parses_single_studio_object() -> None:
+    class P:
+        returncode = 0
+        stdout = '{"service_elevated":false,"studio":{"pid":9,"elevated":true,"denied":true}}'
+
+    class R:
+        def run_powershell(self, ps, timeout, **kw):
+            return P()
+
+    out = studio_arm.probe_elevation(R())
+    assert out == {"service_elevated": False,
+                   "studio": [{"pid": 9, "elevated": True, "denied": True}]}
+
+
+def test_cmdline_project_paths_accepts_new_name_root(tmp_path: Path) -> None:
+    root = str(tmp_path)
+    got = studio_arm.cmdline_project_paths(["C:\\Studio\\FTOptixStudio.exe", "new", "X", root, "--silent"])
+    assert len(got) == 2 and got[0].replace("\\", "/").endswith("/X")
+    assert studio_arm.cmdline_project_paths(["FTOptixStudio.exe", "open", "rel/Y.optix"]) == []
+
+
+def test_title_name_only_ok_false_requires_the_dir() -> None:
+    f = studio_arm.window_title_names_project
+    assert f("Demo - FactoryTalk Optix Studio", "Demo")
+    assert not f("Demo - FactoryTalk Optix Studio", "Demo", name_only_ok=False)
+    assert f("C:\\p\\Demo - FactoryTalk Optix Studio", "Demo", None, "C:\\p\\Demo", name_only_ok=False)
+
+
+def test_blocking_window_for_never_returns_own_process_tree(monkeypatch) -> None:
+    """The service pid, its parent and the hosting conhost/WindowsTerminal are
+    never a blocker, on either the UIA or the Win32 source; a real foreign
+    window still is."""
+    own = {900, 901, 902, 903}      # service, parent shell, conhost, WindowsTerminal
+    calls = []
+    monkeypatch.setattr(studio_arm, "_own_process_tree_pids",
+                        lambda: calls.append(1) or set(own))
+    names = {900: "python.exe", 901: "powershell.exe", 902: "conhost.exe",
+             903: "WindowsTerminal.exe", 77: "FTOptixStudio.exe", 5: "notepad.exe"}
+    monkeypatch.setattr(studio_arm, "_process_name", lambda pid: names.get(pid))
+    own_wins = [{"title": f"own{p}", "pid": p, "rect": (0, 0, 2000, 2000),
+                 "foreground": p == 903} for p in sorted(own)]
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows",
+                        lambda: own_wins + [_STUDIO_WIN])
+    for pid in sorted(own):                      # UIA foreground in our tree
+        monkeypatch.setattr(studio_arm, "_foreground_window",
+                            lambda auto, pid=pid: {"title": "console", "pid": pid})
+        calls.clear()
+        assert studio_arm.blocking_window_for(object(), 77) is None
+        assert len(calls) == 1                   # exclusion set computed once
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows", lambda: own_wins + [
+        _STUDIO_WIN, {"title": "Real dialog", "pid": 5, "rect": (10, 10, 50, 50),
+                      "foreground": False}])
+    monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto: None)
+    got = studio_arm.blocking_window_for(None, 77)
+    assert got and got["pid"] == 5 and got["source"] == "win32"
+
+
+def test_own_process_tree_pids_includes_self_and_parent() -> None:
+    import os
+    pids = studio_arm._own_process_tree_pids()
+    assert os.getpid() in pids and os.getppid() in pids
+
+
+# ---- PRD 0051 (#67): blocking-window attribution ----------------------------
+
+def _hint_env(monkeypatch, windows, own_hwnds=(), needles=()) -> None:
+    monkeypatch.setattr(studio_arm, "_own_process_tree_pids", lambda: {900})
+    monkeypatch.setattr(studio_arm, "_own_window_filter",
+                        lambda: {"hwnds": set(own_hwnds), "needles": list(needles)})
+    monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto: None)
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows", lambda: windows)
+    monkeypatch.setattr(studio_arm, "_process_name", lambda pid: {
+        77: "FTOptixStudio.exe", 500: "conhost.exe", 600: "PickerHost.exe",
+        700: "notepad.exe"}.get(pid))
+
+
+def test_console_host_window_outside_process_tree_is_never_blocking(monkeypatch) -> None:
+    """The service's console window (GetConsoleWindow) and its root owner are
+    excluded by handle even though their pid (conhost) is not in the process
+    tree; so is a window titled with the python.exe path."""
+    py = r"c:\python312\python.exe"
+    _hint_env(monkeypatch, [
+        {"title": "ftx", "pid": 500, "hwnd": 11, "class": "ConsoleWindowClass",
+         "rect": (0, 0, 900, 700), "foreground": True},
+        {"title": "owner", "pid": 500, "hwnd": 12, "class": "X",
+         "rect": (0, 0, 900, 700), "foreground": False},
+        {"title": r"C:\Python312\python.exe", "pid": 501, "hwnd": 13, "class": "X",
+         "rect": (0, 0, 900, 700), "foreground": False},
+        _STUDIO_WIN], own_hwnds={11, 12}, needles=[py])
+    assert studio_arm.blocking_window_for(None, 77) is None
+    assert studio_arm.annotate_os_dialog({"ok": False}, None, 77) == {"ok": False}
+
+
+def test_console_window_excluded_on_uia_source_too(monkeypatch) -> None:
+    _hint_env(monkeypatch, [_STUDIO_WIN], own_hwnds={11})
+    monkeypatch.setattr(studio_arm, "_foreground_window",
+                        lambda auto: {"title": "x", "pid": 500, "hwnd": 11})
+    assert studio_arm.blocking_window_for(object(), 77) is None
+    monkeypatch.setattr(studio_arm, "_foreground_window",
+                        lambda auto: {"title": r"C:\Python312\python.exe", "pid": 500})
+    monkeypatch.setattr(studio_arm, "_own_window_filter",
+                        lambda: {"hwnds": set(), "needles": [r"c:\python312\python.exe"]})
+    assert studio_arm.blocking_window_for(object(), 77) is None
+
+
+def test_picker_dialog_is_ranked_first_with_pid_process_title_class(monkeypatch) -> None:
+    _hint_env(monkeypatch, [
+        {"title": "Untitled - Notepad", "pid": 700, "hwnd": 1, "class": "Notepad",
+         "rect": (10, 10, 50, 50), "foreground": True},
+        {"title": "Select a folder", "pid": 600, "hwnd": 2, "class": "#32770",
+         "rect": (100, 100, 400, 400), "foreground": False},
+        _STUDIO_WIN])
+    got = studio_arm.blocking_window_for(None, 77)
+    assert got == {"title": "Select a folder", "process": "PickerHost.exe",
+                   "pid": 600, "class": "#32770", "source": "win32",
+                   "kind": "firewall_prompt"}
+    # process-name ranking without the dialog class
+    _hint_env(monkeypatch, [
+        {"title": "Notepad", "pid": 700, "hwnd": 1, "class": "Notepad",
+         "rect": (10, 10, 50, 50), "foreground": True},
+        {"title": "Pick", "pid": 600, "hwnd": 2, "class": "Windows.UI.Core.CoreWindow",
+         "rect": (100, 100, 400, 400), "foreground": False},
+        _STUDIO_WIN])
+    assert studio_arm.blocking_window_for(None, 77)["pid"] == 600
+
+
+# ---- PRD 0055 (#94): firewall / consent prompt as blocking_window ------------
+
+_FW_HINT_TEXT = ("a Windows Firewall / consent prompt is open; answer it on the "
+                 "desktop (or pre-create the firewall rule: New-NetFirewallRule "
+                 "-Program <coreservicehost.exe> -Action Allow), then re-arm")
+
+_ZERO_RECT_PICKER = {"title": "Windows Security Alert", "pid": 600, "hwnd": 2,
+                     "class": "Windows.UI.Core.CoreWindow", "rect": (0, 0, 0, 0),
+                     "foreground": False}
+
+
+def test_zero_rect_picker_host_window_is_reported_as_firewall_prompt(monkeypatch) -> None:
+    """A zero-rect PickerHost window that overlaps nothing and is not in front
+    is still the blocker, with kind firewall_prompt and the identifying fields."""
+    _hint_env(monkeypatch, [
+        {"title": "Untitled - Notepad", "pid": 700, "hwnd": 1, "class": "Notepad",
+         "rect": (10, 10, 50, 50), "foreground": True},
+        _ZERO_RECT_PICKER, _STUDIO_WIN])
+    got = studio_arm.blocking_window_for(None, 77)
+    assert got == {"title": "Windows Security Alert", "process": "PickerHost.exe",
+                   "pid": 600, "class": "Windows.UI.Core.CoreWindow",
+                   "source": "win32", "kind": "firewall_prompt"}
+    out = studio_arm.annotate_os_dialog({"ok": False}, None, 77)
+    assert out["probable_cause"] == "os_dialog"
+    assert out["blocking_window"]["kind"] == "firewall_prompt"
+    assert out["hint"] == _FW_HINT_TEXT
+
+
+def test_known_consent_processes_rank_above_other_overlap_candidates(monkeypatch) -> None:
+    """Consent processes beat a #32770 dialog, a foreground window and a UIA
+    foreground window; ShellExperienceHost counts only with a security title."""
+    names = {77: "FTOptixStudio.exe", 700: "notepad.exe", 701: "notepad.exe",
+             610: "consent.exe", 620: "WindowsSecurity.exe",
+             630: "ShellExperienceHost.exe"}
+    others = [
+        {"title": "Notepad", "pid": 700, "hwnd": 1, "class": "Notepad",
+         "rect": (10, 10, 50, 50), "foreground": True},
+        {"title": "Some dialog", "pid": 701, "hwnd": 3, "class": "#32770",
+         "rect": (100, 100, 400, 400), "foreground": False}]
+    for pid, title in ((610, "User Account Control"), (620, "Firewall"),
+                       (630, "Windows Security Alert")):
+        _hint_env(monkeypatch, others + [
+            {"title": title, "pid": pid, "hwnd": 9, "class": "X",
+             "rect": (0, 0, 0, 0), "foreground": False}, _STUDIO_WIN])
+        monkeypatch.setattr(studio_arm, "_process_name", names.get)
+        monkeypatch.setattr(studio_arm, "_foreground_window",
+                            lambda auto: {"title": "UIA fg", "pid": 700})
+        got = studio_arm.blocking_window_for(object(), 77)
+        assert got["pid"] == pid and got["kind"] == "firewall_prompt", got
+    # ShellExperienceHost with an ordinary title is not a blocker
+    _hint_env(monkeypatch, [
+        {"title": "Start", "pid": 630, "hwnd": 9, "class": "X",
+         "rect": (0, 0, 0, 0), "foreground": False}, _STUDIO_WIN])
+    monkeypatch.setattr(studio_arm, "_process_name", names.get)
+    assert studio_arm.blocking_window_for(None, 77) is None
+
+
+def test_menu_item_not_found_with_zero_menu_items_runs_blocking_window_search(
+        tmp_path, monkeypatch) -> None:
+    """The 'menu_items: 0' arm failure always runs the search and names the
+    firewall prompt, whose hint carries the New-NetFirewallRule command."""
+    fake = _menu_missing_fake(tmp_path)
+    _wire(monkeypatch, fake)
+    _hint_env(monkeypatch, [_ZERO_RECT_PICKER, _STUDIO_WIN])
+    searched = []
+    real = studio_arm.blocking_window_for
+    monkeypatch.setattr(studio_arm, "blocking_window_for",
+                        lambda a, p: searched.append(p) or real(a, p))
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge")
+    assert out["error"] == "menu_item_not_found"
+    assert all(t.get("menu_items", 0) == 0 for t in out["tried"])
+    assert searched
+    assert out["blocking_window"]["kind"] == "firewall_prompt"
+    assert out["blocking_window"]["pid"] == 600
+    assert "New-NetFirewallRule" in out["hint"] and "consent prompt" in out["hint"]
+
+
+# ---- PRD 0053 B (#85): bridge_port_range_full + shell windows ----------------
+
+_RANGE = (8768, 4)
+
+
+def _full_range_health(monkeypatch, project_for=lambda p: f"Other{p}") -> None:
+    monkeypatch.setattr(
+        studio_arm, "_bridge_health",
+        lambda port, timeout=0.5: {"project": project_for(port),
+                                   "studio_pid": 1000 + port - 8768})
+
+
+def test_arm_pre_probe_returns_bridge_port_range_full_without_keystrokes(
+        tmp_path, monkeypatch) -> None:
+    """Every port in the range answers for OTHER projects: arm returns
+    bridge_port_range_full with ports/owners/hint and never touches UIA."""
+    _tree_project(tmp_path)
+    _full_range_health(monkeypatch)
+    import sys
+    monkeypatch.delitem(sys.modules, "uiautomation", raising=False)
+    touched: list[str] = []
+    monkeypatch.setattr(studio_arm, "_studio_window_for",
+                        lambda *a, **k: touched.append("window"))
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    base_port=8768, port_range=4)
+    assert out["ok"] is False and out["error"] == "bridge_port_range_full", out
+    assert out["ports"] == [8768, 8769, 8770, 8771]
+    assert out["owners"] == [{"port": 8768 + i, "project": f"Other{8768 + i}",
+                              "pid": 1000 + i} for i in range(4)]
+    assert "OPTIX_BRIDGE_PORT_RANGE" in out["hint"]
+    assert "FTX_BRIDGE_PORT_RANGE" not in out["hint"]
+    assert "fixed at 4" in out["hint"] and "PortRangeSize" in out["hint"]
+    assert touched == []          # no window lookup, no keystrokes
+
+
+def test_arm_pre_probe_not_full_when_a_port_is_free(tmp_path, monkeypatch) -> None:
+    health = {8768: {"project": "A"}, 8769: {"project": "B"}, 8770: None,
+              8771: {"project": "C"}}
+    assert studio_arm.port_range_full_result(health, "Cell_v5") is None
+    # ...and not full when one of the bridges is this project's own.
+    health[8770] = {"project": "Cell_v5", "studio_pid": 5}
+    assert studio_arm.port_range_full_result(health, "Cell_v5") is None
+    health[8770] = {"project": "D"}
+    del health[8768]
+    health[8768] = {"project": "Cell_v5", "studio_pid": 5}
+    assert studio_arm.port_range_full_result(health, "Cell_v5") is None
+    health[8768] = {"project": "E"}
+    got = studio_arm.port_range_full_result(health, "Cell_v5")
+    assert got and got["error"] == "bridge_port_range_full"
+
+
+def test_verify_path_scans_log_for_bind_failure_not_verify_timeout(
+        tmp_path, monkeypatch) -> None:
+    """After the Execute click the bridge logs its bind failure; the verify
+    path reports bridge_port_range_full (with the log line) instead of
+    verify_timeout, even though a foreign window ('Program Manager') is up."""
+    _tree_project(tmp_path)
+    fake = _TreeStudio()
+    _wire_tree(monkeypatch, fake)
+    monkeypatch.setattr(studio_arm, "serving_port_for", lambda *a, **k: None)
+    marks: list[int] = []
+    monkeypatch.setattr(studio_arm, "_log_mark", lambda: marks.append(7) or 7)
+    line = ("2026-10-15 10:00:00 ERROR StudioBridge bridge_port_range_full: "
+            "cannot bind any port in 8768-8771 - 4 bridges are already running")
+    seen: list[object] = []
+    monkeypatch.setattr(studio_arm, "_log_since",
+                        lambda m: seen.append(m) or ["noise", line])
+    # Only the pre-arm probe (called BEFORE the click) sees a free range.
+    probes = iter([None] * 4)
+    monkeypatch.setattr(studio_arm, "_bridge_health",
+                        lambda port, timeout=0.5: (
+                            next(probes, {"project": f"Other{port}", "pid": port})))
+    monkeypatch.setattr(studio_arm, "blocking_window_for",
+                        lambda *a, **k: {"title": "Program Manager"})
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    timeout=0.05, base_port=8768, port_range=4)
+    assert out["ok"] is False and out["error"] == "bridge_port_range_full", out
+    assert out["detail"] == line and "blocking_window" not in out
+    assert out["ports"] == [8768, 8769, 8770, 8771]
+    assert [o["port"] for o in out["owners"]] == [8768, 8769, 8770, 8771]
+    assert marks == [7] and seen and set(seen) == {7}
+
+
+def test_verify_path_without_bind_failure_line_still_times_out(
+        tmp_path, monkeypatch) -> None:
+    _tree_project(tmp_path)
+    _wire_tree(monkeypatch, _TreeStudio())
+    monkeypatch.setattr(studio_arm, "serving_port_for", lambda *a, **k: None)
+    monkeypatch.setattr(studio_arm, "_bridge_health", lambda port, timeout=0.5: None)
+    monkeypatch.setattr(studio_arm, "_log_mark", lambda: 0)
+    monkeypatch.setattr(studio_arm, "_log_since", lambda m: ["unrelated line"])
+    out = studio_arm.execute_method("Cell_v5", str(tmp_path), method="StartBridge",
+                                    timeout=0.05)
+    assert out["error"] == "verify_timeout"
+
+
+def test_bind_failure_line_accepts_marker_and_legacy_wording() -> None:
+    f = studio_arm.bind_failure_line
+    assert f(["a", "x bridge_port_range_full: cannot bind any port in 8768-8771"])
+    assert f(["cannot bind any port in 8768-8771 - old bridge"])
+    assert f(["listening on http://127.0.0.1:8768"]) is None
+    assert f(None) is None
+
+
+def test_blocking_window_for_never_returns_shell_windows(monkeypatch) -> None:
+    """Progman / WorkerW / Shell_TrayWnd (+ secondary), 'Program Manager' and
+    the taskbar are never a blocker on either source, even when foreground or
+    overlapping Studio; a real dialog still is."""
+    shell = [
+        {"title": "Program Manager", "pid": 800, "hwnd": 1, "class": "Progman"},
+        {"title": "", "pid": 800, "hwnd": 2, "class": "WorkerW"},
+        {"title": "Taskbar", "pid": 800, "hwnd": 3, "class": "Shell_TrayWnd"},
+        {"title": "Taskbar", "pid": 800, "hwnd": 4, "class": "Shell_SecondaryTrayWnd"},
+        {"title": "Taskbar", "pid": 800, "hwnd": 5, "class": ""},
+        {"title": "Program Manager", "pid": 800, "hwnd": 6, "class": ""},
+    ]
+    wins = [dict(w, rect=(0, 0, 2000, 2000), foreground=True) for w in shell]
+    _hint_env(monkeypatch, wins + [_STUDIO_WIN])
+    monkeypatch.setattr(studio_arm, "_process_name",
+                        lambda pid: {77: "FTOptixStudio.exe", 800: "explorer.exe",
+                                     700: "notepad.exe"}.get(pid))
+    assert studio_arm.blocking_window_for(None, 77) is None
+    for w in shell:                                   # UIA foreground source
+        monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto, w=w: dict(w))
+        assert studio_arm.blocking_window_for(object(), 77) is None, w
+        assert studio_arm.annotate_os_dialog({"ok": False}, object(), 77) == {"ok": False}
+    monkeypatch.setattr(studio_arm, "_foreground_window", lambda auto: None)
+    monkeypatch.setattr(studio_arm, "_win32_top_level_windows", lambda: wins + [
+        _STUDIO_WIN, {"title": "Real dialog", "pid": 700, "hwnd": 9, "class": "#32770",
+                      "rect": (10, 10, 50, 50), "foreground": False}])
+    got = studio_arm.blocking_window_for(None, 77)
+    assert got and got["pid"] == 700 and got["title"] == "Real dialog"

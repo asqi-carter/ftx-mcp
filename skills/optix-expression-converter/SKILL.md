@@ -51,6 +51,12 @@ one-op list fine — no need to grow it beyond what's shown above.
 `left_of right_of`. Operators: arithmetic, `<< >>`, relational, `== !=`, `& ^ |`,
 `&& ||`, unary `- ~ (cast)`. Full reference: `docs/expression-evaluator-reference.md`.
 Beyond these needs a custom C# converter (out of bridge scope).
+- `pow(base, exp)` exists on **Studio 1.8+ only**. Version-gated expression functions such as `pow`
+  are refused with `function_requires_version` (pow needs 1.8) on older Studios (e.g. 1.7) by the
+  validator/attach — rewrite with `*` or upgrade Studio. The gate compares against the bridge's
+  `studio_version` (`/bridge/health`), which is the **Studio product version** (e.g. `1.7.4.32`,
+  `1.8.0.555`) read from the Studio process — NOT the FTOptix.UI assembly version (`21.x`). If the
+  version cannot be read it is `"unknown"` and the gate does not refuse.
 - `round`/`abs`/`ceil`/`floor`/`trunc`/`sqrt`/`sign`/`isempty` take **ONE** arg —
   `round({0})`, NOT `round({0}, 1)` (a 2nd arg fails). `if` takes 3, `like`/`left_of`/
   `right_of` take 2.

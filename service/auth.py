@@ -235,6 +235,7 @@ DEFAULT_SCOPE_RULES: tuple[ScopeRule, ...] = (
     # Read-only diagnostics. Prefix match is raw string (not segment-aware),
     # so "/skills" covers both GET /skills and GET /skills/{name}.
     ("GET", "/skills", "read"),  # bundled-playbook markdown content off disk
+    ("GET", "/bridge-source", "read"),  # shipped StudioMCPBridge.cs source text (public repo file)
     ("GET", "/doctor", "read"),  # embeds deploy_username/thumbprint when enabled
     ("GET", "/ui/stats", "read"),  # project name + deploy_ip + doctor checks
     ("GET", "/ui", "health"),  # static dashboard shell; no project/config data
@@ -330,6 +331,7 @@ TOOL_SCOPES: dict[str, str] = {
     "optix_observe": "read",  # U14 consolidated read-side CDP capture
     "optix_build_check": "read",  # compiles to a throwaway copy; mutates nothing
     "optix_bridge_log_tail": "read",  # bridge transport diagnostics
+    "optix_studio_log": "read",  # tail of FTOptixStudio.0.log
     "optix_read_netlogic": "read",
     # ---- author (35): mutates project / previews / drives canvas ----
     # U16 batched authoring: `author`, same as every per-noun bridge write it
@@ -349,6 +351,12 @@ TOOL_SCOPES: dict[str, str] = {
     "optix_bridge_bind_property": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_create_alias": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_add_translation": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_set_text_key": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_add_translations": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_remove_translation": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_set_modelling_rule": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_retype": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
+    "optix_bridge_import_tags": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_create_netlogic": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_reorder": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES
     "optix_bridge_attach_expression": "author",  # gated: FTXMCP_BRIDGE_PRIMITIVES

@@ -435,11 +435,11 @@ an Ignition-owned squatter is named).
 
 ## Known limitations
 
-- **`optix_bridge_create_netlogic` cannot create a DESIGN-TIME NetLogic.**
-  The node it mints compiles and exposes its `[ExportMethod]`s, but Studio
-  offers no `Execute` entries for it — `optix_execute_method` can never fire
-  them. Design-time scripts still require one manual Studio step
-  (`NetLogic -> Add -> DesignTime NetLogic`).
+- **`optix_bridge_create_netlogic` could not create a DESIGN-TIME NetLogic in
+  1.0.8.** *(Corrected in 1.0.9: `kind="design_time"` is supported, and
+  `optix_bridge_edit` has a `create_netlogic` op, so no gated primitive is
+  needed.)* In 1.0.8 the node it minted compiled and exposed its
+  `[ExportMethod]`s, but Studio offered no `Execute` entries for it.
 - `optix_execute_method` derives its tree chain from on-disk YAML (needs
   `optix_save` first) and prefix-matches node names.
 
@@ -453,6 +453,8 @@ hard way, on a live project), the expanded `create_variable` datatype set, and
 isolating the F5-guard tests from a developer box's real Studio configuration.
 
 ## Upgrading
+
+> Superseded, see [1.0.9 Upgrading](release-notes-v1.0.9.md#upgrading).
 
 `pip install --upgrade ftx-mcp` updates the service.
 

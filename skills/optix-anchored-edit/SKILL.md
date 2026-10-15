@@ -84,6 +84,13 @@ and handles the subtree re-author, link audit, and rollback internally. Check
 binding nodes may be listed as skipped and need re-attachment via
 `optix_bridge_edit` with `attach_expression` ops after the conversion.
 
+**Refused on some subtrees:** `convert_to_type` (like `move` and `rename`) is
+refused with `contains_netlogic` or `contains_event_handler` when the source
+subtree holds a NetLogic or EventHandler, because re-authoring those via
+`CopySubtreeInto` crashes Studio. Nothing is changed. Move the NetLogic out
+first, delete and later re-wire the handler (`wire_event`), or use Studio's own
+Convert to Type.
+
 ---
 
 ## Add a bound widget (the bridge path, preferred)
